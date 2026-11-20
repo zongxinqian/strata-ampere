@@ -2779,6 +2779,7 @@ bool staged_blobs_ok(const Batch& b, const NativeGeom& g) {
     } else {
         for (int e = b.e0; e < b.e1; ++e) {
             const uint8_t* p = b.blob[e - b.e0];
+            if (p == nullptr) continue;
             cudaPointerAttributes pa{};
             ft::BlobMem m = ft::BlobMem::kUnknown;
             if (cudaPointerGetAttributes(&pa, p) != cudaSuccess) cudaGetLastError();   // (not a pointer the driver knows: the launch's own error says so)

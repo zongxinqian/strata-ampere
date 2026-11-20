@@ -200,7 +200,7 @@ __global__ void place_kernel(const int32_t* __restrict__ ids, int64_t n, int k, 
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int e = ids[i];
-    if ((unsigned) e >= (unsigned) E) { slot[i] = 0; return; }   // (the router never writes one)
+    if ((unsigned) e >= (unsigned) E) { slot[i] = -1; return; }   // unowned or invalid expert under EP=2
     const int p = atomicAdd(&tb.fill[e], 1);
     slot[i] = p;
     src[p] = (int32_t) (i / k);

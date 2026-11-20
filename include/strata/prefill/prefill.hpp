@@ -18,6 +18,8 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 
+namespace strata::core { class TpComm; }
+
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -231,6 +233,9 @@ public:
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
 
+    /// TP=2 + EP=2: coordinate all-reduce and exclusive expert ownership with `peer_pf` via `tp`.
+    void set_tp(core::TpComm* tp, int rank, const int32_t* peer_res, Prefill* peer_pf = nullptr);
+
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
@@ -373,6 +378,10 @@ private:
     float* tap_dev_ = nullptr;
     Prefill* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
+    core::TpComm* tp_ = nullptr;
+    int tp_rank_ = 0;
+    const int32_t* tp_peer_res_ = nullptr;
+    Prefill* tp_peer_ = nullptr;
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
     int64_t kva_floor_ = 0;             ///< kva_floor()

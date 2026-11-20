@@ -2640,6 +2640,7 @@ public:
 private:
     static void clear_marks(ConvCheckpoint& c) {
         c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.dev_tag = 0;
+        if (c.tp1_part) clear_marks(*c.tp1_part);
         for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
     }
     bool on_;
@@ -4595,7 +4596,6 @@ int main(int argc, char** argv) {
     if (tp2_on) {
         o.layer_split.clear();
         o.pipeline_windows = 0;
-        o.prompt_cache = 0;
         o.conversation_cache_mib = 0;
     }
     const bool pcie_given = o.pcie_frac >= 0.0;
@@ -9349,9 +9349,18 @@ int main(int argc, char** argv) {
         int32_t* d_res = nullptr;
         strata::core::Verifier ver;
         strata::core::TpComm comm;
+        cudaStream_t pf_stream = nullptr;
+        strata::prefill::Prefill sp;
         cudaStream_t adapt_stream = nullptr;
         cudaEvent_t adapt_ev = nullptr;
         std::vector<std::pair<int32_t, int32_t>> adapt_pending;
+        ~TpPeerStage() {
+            if (pf_stream != nullptr || sp.chunk() > 0) {
+                const strata::core::OnDevice on(dev);
+                sp.reset();
+                if (pf_stream != nullptr) cudaStreamDestroy(pf_stream);
+            }
+        }
     };
     std::unique_ptr<TpPeerStage> tp1;
     if (tp2_on) {
@@ -9422,7 +9431,7 @@ int main(int argc, char** argv) {
         const auto& lay1 = strata::kernels::cpu::expert_layout();
         size_t fb1 = 0, tb1 = 0;
         cudaMemGetInfo(&fb1, &tb1);
-        const int64_t reserve1 = (int64_t) std::max(o.vram_reserve_mib, 512) << 20;
+        const int64_t reserve1 = ((int64_t) std::max(o.vram_reserve_mib, 512) + 256) << 20;
         const int64_t room1 = (int64_t) fb1 > reserve1 ? (int64_t) fb1 - reserve1 : 0;
         std::vector<int64_t> sized1;
         int64_t used1 = 0;
@@ -9451,8 +9460,9 @@ int main(int argc, char** argv) {
             ++filled1;
         }
         if (cudaStreamCreateWithFlags(&tp1->adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&tp1->pf_stream, cudaStreamNonBlocking) != cudaSuccess ||
             cudaEventCreateWithFlags(&tp1->adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
-            std::fprintf(stderr, "strata generate: TP2 CUDA1 adaptive stream/event creation failed\n");
+            std::fprintf(stderr, "strata generate: TP2 CUDA1 adaptive/prefill stream/event creation failed\n");
             return 1;
         }
         std::fprintf(stderr, "strata generate: STRATA_TP2=1: CUDA1 loaded %.2f MiB dense weights + session, expert cache %lld slots (%.2f GiB) filled\n",
@@ -11330,7 +11340,7 @@ int main(int argc, char** argv) {
         aa.serve = o.serve;
         aa.adaptive = o.adapt_every > 0 && o.adapt_swaps > 0;
         aa.arena = srcp == &arena_src;
-        aa.multi_gpu = multi_gpu;
+        aa.multi_gpu = multi_gpu || (bool) tp1;
         aa.pipeline_windows = o.pipeline_windows >= 2;
         aa.batch = o.batch > 0;
         aa.peer = peer.valid();
@@ -11346,7 +11356,7 @@ int main(int argc, char** argv) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.adapt_every <= 0 || o.adapt_swaps <= 0 ? "the adaptive tier is off"
                         : !o.resident_cpu_experts && srcp != &arena_src ? "it needs the resident RAM mode, --resident-experts, or the expert arena"
-                        : multi_gpu && srcp == &arena_src ? "not with a layer split in the arena mode"
+                        : (multi_gpu || tp1) && srcp == &arena_src ? "not with a layer split or TP2 in the arena mode"
                         : o.pipeline_windows >= 2 && srcp == &arena_src ? "not with --pipeline-windows 2 in the arena mode"
                         : o.batch > 0 && o.batch_groups > 1 ? "not with --batch-groups (the pipelined slot groups)"
                         : peer.valid() ? "not with --peer-device"
@@ -11388,7 +11398,7 @@ int main(int argc, char** argv) {
     auto fit_case = [&](int64_t chunk, bool small_path) -> strata::prefill::fit_out::ScanCase {
         strata::prefill::fit_out::ScanCase sc;
         sc.auto_chunk = o.prefill_auto && strata::prefill::Prefill::ring_bytes_enabled();
-        sc.one_gpu = stages.empty() && !multi_gpu && !peer.valid() && !o.prefill_head_alias && o.batch <= 1;
+        sc.one_gpu = stages.empty() && !multi_gpu && !tp1 && !peer.valid() && !o.prefill_head_alias && o.batch <= 1;
         sc.tail_loan = tail_loan_on;
         sc.equal_cut = equal_cut_one == strata::prefill::equal_cut::Cut::equal;
         sc.small_path = small_path;
@@ -11461,18 +11471,21 @@ int main(int argc, char** argv) {
         // pin_cache_complement's own path, and no regions are set.
         std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lends;
         decide_split_ring();   // the ring the prompt path really uses, BEFORE bytes_needed sizes the regions below
-        if (pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && multi_gpu && !stages.empty()) {
+        if (pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && (tp1 || (multi_gpu && !stages.empty()))) {
             const int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
             static const bool own_ok = [] {
                 const char* v = std::getenv("STRATA_SPLIT_OWN_BUFFERS");
                 return v == nullptr || v[0] != '0';
             }();
-            for (size_t i = 0; i <= stages.size(); ++i) {   // the scan's part order: CUDA0, then every stage
-                strata::core::ExpertCache& xc = i == 0 ? xcache : stages[i - 1]->cache;
-                const strata::core::SessionState& ses = i == 0 ? ss : stages[i - 1]->ss;
-                const int64_t dev = i == 0 ? -1 : stages[i - 1]->dev;
-                const int64_t lb = i == 0 ? 0 : stages[i - 1]->lb;
-                const int64_t le = i == 0 ? split_at[0] : stages[i - 1]->le;
+            const size_t n_parts = (tp1 ? 2 : 1) + stages.size();
+            for (size_t i = 0; i < n_parts; ++i) {   // the scan's part order: CUDA0, optional TP2 CUDA1, then every stage
+                const bool is_tp1 = tp1 && i == 1;
+                const size_t st_idx = tp1 ? i - 2 : i - 1;
+                strata::core::ExpertCache& xc = i == 0 ? xcache : (is_tp1 ? tp1->cache : stages[st_idx]->cache);
+                const strata::core::SessionState& ses = i == 0 ? ss : (is_tp1 ? tp1->ss : stages[st_idx]->ss);
+                const int64_t dev = i == 0 ? -1 : (is_tp1 ? tp1->dev : stages[st_idx]->dev);
+                const int64_t lb = (i == 0 || is_tp1) ? 0 : stages[st_idx]->lb;
+                const int64_t le = i == 0 ? (multi_gpu ? split_at[0] : g.n_layers) : (is_tp1 ? g.n_layers : stages[st_idx]->le);
                 if (xc.slots() <= 0 || le <= lb) continue;
                 const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ses, bound);
                 if (own_ok) {   // the card funds its buffers at any chunk the scan can pick: nothing is lent
@@ -11831,6 +11844,8 @@ int main(int argc, char** argv) {
             strata::core::ExpertCache* cache = nullptr;
             const strata::core::SessionState* ses = nullptr;
             strata::prefill::Prefill* sp = nullptr;
+            std::vector<int32_t>* res = nullptr;
+            bool is_tp1 = false;
             int dev = -1;                  // -1: leave the device alone (CUDA0)
             int64_t lb = 0, le = 0;        // the layers whose rows this cache holds - the only rows it may lend
             int32_t first = -1;            // the first slot it may lend, for the chunk that was chosen
@@ -11874,9 +11889,11 @@ int main(int argc, char** argv) {
         // whose cache already filled its reserve, that is the over-subscription the auto sizing avoids - so the
         // chunk is the largest one EVERY participant can lend (a smaller chunk only reads slower)
         if (pf_borrow && d_res != nullptr) {
-            pf_parts.push_back({&xcache, &ss, &sp, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
+            pf_parts.push_back({&xcache, &ss, &sp, &host_res, false, -1, 0, multi_gpu ? split_at[0] : g.n_layers, -1, -1, 0, {}});
+            if (tp1)
+                pf_parts.push_back({&tp1->cache, &tp1->ss, &tp1->sp, &tp1->host_res, true, tp1->dev, 0, g.n_layers, -1, -1, 0, {}});
             for (auto& st : stages)
-                pf_parts.push_back({&st->cache, &st->ss, &st->sp, st->dev, st->lb, st->le, -1, -1, 0, {}});
+                pf_parts.push_back({&st->cache, &st->ss, &st->sp, &host_res, false, st->dev, st->lb, st->le, -1, -1, 0, {}});
             // The two tests plan_lend makes for CUDA0 alone, one participant at a time: a loan must leave the
             // 128-slot floor.  The percentage cap is an AUTO-chunk rule and only the auto scan applies it - an
             // explicit --prefill is the operator's number, and a loan of it only has to fit.  With one participant
@@ -12423,9 +12440,18 @@ int main(int argc, char** argv) {
         // point into the drafter's expert block.  The room's LAYOUT is a start-up property - it costs nothing to
         // hold (no allocation, no VRAM: the slots ARE the drafter's bytes) - and a prompt takes it by moving that
         // path's ring count (set_ring_room_active), so any later rebuild here re-carves it the same way.
+        if (tp1) {
+            if (!tp1->comm.init(0, tp1->dev, std::max<size_t>(16 * (size_t) g.n_embd, 4u << 20), err)) {
+                std::fprintf(stderr, "strata serve: TP2 comm init: %s\n", err.c_str());
+                return 1;
+            }
+            sp.set_tp(&tp1->comm, 0, tp1->host_res.data(), &tp1->sp);
+            tp1->sp.set_tp(&tp1->comm, 1, host_res.data(), &sp);
+        }
         strata::prefill::Prefill* room_path = nullptr;
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             room_path = nullptr;
+            const size_t st_off = tp1 ? 2 : 1;
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
@@ -12433,9 +12459,9 @@ int main(int argc, char** argv) {
                 void* sb = nullptr;              // this stage's own loan, out of its own cache
                 uint64_t sbb = 0;
                 // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
-                if (i + 1 < pf_parts.size() && pf_parts[i + 1].first >= 0) {
-                    sb = st.cache.device_slot(pf_parts[i + 1].first);
-                    sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
+                if (i + st_off < pf_parts.size() && pf_parts[i + st_off].first >= 0) {
+                    sb = st.cache.device_slot(pf_parts[i + st_off].first);
+                    sbb = part_bytes(pf_parts[i + st_off], pf_parts[i + st_off].first);
                 }
                 // STRATA_MTP_ROOM_MIN: the drafter's card is the one whose prompt path is laid out with the room
                 const bool room_here = mtp_room_slots > 0 && mtp.device() == st.dev;
@@ -12446,6 +12472,22 @@ int main(int argc, char** argv) {
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb, o.prefill_head_alias)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
+                    return err.find("do not fit") != std::string::npos ? 2 : 1;
+                }
+            }
+            if (tp1) {
+                const strata::core::OnDevice on1(tp1->dev);
+                void* tb = nullptr;
+                uint64_t tbb = 0;
+                if (1 < pf_parts.size() && pf_parts[1].first >= 0) {
+                    tb = tp1->cache.device_slot(pf_parts[1].first);
+                    tbb = part_bytes(pf_parts[1], pf_parts[1].first);
+                }
+                tp1->sp.set_ring_room(0);
+                tp1->sp.set_ring_room_base(nullptr, 0);
+                if (!tp1->sp.init(tp1->wt, g, tp1->ss, prefill_src, &tp1->cache, tp1->host_res.data(), o.prefill_chunk,
+                                  (void*) tp1->pf_stream, err, tb, tbb, false)) {
+                    err = "TP2 CUDA" + std::to_string(tp1->dev) + " prompt path: " + err;
                     return err.find("do not fit") != std::string::npos ? 2 : 1;
                 }
             }
@@ -12472,18 +12514,28 @@ int main(int argc, char** argv) {
             // failed to launch on gfx1201 and the prompt hung).  `bytes_needed` is the same count `init` makes.
             const int64_t kHeadroom = (o.prefill_chunk <= 512 ? 128ll : 512ll) << 20;   // (a 512-token chunk or less is the tight-card path: its buffers are priced with a floor of their own)
             auto own_fits = [&](int64_t c, int& dev_out, int64_t& need_out, int64_t& free_out) -> bool {
-                for (size_t i = 0; i <= stages.size(); ++i) {
-                    const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
-                    if (loan) continue;
-                    const int dev = i == 0 ? -1 : stages[i - 1]->dev;
+                auto check_dev = [&](int dev, const strata::core::SessionState& ses, bool loan) -> bool {
+                    if (loan) return true;
                     const strata::core::OnDevice on(dev);
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
-                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c, srcp != nullptr);
+                    const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, ses, c, srcp != nullptr);
                     if (need + kHeadroom > (int64_t) fb) {
                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                         return false;
                     }
+                    return true;
+                };
+                const bool loan0 = !pf_parts.empty() ? pf_parts[0].first >= 0 : borrow != nullptr;
+                if (!check_dev(-1, ss, loan0)) return false;
+                if (tp1) {
+                    const bool loan1 = 1 < pf_parts.size() && pf_parts[1].first >= 0;
+                    if (!check_dev(tp1->dev, tp1->ss, loan1)) return false;
+                }
+                const size_t st_off = tp1 ? 2 : 1;
+                for (size_t i = 0; i < stages.size(); ++i) {
+                    const bool loan = i + st_off < pf_parts.size() && pf_parts[i + st_off].first >= 0;
+                    if (!check_dev(stages[i]->dev, stages[i]->ss, loan)) return false;
                 }
                 return true;
             };
@@ -12532,6 +12584,11 @@ int main(int argc, char** argv) {
                 for (auto& stp : stages) {
                     const strata::core::OnDevice on(stp->dev);
                     stp->sp.reset();
+                    (void) cudaGetLastError();
+                }
+                if (tp1) {
+                    const strata::core::OnDevice on1(tp1->dev);
+                    tp1->sp.reset();
                     (void) cudaGetLastError();
                 }
                 sp.reset();
@@ -12609,7 +12666,7 @@ int main(int argc, char** argv) {
                 int64_t n = 0;
                 for (int64_t l = p.lb; l < p.le; ++l)
                     for (int64_t ex = 0; ex < g.n_expert; ++ex) {
-                        int32_t& r = host_res[(size_t) (l * g.n_expert + ex)];
+                        int32_t& r = (*p.res)[(size_t) (l * g.n_expert + ex)];
                         if (r >= first_s) { r = strata::core::kNotResident; ++n; }
                     }
                 evicted += n;
@@ -12620,6 +12677,11 @@ int main(int argc, char** argv) {
             if (evicted > 0) {
                 if (d_res != nullptr)
                     res_put(d_res);
+                if (tp1 && tp1->d_res != nullptr) {
+                    const strata::core::OnDevice on1(tp1->dev);
+                    cudaMemcpy(tp1->d_res, tp1->host_res.data(), tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    cudaStreamSynchronize(nullptr);
+                }
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
                     res_put(st->d_res);
@@ -12876,10 +12938,6 @@ int main(int argc, char** argv) {
         if (batch_df2) ver.set_batch_taps(true);
 #endif
         if (tp1) {
-            if (!tp1->comm.init(0, tp1->dev, 16 * (size_t) g.n_embd, err)) {
-                std::fprintf(stderr, "strata serve: TP2 comm init: %s\n", err.c_str());
-                return 1;
-            }
             tp1->ver.set_tp(&tp1->comm, 1, false, nullptr);
             ver.set_tp(&tp1->comm, 0, true, &tp1->ver);
         }
@@ -13731,7 +13789,7 @@ int main(int argc, char** argv) {
             return true;
         };
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if (!conversations.enabled() || tp1 || !live_ok || live.empty()) return true;
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
@@ -13831,8 +13889,12 @@ int main(int argc, char** argv) {
             } else if (ckpt_pool.on() || ckpt_threads_env()) {
                 // STRATA_CKPT_POOL / STRATA_CKPT_THREADS: the parts go into the vectors a pooled checkpoint already has
                 // (none resized), with the threads all at once; part k is stage k's session, synchronized first
-                const size_t n = stages.size() + 1;
+                const size_t n = stages.size() + (tp1 ? 2 : 1);
                 const bool reused = !c.gdn.empty();   // (a pooled one)
+                if (tp1) {
+                    if (!c.tp1_part) c.tp1_part = std::make_shared<ConvCheckpoint>();
+                    c.tp1_part->ids = c.ids;
+                }
                 c.stage_parts.resize(stages.size());
                 for (ConvCheckpoint& part : c.stage_parts) part.ids = c.ids;
                 std::vector<char> synced(n, 0), saved(n, 0);
@@ -13842,7 +13904,9 @@ int main(int argc, char** argv) {
                 const std::function<void(size_t)> save_part = [&](size_t k) {
                     try {
                         const Clock::time_point p0 = Clock::now();
-                        const strata::core::OnDevice on(k == 0 ? -1 : stages[k - 1]->dev);
+                        const bool is_tp1 = tp1 && k == 1;
+                        const size_t st_idx = tp1 ? k - 2 : k - 1;
+                        const strata::core::OnDevice on(k == 0 ? -1 : (is_tp1 ? tp1->dev : stages[st_idx]->dev));
                         const cudaError_t e = cudaDeviceSynchronize();
                         if (e != cudaSuccess) {
                             why[k] = std::string(": the GPU stopped responding before it (") + cudaGetErrorString(e) +
@@ -13851,7 +13915,9 @@ int main(int argc, char** argv) {
                         }
                         synced[k] = 1;
                         const Clock::time_point p1 = Clock::now();
-                        saved[k] = checkpoint_save(k == 0 ? c : c.stage_parts[k - 1], k == 0 ? ss : stages[k - 1]->ss, g);
+                        ConvCheckpoint& dst_cp = k == 0 ? c : (is_tp1 ? *c.tp1_part : c.stage_parts[st_idx]);
+                        const strata::core::SessionState& src_ss = k == 0 ? ss : (is_tp1 ? tp1->ss : stages[st_idx]->ss);
+                        saved[k] = checkpoint_save(dst_cp, src_ss, g);
                         sync_part[k] = std::chrono::duration<double, std::milli>(p1 - p0).count();
                         part_ms[k] = std::chrono::duration<double, std::milli>(Clock::now() - p0).count();
                     } catch (...) {
@@ -13902,6 +13968,15 @@ int main(int argc, char** argv) {
                 lap(sync_ms);
                 if (!checkpoint_save(c, ss, g)) return false;
                 lap(save_ms);
+                if (tp1) {
+                    const strata::core::OnDevice on1(tp1->dev);
+                    if (!c.tp1_part) c.tp1_part = std::make_shared<ConvCheckpoint>();
+                    c.tp1_part->ids = c.ids;
+                    if (!gpu_sync_ok()) return false;
+                    lap(sync_ms);
+                    if (!checkpoint_save(*c.tp1_part, tp1->ss, g)) return false;
+                    lap(save_ms);
+                }
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
                     const strata::core::OnDevice on(st->dev);
                     ConvCheckpoint part;
@@ -13917,7 +13992,7 @@ int main(int argc, char** argv) {
                     req_times.sync_ms += sync_ms;
                     req_times.save_ms += save_ms;
                     std::fprintf(stderr, "strata trace: checkpoint at %lld: sync %.1f ms, save %.1f ms (%zu stage(s))\n",
-                                 (long long) L, sync_ms, save_ms, stages.size() + 1);
+                                 (long long) L, sync_ms, save_ms, stages.size() + (tp1 ? 2 : 1));
                 }
             }
             c.used = ++check_clock;
@@ -17726,6 +17801,10 @@ int main(int argc, char** argv) {
             bool mtp_room_open = mtp_room_slots > 0 && room_path != nullptr && !mtp.experts_resident();
             auto head_restore = [&]() -> int {
                 if (!o.prefill_head_alias || native_head.loaded()) return 0;
+                if (tp1) {
+                    const strata::core::OnDevice on1(tp1->dev);
+                    tp1->sp.reset();
+                }
                 sp.reset();
                 const auto head_t0 = Clock::now();
                 if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
@@ -17762,6 +17841,10 @@ int main(int argc, char** argv) {
             if (o.prefill_head_alias && native_head.loaded()) {
                 const auto head_t0 = Clock::now();
                 native_head.unload();
+                if (tp1) {
+                    const strata::core::OnDevice on1(tp1->dev);
+                    tp1->sp.reset();
+                }
                 sp.reset();
                 if (init_prompt_paths() != 0) {
                     std::printf("ERR rebuilding the head-alias prompt path failed: %s\n", err.c_str());
@@ -18330,6 +18413,11 @@ int main(int argc, char** argv) {
                     // checkpoint missed shows up as a difference.
                     strata::core::session_zero(ss, g, nullptr, main_cs);
                     cudaStreamSynchronize(main_stream);
+                    if (tp1) {
+                        const strata::core::OnDevice on1(tp1->dev);
+                        strata::core::session_zero(tp1->ss, g, nullptr, nullptr);
+                        cudaDeviceSynchronize();
+                    }
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
                         strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
@@ -18339,6 +18427,11 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
                                          "restoring\n", (long long) resume);
                 } else if (c == nullptr || !checkpoint_restore(*c, ss, g) || c->stage_parts.size() != stages.size() ||
+                           (tp1 && [&] {
+                               if (!c->tp1_part) return true;
+                               const strata::core::OnDevice on1(tp1->dev);
+                               return !checkpoint_restore(*c->tp1_part, tp1->ss, g);
+                           }()) ||
                            [&] {
                                for (size_t i = 0; i < stages.size(); ++i) {
                                    const strata::core::OnDevice on(stages[i]->dev);
@@ -18463,7 +18556,6 @@ int main(int argc, char** argv) {
                                      "whole prompt through the batched path, none of it through the verify windows\n");
             }
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (tp1) return true;
                 if (no_short || b - a > req_short_read) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
@@ -18698,7 +18790,7 @@ int main(int argc, char** argv) {
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
                     if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
                         if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
-                        host_res[(size_t) i] = slot;
+                        (*p.res)[(size_t) i] = slot;
                         continue;
                     }
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
@@ -18707,7 +18799,7 @@ int main(int argc, char** argv) {
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
-                    host_res[(size_t) i] = slot;
+                    (*p.res)[(size_t) i] = slot;
                 }
                 return true;
             };
@@ -18811,20 +18903,33 @@ int main(int argc, char** argv) {
                 const int64_t floor_t = Prefill::stream_all_min_tokens();
                 const bool tail_ok = tail_loan_on && pf_parts.size() == 1 && stages.empty() && !multi_gpu && !peer.valid() &&
                                      !o.prefill_head_alias && o.batch <= 1;
+                int64_t common_want = want;
+                if (pf_parts.size() > 1 && !o.prefill_head_alias) {
+                    for (const PfPart& p : pf_parts) {
+                        if (p.first < 0) continue;
+                        int64_t wp = common_want;
+                        int64_t need_p = part_slots(p, wp, -1);
+                        while ((need_p <= 0 || need_p + g_lend_keep > p.cache->slots()) && wp > 256) {
+                            wp = std::max<int64_t>(256, wp / 2 / 256 * 256);
+                            need_p = part_slots(p, wp, -1);
+                        }
+                        common_want = std::min(common_want, wp);
+                    }
+                }
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     if (!p.lent.empty()) {
                         // its current loan already covers this: the chunk, and (a fused layout) the tail the segment's last
                         // chunk needs when it is read in the loan's own chunks
-                        if (tail_ok && !dbg_tail_noreuse ? lr::reuse_ok(want, tokens, p.lent_chunk, p.sp->tail_room(), floor_t)
-                                                         : want <= p.lent_chunk) continue;
+                        if (tail_ok && !dbg_tail_noreuse ? lr::reuse_ok(common_want, tokens, p.lent_chunk, p.sp->tail_room(), floor_t)
+                                                         : common_want <= p.lent_chunk) continue;
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
                         if (!refill_one(p, e)) return false;
                     }
                     const strata::core::OnDevice on(p.dev);
-                    int64_t want_p = want;
+                    int64_t want_p = common_want;
                     int64_t tail_p = -1;   // the tail the layout is laid out with (-1: floor - 1)
                     int32_t first = p.first_now;
                     // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout.
@@ -18901,9 +19006,9 @@ int main(int argc, char** argv) {
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
-                            if (host_res[i] >= first) {
-                                p.lent.emplace_back((int32_t) i, host_res[i]);
-                                host_res[i] = strata::core::kNotResident;
+                            if ((*p.res)[i] >= first) {
+                                p.lent.emplace_back((int32_t) i, (*p.res)[i]);
+                                (*p.res)[i] = strata::core::kNotResident;
                                 any = true;
                             }
                         }
