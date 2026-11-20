@@ -23,6 +23,18 @@
 
 namespace strata::core {
 namespace {
+int g_tp_rank = 0;
+int g_tp_world = 1;
+int64_t tp2_global_v_head(int rank, int64_t lv) {
+    return (lv / 8) * 16 + (int64_t) rank * 8 + (lv % 8);
+}
+int64_t tp2_global_conv_ch(int rank, int64_t lc) {
+    if (lc < 1024) return (int64_t) rank * 1024 + lc;
+    if (lc < 2048) return 2048 + (int64_t) rank * 1024 + (lc - 1024);
+    const int64_t lv = (lc - 2048) / 128;
+    const int64_t col = (lc - 2048) % 128;
+    return 4096 + tp2_global_v_head(rank, lv) * 128 + col;
+}
 
 constexpr uint64_t CHUNK = 8ull << 20;   // 8 MiB of SOURCE per staging round
 
@@ -491,6 +503,69 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         wr.file_id = r.file;
         wr.scales_fp16 = r.scales_fp16 != 0;
         wr.act_kind = r.act_kind;
+        if (g_tp_world == 2 && r.name.rfind("blk.", 0) == 0) {
+            if ((r.name.ends_with(".ssm_a") || r.name.ends_with(".ssm_dt.bias")) &&
+                wr.ne0 == 48 && wr.bytes == 192) {
+                std::vector<uint8_t> h_full(192), h_half(96);
+                if (cudaMemcpy(h_full.data(), dst_base + r.dst_off, 192, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    err = "tp2 shard D2H failed for " + r.name;
+                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    return false;
+                }
+                for (int64_t lv = 0; lv < 24; ++lv) {
+                    const int64_t gv = tp2_global_v_head(g_tp_rank, lv);
+                    std::memcpy(h_half.data() + lv * 4, h_full.data() + gv * 4, 4);
+                }
+                if (cudaMemcpy(dst_base + r.dst_off, h_half.data(), 96, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "tp2 shard H2D failed for " + r.name;
+                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    return false;
+                }
+                wr.ne0 = 24;
+                wr.elements = 24;
+                wr.bytes = 96;
+            } else if ((r.name.ends_with(".ssm_alpha.weight") || r.name.ends_with(".ssm_beta.weight")) &&
+                       wr.ne0 == 2560 && wr.ne1 == 48 && wr.bytes == 245760) {
+                std::vector<uint8_t> h_full(245760), h_half(122880);
+                if (cudaMemcpy(h_full.data(), dst_base + r.dst_off, 245760, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    err = "tp2 shard D2H failed for " + r.name;
+                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    return false;
+                }
+                for (int64_t lv = 0; lv < 24; ++lv) {
+                    const int64_t gv = tp2_global_v_head(g_tp_rank, lv);
+                    std::memcpy(h_half.data() + lv * 5120, h_full.data() + gv * 5120, 5120);
+                }
+                if (cudaMemcpy(dst_base + r.dst_off, h_half.data(), 122880, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "tp2 shard H2D failed for " + r.name;
+                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    return false;
+                }
+                wr.ne1 = 24;
+                wr.elements = 2560 * 24;
+                wr.bytes = 122880;
+            } else if (r.name.ends_with(".ssm_conv1d.weight") &&
+                       wr.ne0 == 4 && wr.ne1 == 10240 && wr.bytes == 163840) {
+                std::vector<uint8_t> h_full(163840), h_half(81920);
+                if (cudaMemcpy(h_full.data(), dst_base + r.dst_off, 163840, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    err = "tp2 shard D2H failed for " + r.name;
+                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    return false;
+                }
+                for (int64_t lc = 0; lc < 5120; ++lc) {
+                    const int64_t gc = tp2_global_conv_ch(g_tp_rank, lc);
+                    std::memcpy(h_half.data() + lc * 16, h_full.data() + gc * 16, 16);
+                }
+                if (cudaMemcpy(dst_base + r.dst_off, h_half.data(), 81920, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "tp2 shard H2D failed for " + r.name;
+                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    return false;
+                }
+                wr.ne1 = 5120;
+                wr.elements = 4 * 5120;
+                wr.bytes = 81920;
+            }
+        }
         table_[r.name] = wr;
 
         ++report_.tensors;
@@ -509,6 +584,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
     return true;
 }
+
+void WeightTable::set_tp_shard(int rank, int world) { g_tp_rank = rank; g_tp_world = world; }
 
 const WeightRef* WeightTable::find(const std::string& name) const {
     const auto it = table_.find(name);

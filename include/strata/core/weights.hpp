@@ -145,6 +145,7 @@ public:
     bool load_hc_q8(const std::string& pack_dir, uint64_t& bytes, std::string& err);
     /// The tensor names `load_hc_q8` converts, for the loader's skip set.
     static void hc_q8_names(int64_t n_layers, std::set<std::string>& out);
+    static void set_tp_shard(int rank, int world);
     const std::map<std::string, WeightRef>& all() const { return table_; }
     const LoadReport& report() const { return report_; }
 

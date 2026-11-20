@@ -5005,6 +5005,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 distinct[nd++] = i;
                 const int32_t e = ids[i];
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                    !(d.tp_res1 != nullptr && d.tp_res1[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) &&
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
@@ -5055,6 +5056,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         static const bool pcie_min1 = [] { const char* v = std::getenv("STRATA_PCIE_MIN1"); return v && std::atoi(v) != 0; }();
         if (pcie_min1 && pcie_ok && m < 1 && nmiss >= 2) m = 1;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
+        int groups1 = 0, entries1 = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
         int64_t pcie_i0[64];
@@ -5070,6 +5072,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int32_t e = ids[distinct[q]];   // a tail-skipped miss is not fetched
                 // (an unpinned blob cannot be fetched: under STRATA_PIN_BY_NEED a PCIe layer is pinned in part)
                 if (!skip_d[q] && e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
+                    !(d.tp_res1 != nullptr && d.tp_res1[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) &&
                     d.src->pinned(d.layers, e))
                     mq[nm++] = q;
             }
@@ -5092,6 +5095,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;
                     ptr = (unsigned long long) (d.cache_base + (d.cache_slot_off ? (size_t) d.cache_slot_off[slot]
                                                                                  : (size_t) slot * (size_t) d.cache_blob));
+                } else if (d.tp_plan1 != nullptr && d.tp_res1 != nullptr &&
+                           d.tp_res1[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) {
+                    const int32_t slot1 = d.tp_res1[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
+                    kd = 2;
+                    const unsigned long long ptr1 = (unsigned long long) (d.tp_cache_base1 +
+                        (d.tp_cache_slot_off1 ? (size_t) d.tp_cache_slot_off1[slot1]
+                                              : (size_t) slot1 * (size_t) d.cache_blob));
+                    GpuPlanSink& P1 = *d.tp_plan1;
+                    P1.ptr[groups1] = ptr1;
+                    P1.start[groups1] = entries1;
+                    for (int64_t i = i0; i < n; ++i)
+                        if (first_of[i] == i0) {
+                            P1.dst[entries1] = (int32_t) i;
+                            P1.tok[entries1] = (int32_t) (i / k);
+                            ++entries1;
+                        }
+                    ++groups1;
                 } else if (d.peer != nullptr && d.peer->has(d.layers, e)) {
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
@@ -5184,12 +5204,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (ids[i] >= 0 && ids[i] < d.n_expert) d.fetch_mark[(size_t) ids[i]] = 0;
         }
         P.start2[fetches] = entries;
+        int entries_all = entries;
+        if (d.tp_plan1 != nullptr) {
+            for (int64_t i = 0; i < n; ++i)
+                if (kind[i] == 2) P.dst[entries_all++] = (int32_t) i;
+            GpuPlanSink& P1 = *d.tp_plan1;
+            P1.start[groups1] = entries1;
+            P1.start2[0] = entries1;
+            P1.counts[0] = groups1;
+            P1.counts[1] = entries1;
+            P1.counts[2] = 0;
+            P1.counts[3] = entries1;
+        }
         P.counts[0] = groups;
         P.counts[1] = entries;
         P.counts[2] = fetches;
+        P.counts[3] = entries_all;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         pt("publish", fetches);
         if (P.publish) P.publish(P.ctx);
+        if (d.tp_plan1 != nullptr && d.tp_plan1->publish) d.tp_plan1->publish(d.tp_plan1->ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
     } else {
@@ -5328,7 +5362,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
                 if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
-                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
+                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1 || (d.tp_plan1 != nullptr && kind[i] == 2)))))
                     std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
             }

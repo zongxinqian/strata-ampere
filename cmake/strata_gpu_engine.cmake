@@ -94,6 +94,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/qsa_pattn.cu
                           src/kernels/cuda/verify_kernels.cu
+                          src/kernels/cuda/tp_comm.cu
                           src/kernels/cuda/dflash2.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp

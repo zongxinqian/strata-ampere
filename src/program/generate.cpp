@@ -4515,6 +4515,14 @@ int main(int argc, char** argv) {
     // prompt path (each stage's prompt path has its own buffers).
     // --pcie-frac given: that one share is every stage's (the stages' own link probes are skipped), so a split over
     // a fast and a slow link cannot set the two apart from the command line (#485)
+    const bool tp2_on = std::getenv("STRATA_TP2") != nullptr && std::atoi(std::getenv("STRATA_TP2")) != 0;
+    if (tp2_on) {
+        o.layer_split.clear();
+        o.pipeline_windows = 0;
+        o.prompt_cache = 0;
+        o.conversation_cache_mib = 0;
+        o.adapt_every = 1000000000;
+    }
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
@@ -5371,6 +5379,12 @@ int main(int argc, char** argv) {
                              o.native_preset.c_str(), e.what());
                 return 1;
             }
+        }
+        if (tp2_on) {
+            g = strata::core::tp2_geometry(g);
+            strata::core::WeightTable::set_tp_shard(0, 2);
+            strata::core::NativeDense::set_tp_shard(0, 2);
+            std::fprintf(stderr, "strata generate: STRATA_TP2=1: Dual-GPU Tensor Parallel (TP=2) + Expert Parallel (EP=2) active\n");
         }
         using RST = strata::kernels::RopeScalingType;
         if (!o.rope_scaling.empty()) {
@@ -7253,6 +7267,20 @@ int main(int argc, char** argv) {
     // the experts no GPU holds over ALL the layers (with CUDA0's share alone, a copy that did not fit kept only layers
     // 0..K-1's experts and read every later layer's from the files)
     std::vector<std::pair<int32_t, int32_t>> profile_all;
+    std::vector<std::pair<int32_t, int32_t>> tp1_profile;
+    if (tp2_on && !profile.empty()) {
+        profile_all = profile;
+        std::vector<std::pair<int32_t, int32_t>> p0;
+        p0.reserve((profile.size() + 1) / 2);
+        tp1_profile.reserve(profile.size() / 2);
+        for (size_t i = 0; i < profile.size(); ++i) {
+            if ((i & 1u) == 0) p0.push_back(profile[i]);
+            else tp1_profile.push_back(profile[i]);
+        }
+        profile.swap(p0);
+        std::fprintf(stderr, "strata generate: STRATA_TP2=1: partitioned %zu profiled experts into %zu (CUDA0) + %zu (CUDA1) disjoint sets\n",
+                     profile_all.size(), profile.size(), tp1_profile.size());
+    }
     if (multi_gpu) {
         profile_all = profile;
         std::vector<std::pair<int32_t, int32_t>> mine;
@@ -9231,6 +9259,122 @@ int main(int argc, char** argv) {
         }
     }
 
+    struct TpPeerStage {
+        int dev = 1;
+        void* arena = nullptr;
+        uint64_t arena_bytes = 0;
+        strata::core::WeightTable wt;
+        strata::core::NativeDense dense;
+        void* sbuf = nullptr;
+        strata::core::SessionState ss;
+        float* ple_emb_dev = nullptr;
+        float* ple_scratch = nullptr;
+        strata::core::ExpertCache cache;
+        std::vector<int32_t> host_res;
+        int32_t* d_res = nullptr;
+        strata::core::Verifier ver;
+        strata::core::TpComm comm;
+    };
+    std::unique_ptr<TpPeerStage> tp1;
+    if (tp2_on) {
+        tp1 = std::make_unique<TpPeerStage>();
+        const strata::core::OnDevice on1(tp1->dev);
+        strata::core::WeightTable::set_tp_shard(1, 2);
+        strata::core::NativeDense::set_tp_shard(1, 2);
+        tp1->arena_bytes = pool_bytes;
+        if (cudaMalloc(&tp1->arena, pool_bytes) != cudaSuccess ||
+            !tp1->wt.load(o.pack, tp1->arena, pool_bytes, err, skip.empty() ? nullptr : &skip)) {
+            std::fprintf(stderr, "strata generate: TP2 CUDA1 weights: %s\n", err.c_str());
+            return 1;
+        }
+        if (!o.native_dense_gguf.empty() &&
+            !tp1->dense.load(o.native_dense_gguf, tp1->wt, err, o.native_ple_key)) {
+            std::fprintf(stderr, "strata generate: TP2 CUDA1 native dense: %s\n", err.c_str());
+            return 1;
+        }
+        strata::core::WeightTable::set_tp_shard(0, 2);
+        strata::core::NativeDense::set_tp_shard(0, 2);
+        if (cudaMalloc(&tp1->sbuf, strata::core::session_bytes(g, o.max_context, K, 0, g.n_layers)) != cudaSuccess ||
+            strata::core::session_init(g, o.max_context, K, tp1->sbuf, tp1->ss, 0, g.n_layers) == 0) {
+            std::fprintf(stderr, "strata generate: TP2 CUDA1 session_init failed\n");
+            return 1;
+        }
+        if (!o.ple_gguf.empty()) {
+            const strata::core::WeightRef *wk = tp1->wt.find("blk.1.ple_key.weight"),
+                                          *wv = tp1->wt.find("blk.1.ple_value.weight"),
+                                          *wnk = tp1->wt.find("blk.1.ple_norm_key.weight"),
+                                          *wnq = tp1->wt.find("blk.1.ple_norm_query.weight"),
+                                          *wnc = tp1->wt.find("blk.1.ple_norm_conv.weight"),
+                                          *wc = tp1->wt.find("blk.1.ple_conv1d.weight");
+            if (!wk || !wv || !wnk || !wnq || !wnc || !wc) {
+                std::fprintf(stderr, "strata generate: TP2 CUDA1 missing blk.1.ple_* tensors\n");
+                return 1;
+            }
+            if (!wk->quantized()) tp1->ss.ple.w.key_bf16 = (const uint16_t*) wk->data;
+            else if (wk->data != nullptr) {
+                tp1->ss.ple.w.key_codes = (const uint8_t*) wk->data;
+                tp1->ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
+            }
+            if (o.native_ple_key && wk->quantized()) {
+                tp1->ss.ple.w.key_native_data = wk->native_data;
+                tp1->ss.ple.w.key_native_type = wk->native_type;
+                tp1->ss.ple.w.key_native_q8_1 = wk->native_q8_1;
+            }
+            tp1->ss.ple.w.value_bf16 = (const uint16_t*) wv->data;
+            tp1->ss.ple.w.norm_key = (const float*) wnk->data;
+            tp1->ss.ple.w.norm_query = (const float*) wnq->data;
+            tp1->ss.ple.w.norm_conv = (const float*) wnc->data;
+            tp1->ss.ple.w.conv1d_f16 = (const uint16_t*) wc->data;
+            tp1->ss.ple.consts = ple_consts_run;
+            tp1->ss.ple.table = &ple_table;
+            tp1->ss.ple.token = &tp1->ss.ple_token;
+            tp1->ss.ple.prev = tp1->ss.ple_prev;
+            tp1->ss.ple.hist = tp1->ss.ple_hist;
+            tp1->ss.ple.emb_host = ple_emb_host.data();
+            if (cudaMalloc((void**) &tp1->ple_emb_dev, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess ||
+                cudaMalloc((void**) &tp1->ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: TP2 CUDA1 PLE buffers failed\n");
+                return 1;
+            }
+            tp1->ss.ple.emb_dev = tp1->ple_emb_dev;
+            tp1->ss.ple.scratch = tp1->ple_scratch;
+        }
+        strata::core::session_zero(tp1->ss, g, nullptr, nullptr);
+        cudaDeviceSynchronize();
+        const auto& lay1 = strata::kernels::cpu::expert_layout();
+        size_t fb1 = 0, tb1 = 0;
+        cudaMemGetInfo(&fb1, &tb1);
+        const int64_t reserve1 = (int64_t) std::max(o.vram_reserve_mib, 1024) << 20;
+        const int64_t room1 = (int64_t) fb1 > reserve1 ? (int64_t) fb1 - reserve1 : 0;
+        std::vector<int64_t> sized1;
+        int64_t used1 = 0;
+        for (const auto& pr : tp1_profile) {
+            const int64_t b = native_pack ? strata::core::ExpertCache::slot_stride((int64_t) nib::slot_bytes(pr.first), slot_guard)
+                                          : (int64_t) lay1.max_blob;
+            if (used1 + b > room1) break;
+            used1 += b;
+            sized1.push_back((int64_t) nib::slot_bytes(pr.first));
+        }
+        tp1->cache.set_slot_guard(slot_guard);
+        if (!tp1->cache.open_sized(sized1, g.n_layers, g.n_expert, err)) {
+            std::fprintf(stderr, "strata generate: TP2 CUDA1 expert cache open failed: %s\n", err.c_str());
+            return 1;
+        }
+        int64_t filled1 = 0;
+        for (const auto& pr : tp1_profile) {
+            if (filled1 >= tp1->cache.slots()) break;
+            const int32_t slot = tp1->cache.admit(pr.first, pr.second);
+            if (slot == strata::core::kNotResident) break;
+            const uint8_t* b = srcp->blob_stable(pr.first, pr.second);
+            if (b == nullptr || !tp1->cache.fill_slot_blocking(slot, b, err, (int64_t) lay1.blob_bytes(pr.first))) {
+                std::fprintf(stderr, "strata generate: TP2 CUDA1 profile fill failed at %lld: %s\n", (long long) filled1, err.c_str());
+                return 1;
+            }
+            ++filled1;
+        }
+        std::fprintf(stderr, "strata generate: STRATA_TP2=1: CUDA1 loaded %.2f MiB dense weights + session, expert cache %lld slots (%.2f GiB) filled\n",
+                     (double) tp1->dense.weight_bytes() / 1048576.0, (long long) tp1->cache.slots(), tp1->cache.gib());
+    }
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -10313,11 +10457,35 @@ int main(int argc, char** argv) {
                 host_res[(size_t) (l * g.n_expert + e)] = slot;
                 if (slot != strata::core::kNotResident) ++resident;
             }
+        if (tp1) {
+            tp1->host_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+            int64_t res1 = 0;
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e) {
+                    const int32_t s1 = tp1->cache.slot_of(l, e);
+                    tp1->host_res[(size_t) (l * g.n_expert + e)] = s1;
+                    if (s1 != strata::core::kNotResident) ++res1;
+                }
+            const strata::core::OnDevice on1(tp1->dev);
+            if (cudaMalloc((void**) &tp1->d_res, tp1->host_res.size() * sizeof(int32_t)) != cudaSuccess ||
+                cudaMemcpy(tp1->d_res, tp1->host_res.data(), tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: TP2 CUDA1 residency table failed\n");
+                return 1;
+            }
+            resident += res1;
+        }
         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
             cudaMalloc((void**) &d_hit_count, sizeof(int32_t)) != cudaSuccess ||
             res_put(d_res) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the device residency table could not be staged\n");
             return 1;
+        }
+        if (tp1) {
+            std::vector<int32_t> combined_res = host_res;
+            for (size_t i = 0; i < combined_res.size(); ++i)
+                if (combined_res[i] < 0 && tp1->host_res[i] >= 0) combined_res[i] = 0;
+            cudaMemcpy(d_res, combined_res.data(), combined_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            cudaStreamSynchronize(nullptr);
         }
         thits.d_res = d_res;
         thits.n_expert = g.n_expert;
@@ -10331,7 +10499,7 @@ int main(int argc, char** argv) {
             uint64_t released = 0;
             if (!keep)
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] != strata::core::kNotResident)
+                    if (host_res[i] != strata::core::kNotResident || (tp1 && tp1->host_res[i] != strata::core::kNotResident))
                         released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
             if (released > 0)
                 std::fprintf(stderr, "strata generate: expert arena: %.2f GiB of VRAM-held experts handed back to the OS\n",
@@ -11170,6 +11338,11 @@ int main(int argc, char** argv) {
         // (true of the single lend region only: the stage_lend_regions block below hands every part's
         // borrowed tail to the copy as well, so under a split the copy keeps a lend region per part again)
         std::vector<std::pair<int32_t, int32_t>> stage_pairs;
+        if (tp1) {
+            for (int64_t l = 0; l < g.n_layers; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (tp1->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
+        }
         for (auto& st : stages)
             for (int64_t l = st->lb; l < st->le; ++l)
                 for (int64_t e = 0; e < g.n_expert; ++e)
@@ -12620,6 +12793,35 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
+        if (tp1) {
+            if (!tp1->comm.init(0, tp1->dev, 512 * (size_t) g.n_embd, err)) {
+                std::fprintf(stderr, "strata serve: TP2 comm init: %s\n", err.c_str());
+                return 1;
+            }
+            {
+                const strata::core::OnDevice on1(tp1->dev);
+                strata::core::VerifyHits vh1;
+                vh1.d_res = tp1->d_res;
+                vh1.h_res = tp1->host_res.data();
+                vh1.cache_base = (const uint8_t*) tp1->cache.device_slot(0);
+                vh1.blob = thits.blob;
+                vh1.slot_off = tp1->cache.slot_offsets();
+                vh1.n_slots = tp1->cache.slots();
+                if (!tp1->ver.init(tp1->wt, g, tp1->ss, vh1, nullptr, batch_max_t(), err)) {
+                    std::fprintf(stderr, "strata serve: TP2 CUDA%d verifier init: %s\n", tp1->dev, err.c_str());
+                    return 1;
+                }
+            }
+            tp1->ver.set_tp(&tp1->comm, 1, false, nullptr);
+            ver.set_tp(&tp1->comm, 0, true, &tp1->ver);
+            drive.d.tp_plan1 = tp1->ver.plan_sink();
+            drive.d.tp_res1 = tp1->host_res.data();
+            drive.d.tp_cache_base1 = (const uint8_t*) tp1->cache.device_slot(0);
+            drive.d.tp_cache_slot_off1 = tp1->cache.slot_offsets();
+            std::fprintf(stderr, "strata serve: STRATA_TP2=1 ready: CUDA0 (%lld experts) + CUDA%d (%lld experts) = %lld total resident experts\n",
+                         (long long) xcache.slots(), tp1->dev, (long long) tp1->cache.slots(),
+                         (long long) (xcache.slots() + tp1->cache.slots()));
+        }
 #if defined(STRATA_HAVE_DFLASH2)
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2 prompt taps on a layer split.  Every stage's prompt path taps the requested layers it runs into its own staging and hands them to its
@@ -15233,6 +15435,11 @@ int main(int argc, char** argv) {
                 }
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
+                if (tp1) {
+                    const strata::core::OnDevice on1(tp1->dev);
+                    strata::core::session_zero(tp1->ss, g, nullptr, nullptr);
+                    cudaDeviceSynchronize();
+                }
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -17962,6 +18169,11 @@ int main(int argc, char** argv) {
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
+                if (tp1) {
+                    const strata::core::OnDevice on1(tp1->dev);
+                    strata::core::session_zero(tp1->ss, g, nullptr, nullptr);
+                    cudaDeviceSynchronize();
+                }
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
@@ -18119,6 +18331,7 @@ int main(int argc, char** argv) {
                                      "whole prompt through the batched path, none of it through the verify windows\n");
             }
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
+                if (tp1) return true;
                 if (no_short || b - a > req_short_read) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)

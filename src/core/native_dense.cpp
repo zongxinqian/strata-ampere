@@ -38,6 +38,79 @@ uint64_t alloc_bytes(uint64_t bytes) {
     return bytes < kSmallAlloc ? bytes : (bytes + kAllocGranule - 1) / kAllocGranule * kAllocGranule;
 }
 int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1: every layer
+int g_tp_dense_rank = 0, g_tp_dense_world = 1;
+int64_t tp2_dense_global_v_head(int rank, int64_t lv) {
+    return (lv / 8) * 16 + (int64_t) rank * 8 + (lv % 8);
+}
+int64_t tp2_dense_global_conv_ch(int rank, int64_t lc) {
+    if (lc < 1024) return (int64_t) rank * 1024 + lc;
+    if (lc < 2048) return 2048 + (int64_t) rank * 1024 + (lc - 1024);
+    const int64_t lv = (lc - 2048) / 128;
+    const int64_t col = (lc - 2048) % 128;
+    return 4096 + tp2_dense_global_v_head(rank, lv) * 128 + col;
+}
+bool tp2_slice_q8_0(const std::string& name, int rank, const uint8_t* src,
+                    int64_t& ne0, int64_t& ne1, std::vector<uint8_t>& out) {
+    if (name.ends_with(".attn_qkv.weight") && ne0 == 2560 && ne1 == 10240) {
+        constexpr size_t rb = 2560 / 32 * 34;
+        out.resize(5120 * rb);
+        for (int64_t lc = 0; lc < 5120; ++lc) {
+            const int64_t gc = tp2_dense_global_conv_ch(rank, lc);
+            std::memcpy(out.data() + (size_t) lc * rb, src + (size_t) gc * rb, rb);
+        }
+        ne1 = 5120;
+        return true;
+    }
+    if (name.ends_with(".attn_gate.weight") && ne0 == 2560 && ne1 == 6144) {
+        constexpr size_t rb = 2560 / 32 * 34;
+        out.resize(3072 * rb);
+        for (int64_t lv = 0; lv < 24; ++lv) {
+            const int64_t gv = tp2_dense_global_v_head(rank, lv);
+            std::memcpy(out.data() + (size_t) lv * 128 * rb, src + (size_t) gv * 128 * rb, 128 * rb);
+        }
+        ne1 = 3072;
+        return true;
+    }
+    if (name.ends_with(".attn_q.weight") || name.ends_with(".attn_k.weight") ||
+        name.ends_with(".attn_v.weight") || name.ends_with(".ffn_gate_shexp.weight") ||
+        name.ends_with(".ffn_up_shexp.weight")) {
+        const int64_t half_rows = ne1 / 2;
+        const size_t rb = (size_t) (ne0 / 32 * 34);
+        out.resize((size_t) half_rows * rb);
+        std::memcpy(out.data(), src + (size_t) rank * (size_t) half_rows * rb, out.size());
+        ne1 = half_rows;
+        return true;
+    }
+    if (name.ends_with(".ssm_out.weight") && ne0 == 6144 && ne1 == 2560) {
+        constexpr size_t srb = 6144 / 32 * 34;
+        constexpr size_t drb = 3072 / 32 * 34;
+        constexpr size_t hb = 128 / 32 * 34;
+        out.resize((size_t) ne1 * drb);
+        for (int64_t r = 0; r < ne1; ++r) {
+            const uint8_t* srow = src + (size_t) r * srb;
+            uint8_t* drow = out.data() + (size_t) r * drb;
+            for (int64_t lv = 0; lv < 24; ++lv) {
+                const int64_t gv = tp2_dense_global_v_head(rank, lv);
+                std::memcpy(drow + (size_t) lv * hb, srow + (size_t) gv * hb, hb);
+            }
+        }
+        ne0 = 3072;
+        return true;
+    }
+    if (name.ends_with(".attn_output.weight") || name.ends_with(".ffn_down_shexp.weight")) {
+        const int64_t half_cols = ne0 / 2;
+        const size_t srb = (size_t) (ne0 / 32 * 34);
+        const size_t drb = (size_t) (half_cols / 32 * 34);
+        out.resize((size_t) ne1 * drb);
+        for (int64_t r = 0; r < ne1; ++r) {
+            std::memcpy(out.data() + (size_t) r * drb,
+                        src + (size_t) r * srb + (size_t) rank * drb, drb);
+        }
+        ne0 = half_cols;
+        return true;
+    }
+    return false;
+}
 bool in_range(const std::string& name) {
     if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
     const int l = std::atoi(name.c_str() + 4);
@@ -213,6 +286,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
+void NativeDense::set_tp_shard(int rank, int world) { g_tp_dense_rank = rank; g_tp_dense_world = world; }
 // The byte walk `load` does for the layers [lb, le), without the allocations: the same filters in the same order,
 // reading the GGUF headers and the canonical table only, so it needs no device.  A later stage's projections are not
 // on the card when the split search prices that stage, and `load` runs one cudaMalloc per matrix (#1238).  The two
@@ -267,7 +341,9 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                     err = "native dense: incompatible matrix " + tensor.name;
                     return false;
                 }
-                total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
+                uint64_t wb = strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1);
+                if (g_tp_dense_world == 2 && tensor.name != "blk.1.ple_key.weight") wb /= 2;
+                total += alloc_bytes(wb);
             }
         }
         if (hc_q8_env())   // a bf16 pack: `load` quantizes the layers' down / up projections that the GGUF does not carry as Q8_0
@@ -448,13 +524,22 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
+                std::vector<uint8_t> tp_sliced;
+                const void* src_host_ptr = gguf.tensor_data(tensor);
+                if (g_tp_dense_world == 2 && tensor.type == 8 &&
+                    tp2_slice_q8_0(tensor.name, g_tp_dense_rank, (const uint8_t*) src_host_ptr,
+                                   ref.ne0, ref.ne1, tp_sliced)) {
+                    ref.elements = ref.ne0 * ref.ne1;
+                    ref.bytes = tp_sliced.size();
+                    src_host_ptr = tp_sliced.data();
+                }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
                 if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                    status = cudaMemcpy(data.get(), src_host_ptr, bytes, cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
@@ -475,7 +560,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     strata::kernels::native_q8_0_packed_enabled() &&
                     strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1)) {
                     std::vector<uint8_t> host(bytes);
-                    strata::kernels::native_q8_0_pack_host(gguf.tensor_data(tensor), host.data(), (int) ref.ne0,
+                    strata::kernels::native_q8_0_pack_host(src_host_ptr, host.data(), (int) ref.ne0,
                                                            (int) ref.ne1);
                     void* packed_allocation = nullptr;
                     auto packed_status = cudaMalloc(&packed_allocation, bytes);

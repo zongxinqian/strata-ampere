@@ -89,4 +89,17 @@ inline bool is_qsa_layer(const ModelGeometry& g, int64_t layer) {
     return layer % g.qsa_interval == g.qsa_interval - 1;
 }
 
+/// Dual-GPU Tensor Parallel (TP=2) per-rank geometry: splits GDN K/V heads, QSA Q/KV heads,
+/// and shared expert FFN intermediate dimension 50/50 across Rank 0 and Rank 1.
+inline ModelGeometry tp2_geometry(ModelGeometry g) {
+    g.ssm_k_heads /= 2;
+    g.ssm_v_heads /= 2;
+    g.ssm_conv_channels = 2 * g.ssm_state_size * g.ssm_k_heads + g.ssm_state_size * g.ssm_v_heads;
+    g.ssm_value_dim = g.ssm_state_size * g.ssm_v_heads;
+    g.n_head /= 2;
+    g.n_head_kv /= 2;
+    g.n_ff_shexp /= 2;
+    return g;
+}
+
 }  // namespace strata::core

@@ -616,6 +616,10 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
+    GpuPlanSink* tp_plan1 = nullptr;
+    const int32_t* tp_res1 = nullptr;
+    const uint8_t* tp_cache_base1 = nullptr;
+    const uint64_t* tp_cache_slot_off1 = nullptr;
     int pcie_num = 0;
     PcieModel pcie_model;          ///< Verifier::set_pcie_balance: the PCIe count from measured costs
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows

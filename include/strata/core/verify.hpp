@@ -27,6 +27,7 @@
 #include "strata/core/flag_order.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/tp_comm.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -225,6 +226,10 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    void set_tp(TpComm* tp, int rank, bool head_owner, Verifier* peer = nullptr) {
+        tp_ = tp; tp_rank_ = rank; tp_head_owner_ = head_owner; tp_peer_ = peer;
+        if (tp != nullptr) { device_plan_ = false; all_resident_ = false; }
+    }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -625,6 +630,10 @@ private:
     bool chain_overlap() const;          ///< this stage hands off through a flag to a next stage that waits on it
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    TpComm* tp_ = nullptr;
+    int tp_rank_ = 0;
+    bool tp_head_owner_ = true;
+    Verifier* tp_peer_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
