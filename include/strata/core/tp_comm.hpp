@@ -8,6 +8,8 @@ namespace strata::core {
 
 class TpComm {
 public:
+    static constexpr size_t kRingSlots = 8;
+
     TpComm() = default;
     ~TpComm();
     TpComm(const TpComm&) = delete;
@@ -22,6 +24,7 @@ public:
 private:
     int dev_[2] = {0, 1};
     size_t max_floats_ = 0;
+    size_t slot_floats_ = 0;
     float* h_buf_[2] = {nullptr, nullptr};
     uint32_t* h_flag_[2] = {nullptr, nullptr};
     float* m_buf_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};

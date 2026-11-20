@@ -1386,6 +1386,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
     };
+    uint32_t tp_step = 0;
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     // S26 STRATA_LFUSE=1: where the shared expert's gate / scale fusions apply (the paths they replace are the ones taken)
     auto lfuse_on = [&](int n) {
@@ -1803,7 +1804,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
                 if (tp_ != nullptr)
-                    tp_->allreduce_add(bo_ + tb * N, (int) (n * N), (uint32_t) (2 * ((l - lb_) * G + grp) + 1), tp_rank_, cs);
+                    tp_->allreduce_add(bo_ + tb * N, (int) (n * N), ++tp_step, tp_rank_, cs);
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];
@@ -1919,7 +1920,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         for (int t = tb; t < te; ++t) {
                             float* qx = qidx_ + t * IQ * ID;
                             bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), ns);
-                            norm_rope_s(qx, wiqn, (int) IQ, (int) ID, pos_ + t * NH, ns);
+                            norm_rope_s(qx, wiqn, (int) IQ, (int) ID, pos_i + t * IQ, ns);
                         }
                 };
                 auto idx_select = [&](cudaStream_t ns) {
@@ -1998,7 +1999,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
-                else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
+                else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_k + t * NKV);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
                     fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
@@ -2185,7 +2186,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
                 if (tp_ != nullptr)
-                    tp_->allreduce_add(bo_ + tb * N, (int) (n * N), (uint32_t) (2 * ((l - lb_) * G + grp) + 1), tp_rank_, cs);
+                    tp_->allreduce_add(bo_ + tb * N, (int) (n * N), ++tp_step, tp_rank_, cs);
             }
         } catch (const std::exception& e) {
             err = "verify layer " + std::to_string(l) + ": " + e.what();
@@ -2409,14 +2410,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 wait_flag_ge(m_flagA_, ring, cs);
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
-            stamp(l, 19, grp);
-            grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
-            stamp(l, 20, grp);
             cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs);
-            hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && !sg_gated_[grp] && dec_batch && n > 1 &&
-                              native_moe_combine_enabled() && n <= 8 &&
-                              native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
-            if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            stamp(l, 19, grp);
+            grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
+            stamp(l, 20, grp);
         } else if (ar_on()) {
             strata::dispatch::note("experts layer: all-resident device plan, grouped experts straight into the parts (no doorbell, no CPU rows)");
             stamp(l, 19, grp);
@@ -2518,7 +2515,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         if (tp_ != nullptr)
-            tp_->allreduce_add(bo_ + tb * N, (int) (n * N), (uint32_t) (2 * ((l - lb_) * G + grp) + 2), tp_rank_, cs);
+            tp_->allreduce_add(bo_ + tb * N, (int) (n * N), ++tp_step, tp_rank_, cs);
         stamp(l, 24, grp);
         if (tap_on_ && (!batch_rec_ || tap_batch_) && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
             // the layer's completed output: R with this FFN half's write applied (the next layer's read would fold it), the mean of

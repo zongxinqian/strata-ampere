@@ -12785,6 +12785,14 @@ int main(int argc, char** argv) {
         if (use_df2) ver.set_taps(df2.tap_layers());
         if (batch_df2) ver.set_batch_taps(true);
 #endif
+        if (tp1) {
+            if (!tp1->comm.init(0, tp1->dev, 16 * (size_t) g.n_embd, err)) {
+                std::fprintf(stderr, "strata serve: TP2 comm init: %s\n", err.c_str());
+                return 1;
+            }
+            tp1->ver.set_tp(&tp1->comm, 1, false, nullptr);
+            ver.set_tp(&tp1->comm, 0, true, &tp1->ver);
+        }
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_max_t(), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -12794,10 +12802,6 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (tp1) {
-            if (!tp1->comm.init(0, tp1->dev, 512 * (size_t) g.n_embd, err)) {
-                std::fprintf(stderr, "strata serve: TP2 comm init: %s\n", err.c_str());
-                return 1;
-            }
             {
                 const strata::core::OnDevice on1(tp1->dev);
                 strata::core::VerifyHits vh1;
@@ -12812,8 +12816,6 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            tp1->ver.set_tp(&tp1->comm, 1, false, nullptr);
-            ver.set_tp(&tp1->comm, 0, true, &tp1->ver);
             drive.d.tp_plan1 = tp1->ver.plan_sink();
             drive.d.tp_res1 = tp1->host_res.data();
             drive.d.tp_cache_base1 = (const uint8_t*) tp1->cache.device_slot(0);
