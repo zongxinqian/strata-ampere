@@ -19579,8 +19579,13 @@ int main(int argc, char** argv) {
             // (with STRATA_IQ_MT_MIN=1 bit for bit; sampled requests with the same Philox draw per position).
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
+            // STRATA_PIPE_PENALTY=1 (aiden-3080, off by default): a request with penalties pipelines too.  Only the last
+            // stage samples, and it never runs a speculative window: when window A is launched there, every window before
+            // it has its verdict and `consumed` holds the committed tokens, so A's penalty rows are staged then (the
+            // same rows the serial loop stages), and a wrong guess is the existing undo path.
+            static const bool pl_pen_ok = [] { const char* e = std::getenv("STRATA_PIPE_PENALTY"); return e && std::atoi(e) != 0; }();
             const char* pl_serial = !pl_want ? nullptr
-                                  : hist_n > 0 ? "repetition penalties (penalty_last_n)"
+                                  : (hist_n > 0 && !pl_pen_ok) ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
@@ -20056,6 +20061,15 @@ int main(int argc, char** argv) {
                     if (A.finished && !A.s1) {
                         if (chain_kind == 1 && !B.ready) ++pl_late;   // stage 0 idles until the chain has B
                         if (ajob) a_gap(1);   // --adapt-async: stage 1 is idle until this launch
+                        if (hist_n > 0) {   // STRATA_PIPE_PENALTY: A's penalty rows, as the serial loop stages them
+                            strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0),
+                                                          A.tok, A.T, hist_n, hist_stage.data());
+                            const strata::core::OnDevice on_h(hist_dev);
+                            if (cudaMemcpy(d_hist, hist_stage.data(), (size_t) A.T * (size_t) hist_n * sizeof(int32_t),
+                                           cudaMemcpyHostToDevice) != cudaSuccess)
+                                return die("the penalty-history upload failed");
+                            V1(A).set_history(d_hist, hist_n);   // (the last stage's verifier; set_next reaches it in serial)
+                        }
                         if (!V1(A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
                         A.s1 = true;
                         tre("L1", A.seq, A.T);
