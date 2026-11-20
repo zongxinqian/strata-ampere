@@ -733,6 +733,82 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
     return true;
 }
 
+template <class ExcludeFn>
+bool tp2_peer_adapt(
+        int dev1, strata::core::ExpertCache& cache1, std::vector<int32_t>& res1,
+        cudaStream_t st1, cudaEvent_t ev1, std::vector<std::pair<int32_t, int32_t>>& pend1,
+        const std::vector<float>& usage, const std::vector<int32_t>& res0,
+        const std::vector<std::pair<int32_t, int32_t>>& pend0,
+        int64_t n_layers, int64_t n_expert, float min_gain, int adapt_swaps,
+        strata::core::FileExpertSource& src, strata::core::ExpertSource* srcp,
+        std::vector<uint8_t>& in_flight, bool evict_sync, bool& res_dirty,
+        std::vector<int32_t>& res_dirty_idx, int64_t& swapped_out, ExcludeFn&& extra_excl) {
+    swapped_out = 0;
+    if (st1 == nullptr || ev1 == nullptr || res1.empty()) return true;
+    struct Swap1 { float gain; int32_t layer, in, out; };
+    std::vector<Swap1> swaps1;
+    std::vector<uint8_t> pend0_in((size_t) (n_layers * n_expert), 0);
+    for (const auto& pr : pend0)
+        if (pr.first >= 0 && (size_t) pr.first < pend0_in.size()) pend0_in[(size_t) pr.first] = 1;
+    std::vector<std::pair<float, int32_t>> cand, vict;
+    for (int64_t l = 0; l < n_layers; ++l) {
+        cand.clear();
+        vict.clear();
+        const float* u = usage.data() + l * n_expert;
+        const int32_t* r0 = res0.data() + l * n_expert;
+        const int32_t* r1 = res1.data() + l * n_expert;
+        const uint8_t* p0 = pend0_in.data() + l * n_expert;
+        for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
+            if (r1[e] < 0) {
+                if (u[e] >= 2.0f && r0[e] < 0 && !p0[e] && !extra_excl(l, e)) cand.emplace_back(u[e], e);
+            } else {
+                vict.emplace_back(u[e], e);
+            }
+        }
+        if (cand.empty() || vict.empty()) continue;
+        std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        const size_t nc = std::min(cand.size(), vict.size());
+        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
+                          [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < nc; ++i) {
+            if (cand[i].first < vict[i].first + min_gain) break;
+            swaps1.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
+        }
+    }
+    std::sort(swaps1.begin(), swaps1.end(), [](const Swap1& a, const Swap1& b) { return a.gain > b.gain; });
+    if ((int) swaps1.size() > adapt_swaps) swaps1.resize((size_t) adapt_swaps);
+    if (!resident_stage_swaps(src, res1, n_expert, swaps1,
+                              [&](int64_t) -> SwapHome { return {&cache1, st1, dev1}; }))
+        return false;
+    swapped_out = (int64_t) swaps1.size();
+    if (swaps1.empty()) return true;
+    const strata::core::OnDevice on1(dev1);
+    for (const Swap1& s : swaps1) {
+        const size_t in = (size_t) s.layer * (size_t) n_expert + (size_t) s.in;
+        const size_t out = (size_t) s.layer * (size_t) n_expert + (size_t) s.out;
+        const int32_t slot = res1[out];
+        const uint8_t* b = srcp->blob_stable(s.layer, s.in);
+        nib::guard_raw(s.layer, "the TP2 peer adaptive tier's copy in");
+        if (slot < 0 || b == nullptr ||
+            adapt_copy_h2d(cache1.device_slot(slot), b,
+                           (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), st1) != cudaSuccess) {
+            std::fprintf(stderr, "strata: TP2 CUDA%d adaptive swap copy failed (layer %d, slot %d): %s\n",
+                         dev1, (int) s.layer, (int) slot, cudaGetErrorString(cudaGetLastError()));
+            return false;
+        }
+        res1[out] = strata::core::kNotResident;
+        srcp->prefetch(s.layer, s.out);
+        pend1.emplace_back((int32_t) in, slot);
+        if (!in_flight.empty()) in_flight[in] = 1;
+    }
+    if (evict_sync) {
+        for (const Swap1& s : swaps1) res_dirty_idx.push_back((int32_t) ((size_t) s.layer * (size_t) n_expert + (size_t) s.out));
+        res_dirty = true;
+    }
+    cudaEventRecord(ev1, st1);
+    return true;
+}
+
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
@@ -4521,7 +4597,6 @@ int main(int argc, char** argv) {
         o.pipeline_windows = 0;
         o.prompt_cache = 0;
         o.conversation_cache_mib = 0;
-        o.adapt_every = 1000000000;
     }
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
@@ -9274,6 +9349,9 @@ int main(int argc, char** argv) {
         int32_t* d_res = nullptr;
         strata::core::Verifier ver;
         strata::core::TpComm comm;
+        cudaStream_t adapt_stream = nullptr;
+        cudaEvent_t adapt_ev = nullptr;
+        std::vector<std::pair<int32_t, int32_t>> adapt_pending;
     };
     std::unique_ptr<TpPeerStage> tp1;
     if (tp2_on) {
@@ -9344,7 +9422,7 @@ int main(int argc, char** argv) {
         const auto& lay1 = strata::kernels::cpu::expert_layout();
         size_t fb1 = 0, tb1 = 0;
         cudaMemGetInfo(&fb1, &tb1);
-        const int64_t reserve1 = (int64_t) std::max(o.vram_reserve_mib, 1024) << 20;
+        const int64_t reserve1 = (int64_t) std::max(o.vram_reserve_mib, 512) << 20;
         const int64_t room1 = (int64_t) fb1 > reserve1 ? (int64_t) fb1 - reserve1 : 0;
         std::vector<int64_t> sized1;
         int64_t used1 = 0;
@@ -9371,6 +9449,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
             ++filled1;
+        }
+        if (cudaStreamCreateWithFlags(&tp1->adapt_stream, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaEventCreateWithFlags(&tp1->adapt_ev, cudaEventDisableTiming) != cudaSuccess) {
+            std::fprintf(stderr, "strata generate: TP2 CUDA1 adaptive stream/event creation failed\n");
+            return 1;
         }
         std::fprintf(stderr, "strata generate: STRATA_TP2=1: CUDA1 loaded %.2f MiB dense weights + session, expert cache %lld slots (%.2f GiB) filled\n",
                      (double) tp1->dense.weight_bytes() / 1048576.0, (long long) tp1->cache.slots(), tp1->cache.gib());
@@ -10439,7 +10522,14 @@ int main(int argc, char** argv) {
     // The residency table is read by kernels on non-blocking streams, which do not wait for the legacy stream a plain
     // cudaMemcpy runs on, and a pageable copy can return before its DMA has landed: each upload waits for its own copy
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
-    auto res_put = [&host_res](int32_t* dst) -> cudaError_t {
+    auto res_put = [&host_res, &tp1](int32_t* dst) -> cudaError_t {
+        if (tp1 && !tp1->host_res.empty()) {
+            std::vector<int32_t> combined = host_res;
+            for (size_t i = 0; i < combined.size(); ++i)
+                if (combined[i] < 0 && tp1->host_res[i] >= 0) combined[i] = 0;
+            const cudaError_t e = cudaMemcpy(dst, combined.data(), combined.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+            return e != cudaSuccess ? e : cudaStreamSynchronize(nullptr);
+        }
         const cudaError_t e = cudaMemcpy(dst, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         return e != cudaSuccess ? e : cudaStreamSynchronize(nullptr);
     };
@@ -14289,6 +14379,13 @@ int main(int argc, char** argv) {
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() -> cudaError_t {   // the first error, every table tried
             cudaError_t r = d_res != nullptr ? res_put(d_res) : cudaSuccess;
+            if (tp1 && tp1->d_res != nullptr) {
+                const strata::core::OnDevice on1(tp1->dev);
+                const cudaError_t e0 = cudaMemcpy(tp1->d_res, tp1->host_res.data(),
+                                                  tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                const cudaError_t e1 = e0 != cudaSuccess ? e0 : cudaStreamSynchronize(nullptr);
+                if (r == cudaSuccess) r = e1;
+            }
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
                 const cudaError_t e = res_put(st->d_res);
@@ -14298,7 +14395,8 @@ int main(int argc, char** argv) {
         };
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
-            if (pending.empty()) {
+            const bool tp1_has = tp1 && !tp1->adapt_pending.empty();
+            if (pending.empty() && !tp1_has) {
                 // a round where only the peer swapped: its copies have landed (or, without the wait, are still in
                 // flight), and the gate closes with them
                 if (!(peer.valid() && peer.has_pending())) {
@@ -14307,8 +14405,15 @@ int main(int argc, char** argv) {
                 }
                 return;
             }
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            if (!pending.empty()) {
+                if (wait) cudaEventSynchronize(adapt_ev);
+                else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
+            }
+            if (tp1_has) {
+                const strata::core::OnDevice on1(tp1->dev);
+                if (wait) cudaEventSynchronize(tp1->adapt_ev);
+                else if (cudaEventQuery(tp1->adapt_ev) != cudaSuccess) return;
+            }
             for (auto& st : stages)
                 if (st->adapt_live) {
                     if (wait) cudaEventSynchronize(st->adapt_ev);
@@ -14321,6 +14426,14 @@ int main(int argc, char** argv) {
                 host_res[(size_t) i] = slot;
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
                 if (!drive.d.in_flight.empty()) drive.d.in_flight[(size_t) i] = 0;
+            }
+            if (tp1_has) {
+                for (const auto& [i, slot] : tp1->adapt_pending) {
+                    tp1->host_res[(size_t) i] = slot;
+                    srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+                    if (!drive.d.in_flight.empty()) drive.d.in_flight[(size_t) i] = 0;
+                }
+                tp1->adapt_pending.clear();
             }
             if (drive.d.evict_sync || drive.d.fetch_admit > 0) {   // a failed upload leaves them to the pre-launch hook
                 for (const auto& pr : pending) drive.d.res_dirty_idx.push_back(pr.first);
@@ -14368,6 +14481,7 @@ int main(int argc, char** argv) {
         // on 33 swaps; measured +0.9 ms a chat round).  Too many changes, or no mapped memory: the whole table.
         constexpr size_t kResPatchCap = 16384;
         std::vector<int> res_devs{-1};
+        if (tp1) res_devs.push_back(tp1->dev);
         for (auto& st : stages) res_devs.push_back(st->dev);
         int32_t* res_pairs = (serial_windows && (drive.d.fetch_admit > 0 || drive.d.evict_sync))
                                  ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
@@ -14378,6 +14492,11 @@ int main(int argc, char** argv) {
                 if (n >= 0) {
                     if (d_res != nullptr) {
                         strata::kernels::res_patch(d_res, res_pairs, (int) n, ver.stream());
+                        r = cudaGetLastError();
+                    }
+                    if (tp1 && tp1->d_res != nullptr && r == cudaSuccess) {
+                        const strata::core::OnDevice on1(tp1->dev);
+                        strata::kernels::res_patch(tp1->d_res, res_pairs, (int) n, tp1->ver.stream());
                         r = cudaGetLastError();
                     }
                     for (size_t k = 0; k < stages.size() && r == cudaSuccess; ++k) {
@@ -14441,7 +14560,7 @@ int main(int argc, char** argv) {
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
-            if (!pending.empty()) return true;   // the previous swaps are still in flight
+            if (!pending.empty() || (tp1 && !tp1->adapt_pending.empty())) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -14456,7 +14575,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !(tp1 && tp1->host_res[(size_t) l * g.n_expert + e] >= 0) && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e) && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -14609,6 +14728,17 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
                     return false;
                 }
+            }
+            if (tp1) {
+                int64_t nsw1 = 0;
+                if (!tp2_peer_adapt(tp1->dev, tp1->cache, tp1->host_res, tp1->adapt_stream, tp1->adapt_ev,
+                                    tp1->adapt_pending, drive.d.usage, host_res, pending,
+                                    g.n_layers, g.n_expert, o.adapt_min_gain, o.adapt_swaps,
+                                    src, srcp, drive.d.in_flight, drive.d.evict_sync, drive.d.res_dirty,
+                                    drive.d.res_dirty_idx, nsw1,
+                                    [&](int64_t l, int32_t e) { return helper_holds(l, e); }))
+                    return false;
+                adapt_nswaps += nsw1;
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             return true;
@@ -20889,7 +21019,7 @@ int main(int argc, char** argv) {
                         agate.active.store(true, std::memory_order_release);
                     }
                 }
-                else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+                else if ((pending.empty() && (!tp1 || tp1->adapt_pending.empty())) || ++pending_age >= adapt_lag()) apply_pending(true);
                 // STRATA_RAM_ADAPT=<n> (opt-in, the resident RAM mode on one GPU): the RAM copy is chosen once, at
                 // start, so an expert it does not hold is read from the file every time the conversation routes to
                 // it.  With this, before a window and while no adaptive round is in flight, up to n experts the windows
@@ -22572,7 +22702,7 @@ int main(int argc, char** argv) {
                 if (drive.d.res_dirty) {
                     const int64_t n = res_patch_pairs(drive.d.res_dirty_idx, host_res, res_pairs, kResPatchCap);
                     cudaError_t r;
-                    if (n >= 0) {
+                    if (n >= 0 && !tp1) {
                         strata::kernels::res_patch(d_res, res_pairs, (int) n, cs);
                         r = cudaGetLastError();
                     } else {
@@ -22608,15 +22738,23 @@ int main(int argc, char** argv) {
         cudaEventCreateWithFlags(&adapt_ev, cudaEventDisableTiming);
         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
         auto apply_pending = [&](bool wait) {
-            if (pending.empty()) return;
+            const bool tp1_has = tp1 && !tp1->adapt_pending.empty();
+            if (pending.empty() && !tp1_has) return;
             // STRATA_TRACE_ADAPT=1: whether a round's copies had landed when the next window read the table
             static const bool trace_pending = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
-            if (wait) cudaEventSynchronize(adapt_ev);
-            else if (cudaEventQuery(adapt_ev) != cudaSuccess) {
-                if (trace_pending)
-                    std::fprintf(stderr, "strata: PENDING not landed, %zu stay non-resident this window\n",
-                                 pending.size());
-                return;
+            if (!pending.empty()) {
+                if (wait) cudaEventSynchronize(adapt_ev);
+                else if (cudaEventQuery(adapt_ev) != cudaSuccess) {
+                    if (trace_pending)
+                        std::fprintf(stderr, "strata: PENDING not landed, %zu stay non-resident this window\n",
+                                     pending.size());
+                    return;
+                }
+            }
+            if (tp1_has) {
+                const strata::core::OnDevice on1(tp1->dev);
+                if (wait) cudaEventSynchronize(tp1->adapt_ev);
+                else if (cudaEventQuery(tp1->adapt_ev) != cudaSuccess) return;
             }
             if (trace_pending)
                 std::fprintf(stderr, "strata: PENDING landed, %zu experts become resident\n", pending.size());
@@ -22627,6 +22765,14 @@ int main(int argc, char** argv) {
                 srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
                 if (!drive.d.in_flight.empty()) drive.d.in_flight[(size_t) i] = 0;
             }
+            if (tp1_has) {
+                for (const auto& [i, slot] : tp1->adapt_pending) {
+                    tp1->host_res[(size_t) i] = slot;
+                    srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+                    if (!drive.d.in_flight.empty()) drive.d.in_flight[(size_t) i] = 0;
+                }
+                tp1->adapt_pending.clear();
+            }
             if (drive.d.evict_sync || drive.d.fetch_admit > 0) {   // a failed upload leaves them to the pre-launch hook
                 for (const auto& pr : pending) drive.d.res_dirty_idx.push_back(pr.first);
                 drive.d.res_dirty = true;
@@ -22636,6 +22782,11 @@ int main(int argc, char** argv) {
             if (d_res != nullptr && res_put(d_res) == cudaSuccess) {   // the whole table: the hook has nothing left
                 drive.d.res_dirty = false;
                 drive.d.res_dirty_idx.clear();
+            }
+            if (tp1 && tp1->d_res != nullptr) {
+                const strata::core::OnDevice on1(tp1->dev);
+                cudaMemcpy(tp1->d_res, tp1->host_res.data(), tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                cudaStreamSynchronize(nullptr);
             }
         };
         // Plan v0.3 P6: the VRAM tier follows the conversation.  Candidates are missing experts routed at least
@@ -22648,7 +22799,7 @@ int main(int argc, char** argv) {
             // reports the only thing that can make an adapt round a coin flip: whether the PREVIOUS round's
             // asynchronous expert copies had landed by the time this round started.
             static const bool trace_adapt = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
-            if (!pending.empty()) {
+            if (!pending.empty() || (tp1 && !tp1->adapt_pending.empty())) {
                 if (trace_adapt)
                     std::fprintf(stderr, "strata: ADAPT round=%lld SKIPPED, %zu swaps still in flight\n",
                                  (long long) adapt_rounds, pending.size());
@@ -22668,7 +22819,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(l, e) && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !(tp1 && tp1->host_res[(size_t) l * g.n_expert + e] >= 0) && !helper_holds(l, e) && !(fetched && srcp->pinned(l, e))) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -22739,6 +22890,17 @@ int main(int argc, char** argv) {
             if (trace_adapt)
                 std::fprintf(stderr, "strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed\n",
                              (long long) adapt_rounds, swaps.size(), o.adapt_swaps);
+            if (tp1) {
+                int64_t nsw1 = 0;
+                if (!tp2_peer_adapt(tp1->dev, tp1->cache, tp1->host_res, tp1->adapt_stream, tp1->adapt_ev,
+                                    tp1->adapt_pending, drive.d.usage, host_res, pending,
+                                    g.n_layers, g.n_expert, 1.5f, o.adapt_swaps,
+                                    src, srcp, drive.d.in_flight, drive.d.evict_sync, drive.d.res_dirty,
+                                    drive.d.res_dirty_idx, nsw1,
+                                    [&](int64_t l, int32_t e) { return helper_holds(l, e); }))
+                    return false;
+                swaps_total += nsw1;
+            }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             swaps_total += (int64_t) swaps.size();
             ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -23041,7 +23203,7 @@ int main(int argc, char** argv) {
             // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
             // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
             if (adapt_nowait()) apply_pending(false);
-                else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+                else if ((pending.empty() && (!tp1 || tp1->adapt_pending.empty())) || ++pending_age >= adapt_lag()) apply_pending(true);
             if (!drive.d.fetch_log.empty()) {   // STRATA_ADAPT_FETCH_VERIFY: each admitted slot read back
                 static int64_t checked = 0, bad = 0;
                 cudaDeviceSynchronize();
