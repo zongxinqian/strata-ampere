@@ -1670,9 +1670,20 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
     check("wait_copy_i32_from_mapped");
 }
 
+__global__ void raise_flag_max_gpu_kernel(uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    atomicMax(flag, value);
+    __threadfence_system();
+}
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");
+}
+
+void raise_flag_max_gpu(uint32_t* flag, uint32_t value, void* stream) {
+    raise_flag_max_gpu_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("raise_flag_max_gpu");
 }
 
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,

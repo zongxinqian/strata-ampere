@@ -20045,8 +20045,14 @@ int main(int argc, char** argv) {
                         // Step 3: Start highest-priority queued CPU batch if pool is idle
                         finish_cpu_if_done();
                         start_next_cpu();
-                        // Step 4: If pool is busy and no GPU doorbell is waiting, host steals ONE ~5 us task
-                        if (cpu_active >= 0) {
+                        // Step 4: If pool is busy and host_help is enabled and no GPU doorbell is waiting, host steals 1 task.
+                        // Default OFF when pool.workers() >= 16 so core 0 responds to both GPUs' doorbells in <2 us.
+                        static const bool async_host_help = [&] {
+                            const char* e = std::getenv("STRATA_PIPE_ASYNC_HOST_HELP");
+                            if (e != nullptr && e[0] != '\0') return std::atoi(e) != 0;
+                            return pool.workers() < 16;
+                        }();
+                        if (async_host_help && cpu_active >= 0) {
                             const bool rung =
                                 (A.s1 && !A.s1_done && V1(A).has_rung()) ||
                                 (doomed && D.fl && VF(D.fr, D).has_rung()) ||
