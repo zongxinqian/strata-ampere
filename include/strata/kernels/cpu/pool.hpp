@@ -249,6 +249,16 @@ public:
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
+    /// Non-blocking async multi-native dispatch (STRATA_PIPE_ASYNC_BELL): host thread stays free to serve
+    /// another GPU's doorbell while workers drain GateUp/Down phases, and can steal one ~5 us task via
+    /// `async_help_one()` or cancel a doomed speculative window via `async_abort()`.
+    bool async_busy() const { return async_state_ != 0; }
+    void async_start_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
+                                  NativeArithmetic arithmetic = NativeArithmetic::Default);
+    bool async_poll();
+    bool async_help_one();
+    void async_abort();
+    void async_wait();
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -289,7 +299,18 @@ private:
     int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
+    bool drain_one(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
+    void start_phase_async(int mode, int n_tasks);
+    void abort_phase_async();
+    int async_state_ = 0;   // 0 = idle, 1 = gate/up (mode 5), 2 = down (mode 6)
+    bool async_aborted_ = false;
+    uint32_t async_epoch_ = 0;
+    int async_n_tasks_ = 0;
+    int async_n_ = 0, async_b0_ = 0, async_nb_ = 0;
+    ExpertJobMulti* async_all_jobs_ = nullptr;
+    std::chrono::steady_clock::time_point async_t0_{}, async_phase_t0_{}, async_stall_t0_{};
+    uint32_t async_stall_seen_ = 0, async_poll_spins_ = 0;
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.

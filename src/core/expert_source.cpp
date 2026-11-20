@@ -4931,8 +4931,10 @@ int tail_skip_rank() {
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
-                                float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
+                                float* out, strata::kernels::cpu::NativeArithmetic arithmetic,
+                                AsyncCpuDispatch* async_out) {
     using namespace strata::kernels::cpu;
+    if (async_out != nullptr) async_out->pending = false;
     if (d.failed) return;
     if (n_tok < 1 || n_tok > strata::kernels::kWindowMaxT) {
         d.failed = true;
@@ -5232,6 +5234,16 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                         d.dres_check[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] < 0;
         if (!published) ++d.stale_x;
     }
+    const bool async_ok = (async_out != nullptr && native && d.cold_mode == 0 && d.peer == nullptr && d.remote_count == 0);
+    auto& act_buf = async_ok ? async_out->act_multi : d.act_multi;
+    auto& nact_buf = async_ok ? async_out->nact_multi : d.nact_multi;
+    auto& jobs_buf = async_ok ? async_out->jobs_multi : d.jobs_multi;
+    if (async_ok) {
+        if ((int64_t) act_buf.size() < n_tok) act_buf.resize((size_t) strata::kernels::kWindowMaxT);
+        if (nact_buf.size() < (size_t) strata::kernels::kWindowMaxT * kNativeActBytes)
+            nact_buf.resize((size_t) strata::kernels::kWindowMaxT * kNativeActBytes);
+        if (jobs_buf.size() < (size_t) (n_tok * k)) jobs_buf.resize((size_t) (strata::kernels::kWindowMaxT * k));
+    }
     const auto c1 = std::chrono::steady_clock::now();
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
@@ -5239,11 +5251,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
-                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                act_quant_any(x_f + (size_t) t * H, H, act_buf[(size_t) t]);
             else if (native)
-                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, nact_buf.data() + (size_t) t * kNativeActBytes);
             else
-                act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                act_quant_q8_1(x_f + (size_t) t * H, H, act_buf[(size_t) t]);
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
@@ -5335,12 +5347,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     return;
                 }
                 jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
+                ExpertJobMulti& nj = jobs_buf[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
                 nj.fmt = nullptr;
                 if (zc) {   // 149-cold mode 3: the gate rows are the blob; up and down at their distance in the mapping
-                    if (d.zc_fmt.size() < d.jobs_multi.size()) d.zc_fmt.resize(d.jobs_multi.size());
+                    if (d.zc_fmt.size() < jobs_buf.size()) d.zc_fmt.resize(jobs_buf.size());
                     strata::kernels::cpu::NativeFmt& f = d.zc_fmt[(size_t) jo];
                     f = lay.fmt[(size_t) d.layers];
                     f.up_off = (size_t) ((uintptr_t) zp[1] - (uintptr_t) zp[0]);     // modular: the tensors' order
@@ -5349,20 +5361,20 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++d.cold_zc;
                 }
             }
-            if (d.jobs_multi[(size_t) jo].nt == MAXT) {
+            if (jobs_buf[(size_t) jo].nt == MAXT) {
                 // a window of 9..16 rows routes more than MAXT tokens to this expert: the kernels and the pool's scratch
                 // take MAXT tokens a job, so the rest are a further job over the same blob (each token's rows are its own,
                 // so the split changes no value; the blob is read once more)
                 const int16_t prev = jo;
                 jo = (int16_t) njobs++;
-                ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
-                nj.blob = d.jobs_multi[(size_t) prev].blob;
-                nj.fmt = d.jobs_multi[(size_t) prev].fmt;
+                ExpertJobMulti& nj = jobs_buf[(size_t) jo];
+                nj.blob = jobs_buf[(size_t) prev].blob;
+                nj.fmt = jobs_buf[(size_t) prev].fmt;
                 nj.nt = 0;
             }
-            ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
-            jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+            ExpertJobMulti& jb = jobs_buf[(size_t) jo];
+            jb.act[jb.nt] = &act_buf[(size_t) t];
+            jb.nact[jb.nt] = native ? nact_buf.data() + (size_t) t * kNativeActBytes : nullptr;
             jb.out[jb.nt] = row;
             ++jb.nt;
             ++d.multi_entries;
@@ -5416,9 +5428,29 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const auto c3 = std::chrono::steady_clock::now();
     if (d.plan != nullptr) d.plan->cpu_jobs = njobs;
     pt("run", njobs);
+    if (async_ok && njobs > 0 && npend == 0) {
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        d.ms_plan += ms(c0, c1);
+        d.ms_actq += ms(c1, c2);
+        d.ms_jobs += ms(c2, c3);
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            const int64_t e = ids[i];
+            if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;
+        }
+        async_out->pending = true;
+        async_out->layer = d.layers;
+        async_out->njobs = njobs;
+        async_out->arithmetic = arithmetic;
+        async_out->fmt = &lay.fmt[(size_t) d.layers];
+        async_out->t_start = c3;
+        d.multi_misses += njobs;
+        ++d.layers;
+        d.experts += n_tok * k;
+        return;
+    }
     if (njobs > 0 && npend == 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs, arithmetic);
-        else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs_buf.data(), njobs, arithmetic);
+        else d.pool->run_split_multi(jobs_buf.data(), njobs);
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;

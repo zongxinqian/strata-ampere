@@ -83,6 +83,8 @@ class RemoteExpertOpt;
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                              int64_t layer);
+using PoolMultiAsyncFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                                  int64_t layer, bool& cpu_pending);
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
@@ -364,6 +366,15 @@ public:
     bool prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
     /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
     int service(PoolMultiFn pool, void* user, std::string& err);
+    /// Non-blocking split-phase service (STRATA_PIPE_ASYNC_BELL): serves at most one rung layer (Bell A + DMA),
+    /// defers Bell C until `service_finish()` when `cpu_pending()` is true.
+    int service_begin(PoolMultiAsyncFn pool, void* user, std::string& err);
+    void service_finish();
+    bool cpu_pending() const { return fl_cpu_pending_; }
+    bool has_rung() const {
+        return fl_active_ && !fl_cpu_pending_ && fl_k_ < fl_total_ &&
+               (ar_on() || *(volatile uint32_t*) h_seq_ >= (uint32_t) (fl_k_ + 1));
+    }
     bool in_flight() const { return fl_active_; }
     /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
     bool done(std::string& err);
@@ -548,6 +559,9 @@ private:
     cudaEvent_t ev_done_ = nullptr, ev_commit_ = nullptr;
     unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
     bool fl_active_ = false, fl_prof_ = false, fl_ple_ = false, commit_live_ = false, pl_prestaged_ = false;
+    bool fl_cpu_pending_ = false;
+    uint32_t fl_want_ = 0;
+    std::chrono::steady_clock::time_point fl_pool_t0_{};
     int fl_T_ = 0;
     int64_t fl_k_ = 0, fl_total_ = 0;
     double fl_since_ms_ = 0, fl_flush_ms_ = 0, fl_launch_ms_ = 0;

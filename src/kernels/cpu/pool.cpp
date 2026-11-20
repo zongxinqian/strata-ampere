@@ -1164,14 +1164,18 @@ void ExpertPool::wait_done(int n) {
 }
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
+    while (drain_one(id, scratch, epoch)) {}
+}
+
+bool ExpertPool::drain_one(int id, ExpertScratch& scratch, uint32_t epoch) {
     const int s = numa_n_ == 0 ? 0 : id >= 0 ? wslice_[(size_t) id] : hslice_;
-    for (;;) {
+    {
         // STRATA_NUMA_SPLIT: a mode-5/6 batch lives on the slice heads, any other on `head_`; the epoch tag makes the
         // other family's claim fail, so `mode_` is never read before a claim has succeeded (pool.hpp)
         int ci = numa_n_ > 0 ? claim_slice(epoch, s) : -1;
         const bool sliced = ci >= 0;
         if (!sliced) ci = claim(epoch);
-        if (ci < 0) break;
+        if (ci < 0) return false;
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
@@ -1270,7 +1274,160 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         } else {
             done_.fetch_add(1, std::memory_order_release);
         }
+        return true;
     }
+}
+
+void ExpertPool::start_phase_async(int mode, int n_tasks) {
+    wait_parked("before async phase");
+    mode_ = mode;
+    njobs_ = n_tasks;
+    async_n_tasks_ = n_tasks;
+    async_epoch_ = begin_batch(n_tasks);
+    async_phase_t0_ = std::chrono::steady_clock::now();
+    async_stall_seen_ = 0;
+    async_poll_spins_ = 0;
+}
+
+void ExpertPool::abort_phase_async() {
+    if (async_state_ == 0) return;
+    if (numa_phase()) {
+        for (int k = 0; k < numa_n_; ++k) {
+            NodeSync& ns = nsync_[(size_t) k];
+            uint64_t h = ns.head.load(std::memory_order_acquire);
+            for (;;) {
+                if ((uint32_t) (h >> 32) != async_epoch_) break;
+                const uint32_t n = (uint32_t) (h >> 16) & 0xffffu;
+                const uint32_t i = (uint32_t) h & 0xffffu;
+                if (i >= n) break;
+                const uint64_t nh = pack_head(async_epoch_, n, n);
+                if (ns.head.compare_exchange_weak(h, nh, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    const uint32_t skipped = n - i;
+                    if (ns.done.fetch_add(skipped, std::memory_order_release) + skipped >= (uint32_t) ns.tasks)
+                        ns.drained_ns.store(now_ns(), std::memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+    } else {
+        uint64_t h = head_.load(std::memory_order_acquire);
+        for (;;) {
+            if ((uint32_t) (h >> 32) != async_epoch_) break;
+            const uint32_t n = (uint32_t) (h >> 16) & 0xffffu;
+            const uint32_t i = (uint32_t) h & 0xffffu;
+            if (i >= n) break;
+            const uint64_t nh = pack_head(async_epoch_, n, n);
+            if (head_.compare_exchange_weak(h, nh, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                done_.fetch_add(n - i, std::memory_order_release);
+                break;
+            }
+        }
+    }
+}
+
+void ExpertPool::async_start_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
+    if (n <= 0) return;
+    if (async_state_ != 0) async_wait();
+    async_t0_ = std::chrono::steady_clock::now();
+    async_all_jobs_ = jobs;
+    async_n_ = n;
+    async_b0_ = 0;
+    async_aborted_ = false;
+    async_nb_ = (std::min)(kMaxSplitMulti, n);
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    narithmetic_ = arithmetic;
+    mrows_ = (int64_t) async_nb_ * f.n_ff;
+    mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, async_nb_) : phase_tasks(mrows_);
+    async_state_ = 1;
+    start_phase_async(5, mtasks_);
+}
+
+bool ExpertPool::async_help_one() {
+    if (!host_works_ || async_state_ == 0 || async_aborted_) return false;
+    return drain_one(-1, host_scratch_, async_epoch_);
+}
+
+void ExpertPool::async_abort() {
+    if (async_state_ == 0 || async_aborted_) return;
+    async_aborted_ = true;
+    abort_phase_async();
+}
+
+bool ExpertPool::async_poll() {
+    if (async_state_ == 0) return true;
+    uint32_t d = 0;
+    if (numa_phase())
+        for (int k = 0; k < numa_n_; ++k) d += nsync_[(size_t) k].done.load(std::memory_order_acquire);
+    else
+        d = done_.load(std::memory_order_acquire);
+    if (d < (uint32_t) async_n_tasks_ || parked_count() != (uint32_t) n_) {
+        if ((++async_poll_spins_ & 1023u) == 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (async_poll_spins_ == 1024u || d != async_stall_seen_) {
+                async_stall_t0_ = now;
+                async_stall_seen_ = d;
+            } else if (now - async_stall_t0_ > kStall) {
+                std::fprintf(stderr, "strata: the CPU expert pool stalled (async): %u of %d jobs done, %u of %d workers parked%s\n",
+                             d, async_n_tasks_, parked_count(), n_, numa_counters().c_str());
+                strata::core::release_gpu_waits(stderr);
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
+        return false;
+    }
+    if (numa_phase())
+        for (int k = 0; k < numa_n_; ++k) {
+            const int64_t t = nsync_[(size_t) k].drained_ns.load(std::memory_order_acquire);
+            if (t != 0) slice_ms_[k] += (double) (t - pub_ns_) / 1e6;
+        }
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    const auto t_now = std::chrono::steady_clock::now();
+    if (async_aborted_) {
+        async_state_ = 0;
+        async_aborted_ = false;
+        mode_ = 0;
+        ms_drain_ += std::chrono::duration<double, std::milli>(t_now - async_t0_).count();
+        return true;
+    }
+    const NativeFmt& f = *nfmt_;
+    if (async_state_ == 1) {
+        ms_multi_gu += std::chrono::duration<double, std::milli>(t_now - async_phase_t0_).count();
+        for (int e = 0; e < async_nb_; ++e)
+            for (int t = 0; t < mjobs_[e].nt; ++t)
+                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        const auto t_q = std::chrono::steady_clock::now();
+        ms_multi_q += std::chrono::duration<double, std::milli>(t_q - t_now).count();
+        mrows_ = (int64_t) async_nb_ * f.n_embd;
+        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, async_nb_) : phase_tasks(mrows_);
+        async_state_ = 2;
+        start_phase_async(6, mtasks_);
+        return false;
+    }
+    // async_state_ == 2 (down finished)
+    ms_multi_down += std::chrono::duration<double, std::milli>(t_now - async_phase_t0_).count();
+    async_b0_ += kMaxSplitMulti;
+    if (async_b0_ < async_n_) {
+        async_nb_ = (std::min)(kMaxSplitMulti, async_n_ - async_b0_);
+        mjobs_ = async_all_jobs_ + async_b0_;
+        mrows_ = (int64_t) async_nb_ * f.n_ff;
+        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, async_nb_) : phase_tasks(mrows_);
+        async_state_ = 1;
+        start_phase_async(5, mtasks_);
+        return false;
+    }
+    multi_bytes += (int64_t) async_n_ * (int64_t) f.bytes;
+    mode_ = 0;
+    async_state_ = 0;
+    ms_drain_ += std::chrono::duration<double, std::milli>(t_now - async_t0_).count();
+    return true;
+}
+
+void ExpertPool::async_wait() {
+    while (!async_poll()) strata_cpu_pause();
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {

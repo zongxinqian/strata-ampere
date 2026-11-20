@@ -1627,6 +1627,38 @@ void drive_pool_split(void* u, const float* x, const int32_t* ids, int64_t n, in
 void drive_pool_split_invariant(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
     drive_pool_split_impl(u, x, ids, n, k, out, l, strata::kernels::cpu::NativeArithmetic::WindowInvariant);
 }
+struct SplitDriveAsync {
+    SplitDrive* sd = nullptr;
+    strata::core::AsyncCpuDispatch* job = nullptr;
+};
+void drive_pool_split_async(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                            int64_t layer, bool& cpu_pending) {
+    SplitDriveAsync* a = (SplitDriveAsync*) user;
+    SplitDrive* s = a->sd;
+    int st = 0;
+    while (st + 1 < s->n && layer >= s->end[st]) ++st;
+    Drive& d = *s->base;
+    d.d.plan = s->plan[st];
+    d.d.cache_base = s->cache_base[st];
+    d.d.cache_slot_off = s->cache_slot_off[st];
+    d.d.pcie_num = s->pcie_num[st];
+    d.d.layers = layer;
+    const Clock::time_point t0 = Clock::now();
+    strata::core::expert_pool_dispatch_multi(d.d, x_f, ids, n_tok, k, out,
+                                             strata::kernels::cpu::NativeArithmetic::Default, a->job);
+    d.cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    ++d.calls;
+    if (d.routing != nullptr && layer >= 0 && layer < strata::core::kCompiledGeometry.n_layers) {
+        for (int64_t tok = 0; tok < n_tok; ++tok) {
+            const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
+            std::fwrite(rec, sizeof rec, 1, d.routing);
+            std::fwrite(ids + tok * k, sizeof(int32_t), (size_t) k, d.routing);
+            static const float one[64] = {};
+            std::fwrite(one, sizeof(float), (size_t) k, d.routing);
+        }
+    }
+    cpu_pending = a->job != nullptr && a->job->pending;
+}
 
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
 /// expert cache for its layers, a verify window and a prompt path; the last one also holds the head (the drafter
@@ -13809,6 +13841,18 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: PCIe share: start %.2f from %d pool workers (assumed %.0f GB/s of expert bytes) and the %.1f GB/s link (was %.2f)\n",
                              f0, pool.workers(), r, o.pcie_probe_gbps, o.pcie_frac);
                 o.pcie_frac = f0;
+                const int pn0 = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+                split_drive.pcie_num[0] = pn0;
+                split_drive_b.pcie_num[0] = pn0;
+                for (int st = 1; st < n_stages; ++st) {
+                    GpuStage& gs = *stages[(size_t) st - 1];
+                    if (gs.link_gbps > 0.0) {
+                        gs.pcie_frac = std::min(pcie_share_max(),
+                                                std::max(0.10, std::round(gs.link_gbps / (gs.link_gbps + pcie_pool_k(r) * r) * 20.0) / 20.0));
+                        split_drive.pcie_num[st] = std::max(0, std::min(256, (int) (gs.pcie_frac * 256.0 + 0.5)));
+                        split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
+                    }
+                }
             }
         }
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
@@ -19664,7 +19708,21 @@ int main(int argc, char** argv) {
                 // an error ends the engine, as the serial loop's do: every GPU wait is released first (#267), so no
                 // window in flight keeps spinning on a flag nobody raises, and the tier's thread can finish (the
                 // asynchronous tier's job does host work alone: it ends)
+                static const bool pipe_async_bell = [] {
+                    const char* v = std::getenv("STRATA_PIPE_ASYNC_BELL");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                struct PipeCpuSlot {
+                    strata::core::AsyncCpuDispatch job;
+                    strata::core::Verifier* ver = nullptr;
+                    bool is_doomed = false;
+                    bool running = false;
+                };
+                PipeCpuSlot cpu_slots[SplitDrive::kMax];
+                int cpu_active = -1;
+                const int last_st = n_stages - 1;
                 auto die = [&](const std::string& m) -> int {
+                    if (pool.async_busy()) { pool.async_abort(); pool.async_wait(); }
                     std::fprintf(stderr, "strata serve: pipelined decode: %s\n", m.c_str());
                     strata::core::diag_pipeline_fn().store(nullptr);
                     strata::core::release_gpu_waits(stderr);
@@ -19888,15 +19946,129 @@ int main(int argc, char** argv) {
                         }
                     }
                     // ---- every window in flight served
-                    if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B)) return die(err);
-                    if (A.s1 && !A.s1_done) {
-                        strata::core::Verifier& v = V1(A);
-                        if (v.service(&drive_pool_split, SDf(A), err) < 0) return die(err);
-                        if (v.done(err)) {
-                            if (!v.pl_finish(outp.data(), err)) return die(err);
-                            A.s1_done = true;
-                            tre("F1", A.seq, A.T);
-                        } else if (!err.empty()) return die(err);
+                    if (pipe_async_bell) {
+                        static const bool doom_skip_a = [] {
+                            const char* e = pipe_dbg_env("STRATA_PIPELINE_DOOM_SKIP");
+                            return e == nullptr || std::atoi(e) != 0;
+                        }();
+                        auto finish_cpu_if_done = [&]() {
+                            if (cpu_active >= 0 && pool.async_poll()) {
+                                PipeCpuSlot& sl = cpu_slots[cpu_active];
+                                const double run_ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.job.t_start).count();
+                                drive.d.ms_run += run_ms;
+                                drive.cpu_ms += run_ms;
+                                sl.job.pending = false;
+                                sl.running = false;
+                                sl.is_doomed = false;
+                                strata::core::Verifier* done_v = sl.ver;
+                                sl.ver = nullptr;
+                                cpu_active = -1;
+                                if (done_v != nullptr) done_v->service_finish();
+                            }
+                        };
+                        auto start_next_cpu = [&]() {
+                            if (cpu_active >= 0) return;
+                            // Strict priority: Stage 1 (last_st, committed critical path) before Stage 0!
+                            for (int st = last_st; st >= 0; --st) {
+                                PipeCpuSlot& sl = cpu_slots[st];
+                                if (!sl.job.pending) continue;
+                                if (sl.is_doomed) {
+                                    sl.job.pending = false;
+                                    sl.is_doomed = false;
+                                    strata::core::Verifier* dv = sl.ver;
+                                    sl.ver = nullptr;
+                                    if (dv != nullptr) dv->service_finish();
+                                    continue;
+                                }
+                                pool.async_start_multi_native(*sl.job.fmt, sl.job.jobs_multi.data(), sl.job.njobs, sl.job.arithmetic);
+                                sl.running = true;
+                                cpu_active = st;
+                                break;
+                            }
+                        };
+                        auto pump0_async = [&](PW& w, bool is_d) -> bool {
+                            if (!w.fl) return true;
+                            const int st = w.fr;
+                            strata::core::Verifier& v = VF(st, w);
+                            const bool skip = doom_skip_a && is_d;
+                            if (skip) {
+                                if (cpu_active == st && cpu_slots[st].ver == &v) {
+                                    cpu_slots[st].is_doomed = true;
+                                    pool.async_abort();
+                                } else if (cpu_slots[st].job.pending && !cpu_slots[st].running && cpu_slots[st].ver == &v) {
+                                    cpu_slots[st].job.pending = false;
+                                    cpu_slots[st].is_doomed = false;
+                                    cpu_slots[st].ver = nullptr;
+                                    v.service_finish();
+                                }
+                            }
+                            if (!v.cpu_pending()) {
+                                SplitDriveAsync sda{PSD[w.seq & 1], &cpu_slots[st].job};
+                                if (v.service_begin(skip ? nullptr : &drive_pool_split_async, skip ? nullptr : &sda, err) < 0)
+                                    return false;
+                                if (v.cpu_pending()) {
+                                    cpu_slots[st].ver = &v;
+                                    cpu_slots[st].is_doomed = false;
+                                    cpu_slots[st].running = false;
+                                }
+                            }
+                            if (!v.cpu_pending() && v.done(err)) {
+                                if (!v.pl_finish(nullptr, err)) return false;
+                                w.fl = false;
+                                if (++w.fr == pl_nf) w.finished = true;
+                                tre("F0", w.seq, w.fr, w.spec);
+                            }
+                            return err.empty();
+                        };
+                        // Step 1: Finish completed CPU batch (raises Bell C)
+                        finish_cpu_if_done();
+                        // Step 2: Poll doorbells in strict priority: Stage 1 (V1(A)) -> Doomed (D) -> Stage 0 (A, B)
+                        if (A.s1 && !A.s1_done) {
+                            strata::core::Verifier& v = V1(A);
+                            if (!v.cpu_pending()) {
+                                SplitDriveAsync sda{PSD[A.seq & 1], &cpu_slots[last_st].job};
+                                if (v.service_begin(&drive_pool_split_async, &sda, err) < 0) return die(err);
+                                if (v.cpu_pending()) {
+                                    cpu_slots[last_st].ver = &v;
+                                    cpu_slots[last_st].is_doomed = false;
+                                    cpu_slots[last_st].running = false;
+                                }
+                            }
+                            if (!v.cpu_pending() && v.done(err)) {
+                                if (!v.pl_finish(outp.data(), err)) return die(err);
+                                A.s1_done = true;
+                                tre("F1", A.seq, A.T);
+                            } else if (!err.empty()) return die(err);
+                        }
+                        if ((doomed && !pump0_async(D, true)) || !pump0_async(A, false) || !pump0_async(B, false))
+                            return die(err);
+                        // Step 3: Start highest-priority queued CPU batch if pool is idle
+                        finish_cpu_if_done();
+                        start_next_cpu();
+                        // Step 4: If pool is busy and no GPU doorbell is waiting, host steals ONE ~5 us task
+                        if (cpu_active >= 0) {
+                            const bool rung =
+                                (A.s1 && !A.s1_done && V1(A).has_rung()) ||
+                                (doomed && D.fl && VF(D.fr, D).has_rung()) ||
+                                (A.fl && VF(A.fr, A).has_rung()) ||
+                                (B.fl && VF(B.fr, B).has_rung());
+                            if (!rung) {
+                                pool.async_help_one();
+                                finish_cpu_if_done();
+                                start_next_cpu();
+                            }
+                        }
+                    } else {
+                        if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B)) return die(err);
+                        if (A.s1 && !A.s1_done) {
+                            strata::core::Verifier& v = V1(A);
+                            if (v.service(&drive_pool_split, SDf(A), err) < 0) return die(err);
+                            if (v.done(err)) {
+                                if (!v.pl_finish(outp.data(), err)) return die(err);
+                                A.s1_done = true;
+                                tre("F1", A.seq, A.T);
+                            } else if (!err.empty()) return die(err);
+                        }
                     }
                     if (drive.d.failed) return die(drive.d.fail ? drive.d.fail : "the expert pool failed");
                     // ---- a wrong speculative window has stopped (it is launched on no further stage once doomed):
@@ -20191,6 +20363,18 @@ int main(int argc, char** argv) {
                             D = B;
                             undo_w = A;
                             undo_keep = a + 1;
+                            if (pipe_async_bell && D.fl) {
+                                strata::core::Verifier& dv = VF(D.fr, D);
+                                if (cpu_active == D.fr && cpu_slots[D.fr].ver == &dv) {
+                                    cpu_slots[D.fr].is_doomed = true;
+                                    pool.async_abort();
+                                } else if (cpu_slots[D.fr].job.pending && !cpu_slots[D.fr].running && cpu_slots[D.fr].ver == &dv) {
+                                    cpu_slots[D.fr].job.pending = false;
+                                    cpu_slots[D.fr].is_doomed = false;
+                                    cpu_slots[D.fr].ver = nullptr;
+                                    dv.service_finish();
+                                }
+                            }
                         }
                         // B is D now (or dropped): never pump it twice (whichever copy saw the window complete first
                         // would finish it, and the other would wait for it forever)
@@ -20215,6 +20399,7 @@ int main(int argc, char** argv) {
                     if (!last && ajob && !adapt_tick(false)) return die("an adaptive refill failed");
                     if (last) ending = true;
                 }
+                if (pool.async_busy()) { pool.async_abort(); pool.async_wait(); }
                 pl_drain();   // nothing in flight: both stages' commits and the drafter have landed
                 strata::core::diag_pipeline_fn().store(nullptr);
                 if (pl_adapt_thr.joinable()) pl_adapt_thr.join();   // its copies waited only for finished work

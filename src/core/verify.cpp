@@ -5290,6 +5290,8 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
     (void) cudaStreamQuery(cs_);   // WDDM: submit now
     fl_active_ = true;
+    fl_cpu_pending_ = false;
+    fl_want_ = 0;
     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
     return true;
 }
@@ -5385,6 +5387,110 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         fl_since_ms_ = fl_flush_ms_ = now_ms();
     }
     return 1;
+}
+
+int Verifier::service_begin(PoolMultiAsyncFn pool, void* user, std::string& err) {
+    if (!fl_active_) return 1;
+    if (fl_k_ >= fl_total_) return 1;
+    if (fl_cpu_pending_) return 0;
+    if (!ar_on() && *(volatile uint32_t*) h_seq_ < (uint32_t) (fl_k_ + 1)) {
+        const double now = now_ms();
+        if (now - fl_flush_ms_ <= 2.0 && now - fl_since_ms_ <= 20000.0) return 0;
+    }
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const int T = fl_T_;
+    auto gather_ple = [&]() -> bool {
+        if (!fl_ple_) return true;
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(pl_ple_rows_.data(), (size_t) T, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        strata_store_fence();
+        ms_host += ms_since(tp);
+        return true;
+    };
+    if (ar_on()) {
+        if (!gather_ple()) return -1;
+        *(volatile uint32_t*) h_flag_ = 1;
+        fl_k_ = fl_total_;
+        progress_tick();
+        return 1;
+    }
+    const int G = groups_[T] > 0 ? groups_[T] : 1;
+    const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    const int64_t l = lb_ + fl_k_ / G;
+    const uint32_t want = (uint32_t) (fl_k_ + 1);
+    if (*(volatile uint32_t*) h_seq_ < want) {
+        const double now = now_ms();
+        if (now - fl_flush_ms_ > 2.0) {
+            fl_flush_ms_ = now;
+            const cudaError_t q = cudaEventQuery(ev_done_);
+            if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < want) {
+                trace_ev("NEVER-RANG", fl_k_, l, (int64_t) q);
+                err = "verify: layer " + std::to_string(l) + " never rang (" +
+                      (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                return -1;
+            }
+            (void) cudaStreamQuery(cs_);
+        }
+        if (now - fl_since_ms_ > 20000.0) {
+            trace_ev("TIMEOUT", fl_k_, l, 0);
+            err = "verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+            return -1;
+        }
+        return 0;
+    }
+    const Clock::time_point b = Clock::now();
+    ms_wait += now_ms() - fl_since_ms_;
+    const int grp = (int) (fl_k_ % G);
+    cur_layer_ = want - 1;
+    set_plan_slot(grp);
+    const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+    progress_at("verify window (pipelined async): the CPU experts of layer", l);
+    bool pending = false;
+    if (pool != nullptr)
+        pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+             h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l, pending);
+    if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", fl_k_, l,
+                          (int64_t) ms_since(b));
+    if (*(volatile uint32_t*) h_flagA_ != want) {
+        sink_.counts[0] = 0;
+        sink_.counts[1] = 0;
+        sink_.counts[2] = 0;
+        sink_.start[0] = 0;
+        sink_.start2[0] = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        *(volatile uint32_t*) h_flagA_ = want;
+        raise_flag_b_ordered(want);
+    }
+    if (fl_k_ == 0 && !gather_ple()) return -1;
+    if (pending) {
+        fl_cpu_pending_ = true;
+        fl_want_ = want;
+        fl_pool_t0_ = b;
+        return 0;
+    }
+    progress_tick();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    strata_store_fence();
+    *(volatile uint32_t*) h_flag_ = want;
+    ++fl_k_;
+    ms_pool += ms_since(b);
+    fl_since_ms_ = fl_flush_ms_ = now_ms();
+    return fl_k_ >= fl_total_ ? 1 : 0;
+}
+
+void Verifier::service_finish() {
+    if (!fl_cpu_pending_) return;
+    progress_tick();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    strata_store_fence();
+    *(volatile uint32_t*) h_flag_ = fl_want_;
+    ++fl_k_;
+    fl_cpu_pending_ = false;
+    ms_pool += ms_since(fl_pool_t0_);
+    fl_since_ms_ = fl_flush_ms_ = now_ms();
 }
 
 bool Verifier::done(std::string& err) {

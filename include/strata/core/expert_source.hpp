@@ -703,8 +703,23 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 int tail_skip_rank();
 void set_tail_skip_rank(int r);
 
+/// Per-stage async CPU expert dispatch state (STRATA_PIPE_ASYNC_BELL): separates activation & job buffers
+/// from ExpertDispatch so Stage 0 and Stage 1 can each hold a prepared/running batch simultaneously.
+struct AsyncCpuDispatch {
+    bool pending = false;
+    int64_t layer = 0;
+    int njobs = 0;
+    strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default;
+    const strata::kernels::cpu::NativeFmt* fmt = nullptr;
+    std::vector<strata::kernels::cpu::ActQ> act_multi;
+    std::vector<uint8_t> nact_multi;
+    std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
+    std::chrono::steady_clock::time_point t_start{};
+};
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
-                                float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
+                                float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default,
+                                AsyncCpuDispatch* async_out = nullptr);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about
