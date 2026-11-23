@@ -111,9 +111,14 @@
     "STRATA_ATTN_MERGE_V2": "1",
     "STRATA_TREE_PROBE_MIN_EV": "0.04",
     "STRATA_FUSED_SWIGLU_Q81": "1",
-    "STRATA_B6_MMVQ_ROWS": "1"
+    "STRATA_B6_MMVQ_ROWS": "1",
+    "STRATA_PREFILL_CPU_SHARE_NT": "32",
+    "STRATA_PREFILL_CPU_SHARE_MAX": "6144"
   },
-  "gpu": [0, 1],
+  "gpu": [
+    0,
+    1
+  ],
   "gpus_asked": true,
   "layer_split": "auto",
   "host": "0.0.0.0",

@@ -276,6 +276,9 @@ public:
     /// it.
     long long pauses() const { return 0; }
 
+    /// Run `n_tasks` independent callbacks `fn(ctx, task_id)` across all spinning pool workers (and host when host_works_).
+    void run_range(int n_tasks, void (*fn)(void*, int), void* ctx);
+
     /// **WHERE `run()` SPENDS ITS TIME, in milliseconds accumulated over its lifetime.**  Three phases per
     /// layer - wait for every worker to be parked, wait for the drain, wait for them to re-park - and until now
     /// all three were reported as one number.  Without the split there is no way to tell a pool that is slow at
@@ -377,8 +380,10 @@ private:
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
-    // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
+    // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts, 8 = generic parallel range
     int mode_ = 0;
+    void (*range_fn_)(void*, int) = nullptr;
+    void* range_ctx_ = nullptr;
     int parts_a_ = 1, parts_b_ = 1;
     struct SplitBuf {
         alignas(64) float ff[FF];
@@ -439,7 +444,7 @@ private:
     std::vector<int> slice_threads_;  // threads draining each slice (the host counted in its own)
     int64_t pub_ns_ = 0;              // the current mode-5/6 phase's publish time (host only)
     double slice_ms_[2] = {0.0, 0.0}; // accumulated per-slice drain time (host only)
-    bool numa_phase() const { return numa_n_ > 0 && mode_ >= 5; }
+    bool numa_phase() const { return numa_n_ > 0 && (mode_ == 5 || mode_ == 6); }
     /// The claim of `claim()` on slice `slice`'s head: `base + i`, or -1.
     int claim_slice(uint32_t epoch, int slice);
     std::atomic<uint32_t>& parked_of(int id) { return numa_n_ > 0 ? nsync_[(size_t) wslice_[(size_t) id]].parked : parked_; }

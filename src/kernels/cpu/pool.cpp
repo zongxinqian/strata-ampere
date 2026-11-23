@@ -1197,6 +1197,8 @@ bool ExpertPool::drain_one(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 8) {
+            range_fn_(range_ctx_, (int) i);
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
             // FF / H, or another family's smaller expert)
@@ -1450,6 +1452,17 @@ bool ExpertPool::async_poll() {
 
 void ExpertPool::async_wait() {
     while (!async_poll()) strata_cpu_pause();
+}
+
+void ExpertPool::run_range(int n_tasks, void (*fn)(void*, int), void* ctx) {
+    if (n_tasks <= 0 || fn == nullptr) return;
+    if (n_ <= 0 || n_tasks == 1) {
+        for (int i = 0; i < n_tasks; ++i) fn(ctx, i);
+        return;
+    }
+    range_fn_ = fn;
+    range_ctx_ = ctx;
+    run_phase(8, n_tasks);
 }
 
 void ExpertPool::run_phase(int mode, int n_tasks) {
