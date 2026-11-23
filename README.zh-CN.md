@@ -1,176 +1,94 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
-
-<h3 align="center">在你自己的电脑上运行强大的 AI。</h3>
-<p align="center">本地聊天、写代码、处理图片。</p>
+# strata-ampere
 
 <p align="center">
-  <a href="#模型">模型</a> · <a href="#安装"><b>安装</b></a> ·
-  <a href="#硬件">硬件</a> · <a href="#工具">工具</a> ·
-  <a href="#帮助">帮助</a> · <a href="#支持-strata">支持</a>
+  <b>面向 Ampere（<code>sm_86</code>）双卡 MoE 推理的 <a href="https://github.com/Niko1221/Strata">Strata</a> 无损高吞吐 TP=2 + EP=2 魔改分支。</b>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="下载 Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT 许可证"></a>
-  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="在 GitHub Sponsors 上支持 Strata"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="在 Buy Me a Coffee 上支持 Strata"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="README.md">English</a>
 </p>
 
-<p align="center"><sub><a href="README.md">English</a> · <b>简体中文</b> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
+`strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度优化，目标是在消费级双卡 Ampere（`sm_86`，例如 2× 魔改 RTX 3080 20 GB，跨 CPU Host Bridge 非 P2P PCIe Gen4 x16）+ 多通道 DDR4 主机 CPU 混合推理架构上，以**严格无损精度**榨干 MoE 大模型的 Decode 吞吐。
 
-**免费、开源，由你自己运行。** 在桌面上使用 Strata，或搭配你喜欢的编程工具。无需账号。
+在 `Qwen3.8-Flash-Next-UD-Q4_K_XL`（48 层、每层 512 路由专家、256K 上下文、`int8` KV 且 32K 常驻显存）上，`strata-ampere` 实测 6 场景中位均值达 **`159.68 tok/s`**（相比基线 `91.42 tok/s` **+74.7%**，相比早期 TP=2 Surgery 5 `111.02 tok/s` **+43.8%**），全程保持**零降量化**、**绝不跳过冷门专家**（`STRATA_ROUTE_TAIL_SKIP=0`）与 **BF16** TP2 AllReduce 精度。
 
-## 模型
+---
 
-我们**首先推荐 ISTA-DASLab**，其次是 **Unsloth** 和其他提供方，前提是有内存放得下的兼容模型。
+## 核心优化亮点
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+1. **非 P2P 双卡 `TP=2 + EP=2` 全链路架构**
+   - 全 48 层注意力 / GDN / QSA / 共享 MLP / LM Head 50/50 Tensor Parallel + 24,576 专家 50/50 互不重叠 Expert Parallel（`STRATA_TP2=1`），完整支持 TP=2 多轮前缀缓存 Checkpoint（`--prompt-cache 6`）。
+   - Prefill 采用全双工 Copy-Engine DMA BF16 `TpComm`，Decode 采用低延迟环形 Mapped-Host BF16 AllReduce；移除 `src/kernels/cuda/tp_comm.cu` 中 `ld.acquire.sys` 轮询里的 `__nanosleep(40)`（`96x AR` 实测降低 `~80–91 us`）。
+   - Prefill 锁页冷专家采用 50/50 奇偶 EP 并行加载与计算，均衡双卡负载。
 
-| 提供方 | 可选项 |
-| --- | --- |
-| **ISTA-DASLab · 推荐** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S。[Coder：IQ1\_M](docs/MODELS.md#coder)，适合写代码。 |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。占用内存更少，但速度更慢。 |
-| **其他选项** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+2. **Ampere（`sm_86`）Dense 与 MoE 专家 CUDA 微核深度优化**
+   - **`Q8_0` / `Q4_0` `sm_86` 专用微核**（`src/kernels/cuda/q8_sm86_fast.cuh`、`src/kernels/cuda/q4_sm86.cuh`、`src/kernels/cuda/native_mmvq.cu`）：重调 `RPB/TPR` 分块，新增 `subwarp_kernel`、`row1_direct_kernel`、显式 `__launch_bounds__` 及 `native_mmvq_pair`（支持 `Q8_0`/`Q4_0` `ncols >= 1`）。
+   - **RTX 3080（68 SMs）实测 `kIlRows_86` 表格**（`src/kernels/cuda/native_mmvq.cu`）：基于 `mmvq_il_parity --bench --emit-table` 重标 `Q4_K`、`Q6_K`、`IQ4_XS`、`Q3_K`（替换原 RTX A4000 表项；如 `Q4_K 6144x2560 T=2` 从 `24.8 us` 降至 `16.0 us`）。
+   - **36 层 GDN Split 兼容树解码**（`src/kernels/cuda/verify_kernels.cu`）：为 `gdn_step_split_kernel` 补齐 `bool TREE`（`tree_fork`/`tree_parent`）分支并在 `sm_86` 默认开启 `STRATA_GDN_SPLIT=1`。
+   - **`S27` 常驻专家核优化**（`src/kernels/cuda/iq_kernels.cu`）：`S27<13>::load` 加入 `__ldg` 只读缓存加载，`sm_86` 默认 `gy_gu=16`、`gy_dn=16`（保持 `gth=128`）。
 
-[比较大小、内存需求和兼容性](docs/MODELS.md)。
+3. **MTP TP=2 草稿融合与树投机策略校准**
+   - `--mtp-q4 all` 草稿头 Q4_0 缩容重分配，为 GPU0 腾出 ~130 MiB 换取更多常驻热专家。
+   - `uint4` 向量化 TP2 发布/等待、融合 `bump_round`、`(double)` warp 并行 `sumexp` 归约、`mtp_tp2_merge_head` 内嵌 `dvocab` 映射，并用 `native_mmvq_pair` 融合 `k_proj + v_proj`（`src/core/mtp.cpp`、`src/kernels/cuda/verify_kernels.cu`）。
+   - 基于 `STRATA_SPEC_TRACE` 实测重标 `STRATA_SPEC_FIXED_TABLE=10.5,12.2,14.0,16.1,20.2,23.6`、`STRATA_SPEC_R_OP=0.130`、`STRATA_SPEC_NO_HICONF=0` 与 `--spec-min-p 0.22`（配合 `STRATA_TREE_FORK=1`）。
 
-</details>
+4. **CPU 专家池与内存带宽对齐**
+   - `--pool-workers 15` 跨 8 个 CCX 绑核（`15 worker + 1 host` = 16 活跃线程），在 Threadripper 3960X 四通道 DDR4-3200 上稳定吃满 ~77.8 GB/s 带宽上限且避免跨 CCX 争抢。
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+---
 
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0。这些是目前文档中收录的该模型的版本。
+## 实测性能（`REPS=3` 中位数）
 
-[模型指南和兼容性](docs/QWEN36.md)。
+**测试平台**：2× RTX 3080 20 GB（`sm_86`，320 W，非 P2P PCIe Gen4 x16，CUDA 13.1），AMD Threadripper 3960X（24c/48t，`performance` 调频），128 GB 四通道 DDR4-3200。  
+**测试模型与口径**：`Qwen3.8-Flash-Next-UD-Q4_K_XL`（`temperature=0`、`presence_penalty=0`、`enable_thinking=False`、`--kv int8 --kv-resident 32768`、`STRATA_ROUTE_TAIL_SKIP=0`、`STRATA_TP_AR_MODE=bf16`）。
 
-</details>
+| 场景 | 基线 (11-20) | TP=2 Surgery 5 (11-21) | **`strata-ampere` 客户端 (`srv_decode`)** | 3 轮峰值 | `e2e_out_tok_s` |
+|---|---:|---:|---:|---:|---:|
+| `ctx512` | 91.6 | 103.2 (`103.1`) | **155.2** (`154.9`) | **160.2** | 101.6 |
+| `ctx2048` | 97.2 | 118.5 (`118.3`) | **168.4** (`168.0`) | **171.7** | 87.9 |
+| `ctx8192` | 91.9 | 115.9 (`115.8`) | **169.1** (`168.7`) | **169.7** | 56.3 |
+| `ctx32768` | 101.1 | 111.6 (`111.4`) | **171.9** (`171.3`) | **176.4** | 25.9（`3,407.1` srv prefill） |
+| `creative` | 77.4 | 93.1 (`93.0`) | **131.5** (`131.3`) | 135.3 | 114.0 |
+| `code` | 89.3 | 123.8 (`123.6`) | **162.0** (`161.5`) | 165.0* | 136.4 |
+| **6 项综合均值** | **91.42** | **111.02** (`110.87`) | **`159.68 tok/s`** (`159.28`) | — | **`87.02 tok/s`** |
 
-<a id="the-other-sizes"></a>
+> \*同版二进制在 `STRATA_SPEC_R_OP=0.120` 下 `code` 曾录得单次 `189.1 tok/s` 峰值。`bench.py` 中 `creative` 紧接 `code` 交替执行，瞬时专家缓存命中率由 `84.1%` 降至 `78.4–79.1%`。
 
-不确定哪个放得下？[为你的电脑选择模型](docs/MODELS.md#pick-by-memory)。
+### 精度与稳定性验证
 
-## 安装
+- **Parity 回归套件**：19/19 项核心 CUDA/CPU parity 与微基准 `0` 失败（含 `verify_parity`、`native_multi_parity`、`gdn_parity` 默认/`SPLIT=0`/`SPLIT=1`、`router_top10_parity`、`mmvq_il_parity`、`sampler_parity`、`gr_parity`、`native_expert_parity`、`q8_gemv_bench`、`router_chain_bench`、`mmvf_rows_parity`、`spec_proposal_parity`、`spec_verify_parity`、`qsa_parity`、`shared_expert_parity`）。`fused_gr_bench` 中实际生产路径 `Q8`/`Q8-PK` 对齐正常（`rel rms mixed 0.0012–0.0016`），仅预存历史 BF16 `apply 1` 存在 12 例已知差异（`apply 0` 逐比特一致）。
+- **超长上下文大海捞针**：~150K 字符 / ~87K prompt tokens（深度 0.5）**3/3 精确命中**。
+- **显存与告警**：全过程 `0` 条 `#2065` / `min_free` 告警，压测后 GPU0 余量 `536 MiB >= 512 MiB`。
 
-<a id="option-a-the-strata-app"></a>
+---
 
-### 桌面应用
+## 编译指南（`sm_86`）
 
-**[下载适用于 Windows、Linux 或 Mac 的 Strata →](https://github.com/Niko1221/Strata/releases/latest)**
+依赖 CUDA Toolkit 13.1（或兼容 `sm_86` 的 12.x+）、CMake、Ninja 与 C++20 编译器：
 
-安装应用，选择模型，就可以开始聊天。每个系统只有一个安装程序。首次启动时，应用会下载适合你显卡的引擎。[安装程序帮助](docs/INSTALL.md#the-app)。
-
-<sub>文件: `Strata-0.2.14-windows-x64-setup.exe` · `Strata-0.2.14-linux-x86_64.AppImage` · `Strata-0.2.14-macos-arm64.dmg`</sub>
-
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata 桌面应用，聊天和实时代码预览并排显示">
-  <br><sub>聊天、文件和实时预览都在一个窗口里。</sub>
-</p>
-
-<a id="option-b-the-terminal-one-line"></a>
-
-### 终端应用
-
-更喜欢终端？安装 Strata，然后运行 **`strata launch`**。
-
-<details open>
-<summary><b>安装命令</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+```bash
+export PATH=/usr/local/cuda-13.1/bin:$PATH
+cmake -B build86 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build86 --target strata -j $(nproc)
 ```
 
-**Windows PowerShell**
+---
 
-```powershell
-irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+## 快速启动
+
+1. 复制脱敏配置模板 [examples/strata-2x3080-20g.example.json](examples/strata-2x3080-20g.example.json)，替换其中的 `/path/to/...` 模型/引擎路径以及 `CHANGE_ME_API_KEY`。
+2. 按你的 CPU 物理核拓扑调整 `--pool-workers` 与 `--pool-cores`（模板默认针对 24 核 Threadripper 3960X 跨 8 CCX 绑定 15 个 worker）。
+3. 使用 [examples/start-strata-ampere.sh](examples/start-strata-ampere.sh) 或直接运行：
+
+```bash
+python3 serve/server.py --config /path/to/strata-2x3080-20g.json
 ```
 
-在 Windows 上，安装后请打开一个新的终端。然后运行：
+---
 
-```sh
-strata launch
-```
+## 上游致谢与开源协议
 
-按提示下载并启动模型。[终端指南](docs/TERMINAL_LAUNCH.md)。
-
-</details>
-
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata 终端应用，显示模型活动、速度、内存和最近的请求">
-  <br><sub>模型运行时，随时查看模型和硬件状态。</sub>
-</p>
-
-<a id="build-from-source"></a>
-
-[从源码构建](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [完整安装指南](docs/INSTALL.md)
-
-<a id="what-you-need"></a>
-
-## 硬件
-
-| 支持的硬件 | 指南 |
-| --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 系列** | [NVIDIA 安装](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900、RX 9060 / 9070、AI PRO R9700** | [AMD 安装](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · 实验性** | [RX 6000 安装](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel 安装](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 或更新** | [Mac 安装](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo 安装](docs/STRIX_HALO.md) |
-
-<a id="using-it"></a>
-
-## 工具
-
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**，也可以通过兼容 OpenAI 和 Anthropic 的 API 使用更多工具。
-
-运行 **`strata connect`**，查看你所用工具的设置方法。[连接指南](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect)。
-
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
-<a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
-
-## 帮助
-
-[全部指南](docs) · [故障排查](docs/TROUBLESHOOTING.md) · [报告问题](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[基准测试](docs/COMMUNITY_BENCHMARKS.md) · [工作原理](docs/HOW_IT_WORKS.md) · [参与贡献](CONTRIBUTING.md)
-
-## 支持 Strata
-
-**帮助本地 AI 保持开放。** GitHub 赞助或一杯咖啡，都能帮助我们在更多硬件上开发和测试。
-
-<a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors：支持 Strata" height="48"></a>
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee：支持 Strata" height="48"></a>
-
-### 忠实支持者
-
-感谢每一位支持 Strata 的人。
-
-<!-- supporters:start (one line per public supporter, newest last; copy a line and change the GitHub name in all four places) -->
-<a href="https://github.com/ryan4yin"><img src="https://github.com/ryan4yin.png?size=96" width="48" height="48" alt="ryan4yin" title="ryan4yin"></a>
-<a href="https://github.com/themactep"><img src="https://github.com/themactep.png?size=96" width="48" height="48" alt="themactep" title="themactep"></a>
-<a href="https://github.com/macintog"><img src="https://github.com/macintog.png?size=96" width="48" height="48" alt="macintog" title="macintog"></a>
-<a href="https://github.com/bisonbet"><img src="https://github.com/bisonbet.png?size=96" width="48" height="48" alt="bisonbet" title="bisonbet"></a>
-<a href="https://github.com/vizv"><img src="https://github.com/vizv.png?size=96" width="48" height="48" alt="vizv" title="vizv"></a>
-<a href="https://github.com/kod88vn"><img src="https://github.com/kod88vn.png?size=96" width="48" height="48" alt="kod88vn" title="kod88vn"></a>
-<a href="https://github.com/seoulworker"><img src="https://github.com/seoulworker.png?size=96" width="48" height="48" alt="seoulworker" title="seoulworker"></a>
-<a href="https://github.com/jackyini"><img src="https://github.com/jackyini.png?size=96" width="48" height="48" alt="jackyini" title="jackyini"></a>
-<a href="https://github.com/router0mail"><img src="https://github.com/router0mail.png?size=96" width="48" height="48" alt="router0mail" title="router0mail"></a>
-<!-- supporters:end -->
-
-[MIT 许可证](LICENSE) · [致谢和模型许可证](docs/HOW_IT_WORKS.md#credits) · [隐私](docs/SAFETY.md)
-
-<a id="option-c-let-your-ai-set-it-up"></a>
-
-<sub>面向 AI 工具和自动阅读器： <a href="AGENTS.md">技术参考</a> · <a href="docs/AI_SETUP.md">安装说明</a></sub>
-
-**赞助、硬件合作或其他合作：** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
+`strata-ampere` 派生自 [Niko1221/Strata](https://github.com/Niko1221/Strata)，继续遵循原仓库的 **MIT License**（见 [LICENSE](LICENSE)）。基础引擎架构、Pack 格式、KV Streaming 与验证框架均归功于 Niko1221 及 Strata 社区贡献者。

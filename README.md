@@ -1,179 +1,96 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
-    <img src="apps/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
-
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+# strata-ampere
 
 <p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
+  <b>High-throughput lossless TP=2 + EP=2 fork of <a href="https://github.com/Niko1221/Strata">Strata</a> tuned for Ampere (<code>sm_86</code>) dual-GPU MoE inference.</b>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="Sponsor Strata on GitHub Sponsors"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
+`strata-ampere` is a performance-focused fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) engineered to maximize **strictly lossless** greedy decode throughput on dual consumer Ampere GPUs (`sm_86`, e.g., 2× RTX 3080 20 GB over non-P2P PCIe Gen4 x16) paired with a multi-channel DDR4 host CPU expert pool.
 
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+On `Qwen3.8-Flash-Next-UD-Q4_K_XL` (48 layers, 512 routed experts/layer, 256K context, `int8` KV cache with 32K resident in VRAM), `strata-ampere` achieves **159.68 tok/s** 6-workload median average decode (**+74.7%** over the baseline `91.42 tok/s`, **+43.8%** over the earlier TP=2 Surgery 5 milestone `111.02 tok/s`) with **zero quantization degradation**, **zero dropped routed experts** (`STRATA_ROUTE_TAIL_SKIP=0`), and **BF16** TP2 AllReduce precision.
 
-## Models
+---
 
-We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+## Key Optimizations
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+1. **Dual-GPU Non-P2P `TP=2 + EP=2` Architecture**
+   - Full-layer 50/50 Tensor Parallelism for attention/GDN/QSA/shared-MLP/LM-head plus non-overlapping 50/50 Expert Parallelism across both GPUs (`STRATA_TP2=1`) with TP=2 checkpoint/prefix-cache support (`--prompt-cache 6`).
+   - Duplex Copy-Engine DMA BF16 `TpComm` for prefill and low-latency ring-buffer mapped-host BF16 AllReduce for decode, with polling `__nanosleep(40)` removed from `ld.acquire.sys` loops (`src/kernels/cuda/tp_comm.cu`, saving ~80–91 us per 96× AllReduce).
+   - 50/50 even/odd pinned EP prefill split and balanced static expert sharding.
 
-| Provider | Choices |
-| --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+2. **Ampere (`sm_86`) Dense & Expert CUDA Microkernels**
+   - **`Q8_0` / `Q4_0` `sm_86` kernels** (`src/kernels/cuda/q8_sm86_fast.cuh`, `src/kernels/cuda/q4_sm86.cuh`, `src/kernels/cuda/native_mmvq.cu`): tuned `RPB/TPR` tiles, `subwarp_kernel`, `row1_direct_kernel`, explicit `__launch_bounds__`, and `native_mmvq_pair` (`ncols >= 1`) support for `Q8_0`/`Q4_0`.
+   - **RTX 3080 (`sm_86`, 68 SMs) `kIlRows_86` table** (`src/kernels/cuda/native_mmvq.cu`): re-measured via `mmvq_il_parity --bench --emit-table` for `Q4_K`, `Q6_K`, `IQ4_XS`, and `Q3_K` (replacing legacy RTX A4000 cells; e.g., `Q4_K 6144x2560 T=2` `24.8 -> 16.0 us`).
+   - **36-layer GDN Split with Tree Support** (`src/kernels/cuda/verify_kernels.cu`): `gdn_step_split_kernel` extended with `bool TREE` (`tree_fork`/`tree_parent`) and enabled by default on `sm_86` (`STRATA_GDN_SPLIT=1`).
+   - **`S27` Native Grouped Experts** (`src/kernels/cuda/iq_kernels.cu`): `__ldg` read-only cache loads in `S27<13>::load` and `sm_86` defaults `gy_gu=16`, `gy_dn=16` (`gth=128`).
 
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
+3. **MTP TP=2 Speculative Drafting & Tree Verification**
+   - `--mtp-q4 all` compact Q4_0 draft head reallocation freeing ~130 MiB on GPU0 for additional resident experts.
+   - Vectorized `uint4` TP2 head publish/wait, fused `bump_round`, `(double)` warp-parallel `sumexp` reduction, fused `dvocab` mapping inside `mtp_tp2_merge_head`, and fused `k_proj + v_proj` via `native_mmvq_pair` (`src/core/mtp.cpp`, `src/kernels/cuda/verify_kernels.cu`).
+   - Calibrated `STRATA_SPEC_FIXED_TABLE=10.5,12.2,14.0,16.1,20.2,23.6`, `STRATA_SPEC_R_OP=0.130`, `STRATA_SPEC_NO_HICONF=0`, and `--spec-min-p 0.22` with `STRATA_TREE_FORK=1`.
 
-</details>
+4. **CPU Expert Pool Alignment**
+   - `--pool-workers 15` pinned across 8 CCXs (`15 workers + 1 host` = 16 active threads) saturates 4-channel DDR4-3200 at ~77.8 GB/s without cross-CCX contention.
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+---
 
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
+## Verified Benchmark Results (`REPS=3`, Medians)
 
-[Model guide and compatibility](docs/QWEN36.md).
+**Testbed**: 2× RTX 3080 20 GB (`sm_86`, 320 W, non-P2P PCIe Gen4 x16, CUDA 13.1), AMD Threadripper 3960X (24c/48t, `performance` governor), 128 GB 4-ch DDR4-3200.  
+**Model**: `Qwen3.8-Flash-Next-UD-Q4_K_XL` (`temperature=0`, `presence_penalty=0`, `enable_thinking=False`, `--kv int8 --kv-resident 32768`, `STRATA_ROUTE_TAIL_SKIP=0`, `STRATA_TP_AR_MODE=bf16`).
 
-</details>
+| Workload | Baseline (11-20) | TP=2 Surgery 5 (11-21) | **`strata-ampere` Client (`srv_decode`)** | Peak (3-rep) | `e2e_out_tok_s` |
+|---|---:|---:|---:|---:|---:|
+| `ctx512` | 91.6 | 103.2 (`103.1`) | **155.2** (`154.9`) | **160.2** | 101.6 |
+| `ctx2048` | 97.2 | 118.5 (`118.3`) | **168.4** (`168.0`) | **171.7** | 87.9 |
+| `ctx8192` | 91.9 | 115.9 (`115.8`) | **169.1** (`168.7`) | **169.7** | 56.3 |
+| `ctx32768` | 101.1 | 111.6 (`111.4`) | **171.9** (`171.3`) | **176.4** | 25.9 (`3,407.1` srv prefill) |
+| `creative` | 77.4 | 93.1 (`93.0`) | **131.5** (`131.3`) | 135.3 | 114.0 |
+| `code` | 89.3 | 123.8 (`123.6`) | **162.0** (`161.5`) | 165.0* | 136.4 |
+| **6-Workload Mean** | **91.42** | **111.02** (`110.87`) | **`159.68 tok/s`** (`159.28`) | — | **`87.02 tok/s`** |
 
-<a id="the-other-sizes"></a>
+> \*Single-run `code` peak of `189.1 tok/s` was also observed on the same binary with `STRATA_SPEC_R_OP=0.120`. In `bench.py`, `creative` runs interleaved immediately after `code`, lowering transient expert cache hit rate from `84.1%` to `78.4–79.1%`.
 
-Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
+### Accuracy & Parity Verification
 
-## Install
+- **CUDA/CPU Parity Suite**: 19/19 core parity and microbench targets pass with `0` failures (`verify_parity`, `native_multi_parity`, `gdn_parity` default/`SPLIT=0`/`SPLIT=1`, `router_top10_parity`, `mmvq_il_parity`, `sampler_parity`, `gr_parity` default & `Q8_PACKED+HC_Q8+QFUSE_HC`, `native_expert_parity` `q4_K/q5_1` & `q5_K/q8_0`, `q8_gemv_bench`, `router_chain_bench`, `mmvf_rows_parity`, `spec_proposal_parity`, `spec_verify_parity`, `qsa_parity`, `shared_expert_parity`). In `fused_gr_bench`, production `Q8` and `Q8-PK` paths align (`rel rms mixed 0.0012–0.0016`), while 12 pre-existing legacy BF16 `apply 1` cases remain (`apply 0` bitwise equal).
+- **Long-Context Needle Test**: 3/3 exact hits at depth 0.5 (~150K chars / ~87K prompt tokens).
+- **VRAM Stability**: `0` `#2065` / `min_free` warnings across startup, `REPS=3` benchmark, sanity, greedy, and needle runs (`GPU0` post-bench free `536 MiB >= 512 MiB`).
 
-<a id="option-a-the-strata-app"></a>
+---
 
-### Desktop app
+## Building (`sm_86`)
 
-**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
+Requires CUDA Toolkit 13.1 (or 12.x+ compatible with `sm_86`), CMake, Ninja, and a C++20 compiler.
 
-Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
-downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
-
-<sub>Files: `Strata-0.2.14-windows-x64-setup.exe` · `Strata-0.2.14-linux-x86_64.AppImage` · `Strata-0.2.14-macos-arm64.dmg`</sub>
-
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
-  <br><sub>Chat, files and a live preview in one window.</sub>
-</p>
-
-<a id="option-b-the-terminal-one-line"></a>
-
-### Terminal app
-
-Prefer the terminal? Install Strata, then run **`strata launch`**.
-
-<details open>
-<summary><b>Install commands</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+```bash
+export PATH=/usr/local/cuda-13.1/bin:$PATH
+cmake -B build86 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build build86 --target strata -j $(nproc)
 ```
 
-**Windows PowerShell**
+---
 
-```powershell
-irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+## Quick Start
+
+1. Copy the sanitized template [examples/strata-2x3080-20g.example.json](examples/strata-2x3080-20g.example.json) to your deployment directory and replace `/path/to/...` and `CHANGE_ME_API_KEY`.
+2. Adjust `--pool-workers` and `--pool-cores` to match your CPU topology (the example pins 15 workers across 8 CCXs on a 24-core Threadripper 3960X).
+3. Launch the server using [examples/start-strata-ampere.sh](examples/start-strata-ampere.sh) or `serve/server.py`:
+
+```bash
+python3 serve/server.py --config /path/to/strata-2x3080-20g.json
 ```
 
-On Windows, open a new terminal afterwards. Then:
+> **Note for 20 GB RTX 3080 / Ampere cards**: Keep `--vram-reserve-mib 760 --vram-reserve-later-mib 544` (or higher if driving a display) to maintain `>= 512 MiB` free VRAM headroom on GPU0.
 
-```sh
-strata launch
-```
+---
 
-Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
+## Upstream Attribution & License
 
-</details>
-
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
-  <br><sub>Watch your model and hardware while it runs.</sub>
-</p>
-
-<a id="build-from-source"></a>
-
-[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
-
-<a id="what-you-need"></a>
-
-## Hardware
-
-| Supported hardware | Guide |
-| --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
-| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
-
-<a id="using-it"></a>
-
-## Tools
-
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
-
-Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
-
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
-<a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
-
-## Help
-
-[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](CONTRIBUTING.md)
-
-## Support Strata
-
-**Help keep local AI open to everyone.** A GitHub sponsorship or a coffee helps fund development and testing on more hardware.
-
-<a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors: sponsor Strata" height="48"></a>
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
-
-### Loyal supporters
-
-Thank you to everyone who supports Strata.
-
-<!-- supporters:start (one line per public supporter, newest last; copy a line and change the GitHub name in all four places) -->
-<a href="https://github.com/ryan4yin"><img src="https://github.com/ryan4yin.png?size=96" width="48" height="48" alt="ryan4yin" title="ryan4yin"></a>
-<a href="https://github.com/themactep"><img src="https://github.com/themactep.png?size=96" width="48" height="48" alt="themactep" title="themactep"></a>
-<a href="https://github.com/macintog"><img src="https://github.com/macintog.png?size=96" width="48" height="48" alt="macintog" title="macintog"></a>
-<a href="https://github.com/bisonbet"><img src="https://github.com/bisonbet.png?size=96" width="48" height="48" alt="bisonbet" title="bisonbet"></a>
-<a href="https://github.com/vizv"><img src="https://github.com/vizv.png?size=96" width="48" height="48" alt="vizv" title="vizv"></a>
-<a href="https://github.com/kod88vn"><img src="https://github.com/kod88vn.png?size=96" width="48" height="48" alt="kod88vn" title="kod88vn"></a>
-<a href="https://github.com/seoulworker"><img src="https://github.com/seoulworker.png?size=96" width="48" height="48" alt="seoulworker" title="seoulworker"></a>
-<a href="https://github.com/jackyini"><img src="https://github.com/jackyini.png?size=96" width="48" height="48" alt="jackyini" title="jackyini"></a>
-<a href="https://github.com/router0mail"><img src="https://github.com/router0mail.png?size=96" width="48" height="48" alt="router0mail" title="router0mail"></a>
-<!-- supporters:end -->
-
-[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
-
-<a id="option-c-let-your-ai-set-it-up"></a>
-
-<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
-
-**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
-
+`strata-ampere` is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) and is distributed under the original **MIT License** — see [LICENSE](LICENSE). All credit for the base Strata engine, pack format, KV streaming, and verification framework belongs to Niko1221 and the Strata contributors.
