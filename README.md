@@ -79,15 +79,36 @@ cmake --build build86 --target strata -j $(nproc)
 
 ## Quick Start
 
-1. Copy the sanitized template [examples/strata-2x3080-20g.example.json](examples/strata-2x3080-20g.example.json) to your deployment directory and replace `/path/to/...` and `CHANGE_ME_API_KEY`.
-2. Adjust `--pool-workers` and `--pool-cores` to match your CPU topology (the example pins 15 workers across 8 CCXs on a 24-core Threadripper 3960X).
+Choose the drafter preset that best matches your workload (same `build86/strata` binary, zero recompilation):
+
+### Choosing a Drafter: `MTP-6` vs `DFlash2 Q4_0`
+
+Both presets run strictly lossless (`temperature=0`, `STRATA_ROUTE_TAIL_SKIP=0`) on `2× RTX 3080 20 GB` (`TP=2 + EP=2`, `Qwen3.8-Flash-Next-UD-Q4_K_XL`, `REPS=2` head-to-head 6-workload suite):
+
+| Workload | `MTP-6` (Balanced) | `DFlash2 Q4_0` (`conf=0.35`, Code/Reasoning) | Delta |
+|---|---:|---:|---:|
+| `code` (Python LRU + tests) | 156.76 tok/s | **171.42 tok/s** | **+9.4%** |
+| `math` (Proofs & recurrence) | 158.14 tok/s | **166.87 tok/s** | **+5.5%** |
+| `reasoning` (Multi-step logic) | 183.94 tok/s | **197.95 tok/s** | **+7.6%** |
+| `en_tech` (CUDA architecture) | 142.48 tok/s | **144.98 tok/s** | +1.8% |
+| `zh_qa` (Systems Q&A) | **142.54 tok/s** | 140.87 tok/s | -1.2% |
+| `creative` (Chinese sci-fi) | **135.11 tok/s** | 122.64 tok/s | -9.2% |
+| **6-Workload Mean (decode / e2e)** | `153.16 / 137.48 tok/s` | **`157.45 / 141.01 tok/s`** | **+2.80%** |
+
+- **Pick `DFlash2 Q4_0`** ([examples/strata-2x3080-20g-dflash2.example.json](examples/strata-2x3080-20g-dflash2.example.json)) if you mainly do **coding, math, or structured reasoning** (keep `--draft-conf 0.35` and `--vram-reserve-mib 1050`; lowering `--draft-conf` below `0.35` increases unique cold-expert DDR4 traffic on partial-VRAM setups and slows decode down).
+- **Pick `MTP-6`** ([examples/strata-2x3080-20g.example.json](examples/strata-2x3080-20g.example.json)) if you want the most **balanced all-rounder** or do heavy **creative writing** (`+12.5 tok/s` faster on high-entropy creative text).
+
+### Launch Steps
+
+1. Copy your chosen template (`examples/strata-2x3080-20g-dflash2.example.json` or `examples/strata-2x3080-20g.example.json`) to your deployment directory and replace `/path/to/...` and `CHANGE_ME_API_KEY`.
+2. Adjust `--pool-workers` and `--pool-cores` to match your CPU topology (the examples pin 15 workers across 8 CCXs on a 24-core Threadripper 3960X).
 3. Launch the server using [examples/start-strata-ampere.sh](examples/start-strata-ampere.sh) or `serve/server.py`:
 
 ```bash
 python3 serve/server.py --config /path/to/strata-2x3080-20g.json
 ```
 
-> **Note for 20 GB RTX 3080 / Ampere cards**: Keep `--vram-reserve-mib 760 --vram-reserve-later-mib 544` (or higher if driving a display) to maintain `>= 512 MiB` free VRAM headroom on GPU0.
+> **Note for 20 GB RTX 3080 / Ampere cards**: Keep `--vram-reserve-mib 760` (MTP-6) or `1050` (DFlash2 `Q4_0`) with `--vram-reserve-later-mib 544` (or higher if driving a display) to maintain `>= 512 MiB` free VRAM headroom on GPU0.
 
 ---
 

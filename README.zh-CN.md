@@ -77,9 +77,30 @@ cmake --build build86 --target strata -j $(nproc)
 
 ---
 
-## 快速启动
+## 快速启动与草稿模型选型
 
-1. 复制脱敏配置模板 [examples/strata-2x3080-20g.example.json](examples/strata-2x3080-20g.example.json)，替换其中的 `/path/to/...` 模型/引擎路径以及 `CHANGE_ME_API_KEY`。
+同一份 `build86/strata` 二进制无需重新编译，即可通过配置文件在 **MTP-6** 与 **DFlash2 Q4_0** 两种草稿模型间自由切换：
+
+### 草稿模型对比：`MTP-6` vs `DFlash2 Q4_0`
+
+在 `2× RTX 3080 20 GB`（`TP=2 + EP=2`、`Qwen3.8-Flash-Next-UD-Q4_K_XL`、`temperature=0`、`STRATA_ROUTE_TAIL_SKIP=0`）上的同口径 6 场景端到端实测对比：
+
+| 场景 | `MTP-6`（均衡通用） | `DFlash2 Q4_0`（`conf=0.35`，代码/推理向） | 变化 |
+|---|---:|---:|---:|
+| `code`（Python 算法与测试） | 156.76 tok/s | **171.42 tok/s** | **+9.4%** |
+| `math`（数论与递推证明） | 158.14 tok/s | **166.87 tok/s** | **+5.5%** |
+| `reasoning`（多步逻辑推理） | 183.94 tok/s | **197.95 tok/s** | **+7.6%** |
+| `en_tech`（CUDA 架构解析） | 142.48 tok/s | **144.98 tok/s** | +1.8% |
+| `zh_qa`（中文系统技术问答） | **142.54 tok/s** | 140.87 tok/s | -1.2% |
+| `creative`（中文微科幻创作） | **135.11 tok/s** | 122.64 tok/s | -9.2% |
+| **6 场景均值（decode / e2e）** | `153.16 / 137.48 tok/s` | **`157.45 / 141.01 tok/s`** | **+2.80%** |
+
+- **偏代码 / 数学 / 逻辑推理推荐选 `DFlash2 Q4_0`**：使用 [examples/strata-2x3080-20g-dflash2.example.json](examples/strata-2x3080-20g-dflash2.example.json)（建议保持 `--draft-conf 0.35` 与 `--vram-reserve-mib 1050`；在半驻留显存架构下把 `--draft-conf` 调低会引入更多冷专家 DDR4 读取，反而变慢）。
+- **偏中文写作 / 全场景均衡推荐选 `MTP-6`**：使用 [examples/strata-2x3080-20g.example.json](examples/strata-2x3080-20g.example.json)（`creative` 高随机性创作快 `~12.5 tok/s`）。
+
+### 启动步骤
+
+1. 按需复制对应的脱敏配置模板（`examples/strata-2x3080-20g-dflash2.example.json` 或 `examples/strata-2x3080-20g.example.json`），替换其中的 `/path/to/...` 模型/引擎路径以及 `CHANGE_ME_API_KEY`。
 2. 按你的 CPU 物理核拓扑调整 `--pool-workers` 与 `--pool-cores`（模板默认针对 24 核 Threadripper 3960X 跨 8 CCX 绑定 15 个 worker）。
 3. 使用 [examples/start-strata-ampere.sh](examples/start-strata-ampere.sh) 或直接运行：
 
