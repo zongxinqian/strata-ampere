@@ -299,9 +299,21 @@ public:
     /// Draft `idx` (0-based, probability p) was just computed: update `st` and say whether to compute draft idx + 1.
     /// idx == 0 starts a new chain.  `cap` = the widest window (rows).
     bool keep_draft(ChainState& st, int idx, float p, int cap) const;
+    struct ChainSnapshot {
+        double pa_ok[8]{}, pa_n[8]{}, pa_ok_d1[8]{}, pa_n_d1[8]{}, cost_ms[9]{};
+        uint8_t probe_ok[9]{}, stale[9]{};
+        double margin = 0.0;
+        int cap = 1;
+        uint8_t robust = 0;
+        double r_op = 0.0;
+        double opt0 = 0.0;
+        uint8_t no_hiconf = 0;
+        uint8_t depth_cal = 1;
+    };
+    ChainSnapshot chain_snapshot(int cap) const;
     /// After a round of the MTP window T whose drafts were p[0..T-1): `accepted` of them held.  Teaches draft_rate().
     void observe_probs(const float* p, int n_window_drafts, int accepted);
-    double draft_rate(double p) const;     // acceptance of an MTP draft that came with probability p
+    double draft_rate(double p, int depth = 0) const;  // acceptance of an MTP draft that came with probability p
 
 private:
     static int bucket(int match);
@@ -344,13 +356,37 @@ private:
     CostLearner learner_;
     double clamp_sample(int t, double ms) const;
     static constexpr int kPBuckets = 8;
-    std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts reached / accepted by probability bucket (decayed)
+    std::array<double, kPBuckets> pa_ok_{}, pa_n_{}, pa_ok_d1_{}, pa_n_d1_{}; // depth 0 and depth >= 1 buckets (decayed)
+    std::array<double, kPBuckets> tb_ok_{}, tb_n_{};       // 1-fork Branch B root hits / misses where Branch A missed at parent
+    double draft_branch_ms_ = 0.35;                        // EMA cost of 1 secondary branch draft pass (ms)
+    double draft_branch_n_ = 0.0;
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> last_{};   // the round at which each size was last measured
     // Gated proposals (observe_committed / defer_cost / apply_costs); all zero or empty on any other path.
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> tried_{};      // lookup windows of that size run with no time yet
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> delayed_n_{};  // of cost_n_: times applied by apply_costs (not new probes)
     struct HeldCost { int64_t end; int bucket; int t; double ms; double age; };
     std::vector<HeldCost> held_;                                          // defer_cost, oldest first
+public:
+    struct TreePick {
+        int T = 1;            // total verify window rows (1 + n_a + n_b)
+        int fork = 0;         // 0 = linear (use lin_t), else >= 2 (row index where Branch B begins)
+        int parent = 0;       // fork parent row (0 = anchor, 1 = a[0])
+        int n_a = 0;          // Branch A draft count (fork - 1 when fork > 0)
+        int n_b = 0;          // Branch B draft count (T - fork when fork > 0)
+        int lin_t = 1;        // best linear window width for fallback
+        bool probe_branch = false; // true if extending Branch B beyond 1 token can pay off
+        double gain = 0.0;    // relative E[tok/ms] improvement over best linear
+    };
+
+    void observe_tree_b(float p_a, float p_b, bool hit);
+    void observe_branch_ms(double ms);
+    double tree_b_rate(double p_a, double p_b) const;
+    double branch_draft_ms() const;
+    double r_op() const;
+    TreePick choose_tree(const float* draft_p, const float* top2_p, int n_d,
+                         bool allow_d1, double min_rel_gain, int max_b = 1) const;
+    int choose_tree_b_len(int parent, int n_a, float p_a, float p_b0,
+                          const float* draft_p, const float* b_p, int n_bp) const;
 };
 
 }  // namespace strata::spec

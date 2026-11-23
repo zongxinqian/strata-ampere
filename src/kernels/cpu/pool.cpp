@@ -1016,6 +1016,13 @@ void ExpertPool::worker(int id) {
         if (stop_.load(std::memory_order_acquire)) return;
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
         seen = epoch_.load(std::memory_order_acquire);
+        if (mode_ == 7) {
+            const int nw = (int) threads_.size();
+            const int nt_total = nw + (host_works_ ? 1 : 0);
+            const int tid = host_works_ ? id + 1 : id;
+            drain_fused_multi(tid, nt_total, seen, false);
+            continue;
+        }
         parked_of(id).fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
 
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
@@ -1196,7 +1203,8 @@ bool ExpertPool::drain_one(int id, ExpertScratch& scratch, uint32_t epoch) {
             // Task j of T over R rows of `h` per expert from matrix row `row0`: the whole phase (R = mrows_, h = per,
             // row0 = 0) or, under the NUMA split, this thread's slice (slice-local row g -> expert g / h, matrix row
             // row0 + g % h)
-            const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
+            const int unit = (mode_ == 5 && fuse_hq_) ? 32 : 1;
+            const int per = (mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd) / unit;
             int64_t R = mrows_, T = mtasks_, j = i;
             int h = per, row0 = 0;
             if (sliced) {
@@ -1207,7 +1215,7 @@ bool ExpertPool::drain_one(int id, ExpertScratch& scratch, uint32_t epoch) {
             for (int64_t g = g0; g < g1;) {
                 const int e = (int) (g / h), l0 = (int) (g % h);
                 const int l1 = (int) std::min<int64_t>(h, l0 + (g1 - g));
-                const int r0 = row0 + l0, r1 = row0 + l1;
+                const int r0 = (row0 + l0) * unit, r1 = (row0 + l1) * unit;
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;   // 149-cold: same types and rows
                 if (mode_ == 5 && q2_native_kernels(nfmt->gu_type)) {
@@ -1229,6 +1237,10 @@ bool ExpertPool::drain_one(int id, ExpertScratch& scratch, uint32_t epoch) {
                         native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                     else
                         native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    if (fuse_hq_) {
+                        for (int t = 0; t < mjobs_[e].nt; ++t)
+                            native_quant_h_slice(*nfmt, sb.ff[t], sb.hq[t], r0, r1);
+                    }
                 } else if (q2_native_kernels(nfmt->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
@@ -1337,8 +1349,12 @@ void ExpertPool::async_start_multi_native(const NativeFmt& f, ExpertJobMulti* jo
     mjobs_ = jobs;
     nfmt_ = &f;
     narithmetic_ = arithmetic;
-    mrows_ = (int64_t) async_nb_ * f.n_ff;
-    mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, async_nb_) : phase_tasks(mrows_);
+    fuse_hq_ = native_quant_h_fusable(f);
+    for (int e = 0; fuse_hq_ && e < async_nb_; ++e)
+        if (mjobs_[e].fmt != nullptr && !native_quant_h_fusable(*mjobs_[e].fmt)) fuse_hq_ = false;
+    const int p5_per = fuse_hq_ ? (int) (f.n_ff / 32) : (int) f.n_ff;
+    mrows_ = (int64_t) async_nb_ * p5_per;
+    mtasks_ = numa_n_ > 0 ? numa_plan_phase(p5_per, async_nb_) : phase_tasks(mrows_);
     async_state_ = 1;
     start_phase_async(5, mtasks_);
 }
@@ -1361,7 +1377,7 @@ bool ExpertPool::async_poll() {
         for (int k = 0; k < numa_n_; ++k) d += nsync_[(size_t) k].done.load(std::memory_order_acquire);
     else
         d = done_.load(std::memory_order_acquire);
-    if (d < (uint32_t) async_n_tasks_ || parked_count() != (uint32_t) n_) {
+    if (d < (uint32_t) async_n_tasks_ || ((numa_phase() || async_aborted_) && parked_count() != (uint32_t) n_)) {
         if ((++async_poll_spins_ & 1023u) == 0) {
             const auto now = std::chrono::steady_clock::now();
             if (async_poll_spins_ == 1024u || d != async_stall_seen_) {
@@ -1395,10 +1411,12 @@ bool ExpertPool::async_poll() {
     const NativeFmt& f = *nfmt_;
     if (async_state_ == 1) {
         ms_multi_gu += std::chrono::duration<double, std::milli>(t_now - async_phase_t0_).count();
-        for (int e = 0; e < async_nb_; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        if (!fuse_hq_) {
+            for (int e = 0; e < async_nb_; ++e)
+                for (int t = 0; t < mjobs_[e].nt; ++t)
+                    if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                    else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        }
         const auto t_q = std::chrono::steady_clock::now();
         ms_multi_q += std::chrono::duration<double, std::milli>(t_q - t_now).count();
         mrows_ = (int64_t) async_nb_ * f.n_embd;
@@ -1413,8 +1431,12 @@ bool ExpertPool::async_poll() {
     if (async_b0_ < async_n_) {
         async_nb_ = (std::min)(kMaxSplitMulti, async_n_ - async_b0_);
         mjobs_ = async_all_jobs_ + async_b0_;
-        mrows_ = (int64_t) async_nb_ * f.n_ff;
-        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, async_nb_) : phase_tasks(mrows_);
+        fuse_hq_ = native_quant_h_fusable(f);
+        for (int e = 0; fuse_hq_ && e < async_nb_; ++e)
+            if (mjobs_[e].fmt != nullptr && !native_quant_h_fusable(*mjobs_[e].fmt)) fuse_hq_ = false;
+        const int p5_per = fuse_hq_ ? (int) (f.n_ff / 32) : (int) f.n_ff;
+        mrows_ = (int64_t) async_nb_ * p5_per;
+        mtasks_ = numa_n_ > 0 ? numa_plan_phase(p5_per, async_nb_) : phase_tasks(mrows_);
         async_state_ = 1;
         start_phase_async(5, mtasks_);
         return false;
@@ -1437,7 +1459,7 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
-    wait_parked("after a phase");
+    if (numa_phase()) wait_parked("after a phase");
     // Each slice's stamp is stored after its last `done` increment, so `wait_done` can return before it lands; the
     // thread that stored it has parked again since (it left the park to claim), and that re-park is what the wait
     // above acquired.  So the stamps are read here, not in `wait_done`.
@@ -1467,7 +1489,7 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
 }
 
 int ExpertPool::phase_tasks(int64_t rows) const {
-    return tasks_ == 0 ? 3 * (n_ + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
+    return (int) (std::min)(rows, (int64_t) (tasks_ == 0 ? 3 * (n_ + (host_works_ ? 1 : 0)) : tasks_));
 }
 
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
@@ -1509,33 +1531,156 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
+void ExpertPool::drain_fused_multi(int tid, int nt_total, uint32_t epoch, bool is_host) {
+    const NativeFmt& f = *nfmt_;
+    const int nb = njobs_;
+    const int p5_per = fused_p5_per_;
+    const int p5_tot = nb * p5_per;
+    const bool inv = narithmetic_ == NativeArithmetic::WindowInvariant;
+
+    if (fused_act_need_ > 0) {
+        if (tid < fused_act_need_) {
+            for (int t = tid; t < pre_act_->n_toks; t += fused_act_need_)
+                native_quant_act(f, pre_act_->x[t], pre_act_->dst[t]);
+            fused_act_done_.fetch_add(1, std::memory_order_release);
+        }
+        while (fused_act_done_.load(std::memory_order_acquire) != (uint32_t) fused_act_need_) strata_cpu_pause();
+    }
+
+    // Cap active P5 threads to p5_tot so tid=0 (host) gets 1 full group at E=1 and extra groups spread across CCDs.
+    const int nt_p5 = nt_total < p5_tot ? nt_total : p5_tot;
+    if (tid < nt_p5) {
+        const int g0 = (int) (((int64_t) tid * p5_tot) / nt_p5);
+        const int g1 = (int) (((int64_t) (tid + 1) * p5_tot) / nt_p5);
+        for (int g = g0; g < g1; ) {
+            const int e = g / p5_per;
+            const int e_end = (e + 1) * p5_per;
+            const int g_stop = g1 < e_end ? g1 : e_end;
+            const int r0 = (g - e * p5_per) * 32;
+            const int r1 = (g_stop - e * p5_per) * 32;
+            const ExpertJobMulti& j = mjobs_[e];
+            if (j.nt > 0) {
+                const NativeFmt& jf = j.fmt != nullptr ? *j.fmt : f;
+                SplitBufMulti& sb = split_multi_[(size_t) e];
+                float* ff[MAXT];
+                for (int t = 0; t < j.nt; ++t) ff[t] = sb.ff[t];
+                if (inv) native_gu_rows_invariant(jf, j.blob, j.nact, j.nt, ff, r0, r1);
+                else native_gu_rows(jf, j.blob, j.nact, j.nt, ff, r0, r1);
+                for (int t = 0; t < j.nt; ++t) native_quant_h_slice(jf, sb.ff[t], sb.hq[t], r0, r1);
+            }
+            g = g_stop;
+        }
+    }
+
+    if (is_host) {
+        while (fused_p5_done_.load(std::memory_order_acquire) != (uint32_t) threads_.size()) strata_cpu_pause();
+        fused_p5_done_.store(0, std::memory_order_relaxed);
+        fused_p5_go_.store(epoch, std::memory_order_release);
+    } else {
+        fused_p5_done_.fetch_add(1, std::memory_order_release);
+        while (fused_p5_go_.load(std::memory_order_acquire) != epoch) strata_cpu_pause();
+    }
+
+    const int H = (int) f.n_embd;
+    const int64_t p6_tot = (int64_t) nb * H;
+    const int64_t row0 = ((int64_t) tid * p6_tot) / nt_total;
+    const int64_t row1 = ((int64_t) (tid + 1) * p6_tot) / nt_total;
+    for (int64_t r = row0; r < row1; ) {
+        const int e = (int) (r / H);
+        const int64_t e_end = (int64_t) (e + 1) * H;
+        const int64_t r_stop = row1 < e_end ? row1 : e_end;
+        const int lr0 = (int) (r - (int64_t) e * H);
+        const int lr1 = (int) (r_stop - (int64_t) e * H);
+        const ExpertJobMulti& j = mjobs_[e];
+        if (j.nt > 0) {
+            const NativeFmt& jf = j.fmt != nullptr ? *j.fmt : f;
+            SplitBufMulti& sb = split_multi_[(size_t) e];
+            const void* hq[MAXT];
+            for (int t = 0; t < j.nt; ++t) hq[t] = sb.hq[t];
+            if (inv) native_down_rows_invariant(jf, j.blob, hq, j.nt, j.out, lr0, lr1);
+            else native_down_rows(jf, j.blob, hq, j.nt, j.out, lr0, lr1);
+        }
+        r = r_stop;
+    }
+
+    if (is_host) {
+        while (fused_p6_done_.load(std::memory_order_acquire) != (uint32_t) threads_.size()) strata_cpu_pause();
+    } else {
+        fused_p6_done_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic, const SplitPreAct* pre_act) {
     if (n <= 0) return;
+    static const bool fused_env = [] {
+        const char* v = std::getenv("STRATA_POOL_FUSED");
+        return v == nullptr || v[0] != '0';
+    }();
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
+        const SplitPreAct* batch_pre = (b0 == 0 && pre_act != nullptr && pre_act->n_toks > 0) ? pre_act : nullptr;
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         narithmetic_ = arithmetic;
-        mrows_ = (int64_t) nb * f.n_ff;
-        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
-        const auto a = std::chrono::steady_clock::now();
-        run_phase(5, mtasks_);
-        const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
-        const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * f.n_embd;
-        mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);
-        run_phase(6, mtasks_);
-        const auto d = std::chrono::steady_clock::now();
-        ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
-        ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+        fuse_hq_ = native_quant_h_fusable(f);
+        for (int e = 0; fuse_hq_ && e < nb; ++e)
+            if (mjobs_[e].fmt != nullptr && !native_quant_h_fusable(*mjobs_[e].fmt)) fuse_hq_ = false;
+        if (fused_env && fuse_hq_ && numa_n_ == 0 && tasks_ == 0 && !threads_.empty() && f.n_ff <= FF) {
+            wait_parked("before fused multi");
+            const int nw = (int) threads_.size();
+            const int nt_total = nw + (host_works_ ? 1 : 0);
+            njobs_ = nb;
+            fused_p5_per_ = (int) (f.n_ff / 32);
+            pre_act_ = batch_pre;
+            fused_act_need_ = batch_pre != nullptr ? (std::min)(nt_total, batch_pre->n_toks) : 0;
+            if (fused_act_need_ > 0) fused_act_done_.store(0, std::memory_order_relaxed);
+            fused_p5_done_.store(0, std::memory_order_relaxed);
+            fused_p6_done_.store(0, std::memory_order_relaxed);
+            mode_ = 7;
+            const uint32_t ep = epoch_.load(std::memory_order_relaxed) + 1;
+            const auto a = std::chrono::steady_clock::now();
+            publish();
+            if (host_works_) {
+                drain_fused_multi(0, nt_total, ep, true);
+            } else {
+                while (fused_p5_done_.load(std::memory_order_acquire) != (uint32_t) nw) strata_cpu_pause();
+                fused_p5_done_.store(0, std::memory_order_relaxed);
+                fused_p5_go_.store(ep, std::memory_order_release);
+                while (fused_p6_done_.load(std::memory_order_acquire) != (uint32_t) nw) strata_cpu_pause();
+            }
+            const auto d = std::chrono::steady_clock::now();
+            ms_multi_gu += std::chrono::duration<double, std::milli>(d - a).count();
+        } else {
+            if (batch_pre != nullptr) {
+                for (int t = 0; t < batch_pre->n_toks; ++t)
+                    native_quant_act(f, batch_pre->x[t], batch_pre->dst[t]);
+            }
+            const int p5_per = fuse_hq_ ? (int) (f.n_ff / 32) : (int) f.n_ff;
+            mrows_ = (int64_t) nb * p5_per;
+            mtasks_ = numa_n_ > 0 ? numa_plan_phase(p5_per, nb) : phase_tasks(mrows_);
+            const auto a = std::chrono::steady_clock::now();
+            run_phase(5, mtasks_);
+            const auto b = std::chrono::steady_clock::now();
+            if (!fuse_hq_) {
+                for (int e = 0; e < nb; ++e)
+                    for (int t = 0; t < mjobs_[e].nt; ++t)
+                        if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                        else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+            }
+            const auto c = std::chrono::steady_clock::now();
+            mrows_ = (int64_t) nb * f.n_embd;
+            mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);
+            run_phase(6, mtasks_);
+            const auto d = std::chrono::steady_clock::now();
+            ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
+            ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
+            ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+        }
     }
+    pre_act_ = nullptr;
+    fused_act_need_ = 0;
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();

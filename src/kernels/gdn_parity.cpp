@@ -619,6 +619,202 @@ int main(int argc, char** argv) {
         bad += lb_bad;
     }
 
+
+    // ================= 7. Tree verify forward & tree commit (rows_dev), bitwise against packed linear references =================
+    {
+        const int T = 5, fork = 3, L = 5, MT = strata::kernels::kVerifyMaxT;
+        const int vd = S * h_v, qk = S * h_k, C = 2 * qk + vd;
+        const int64_t conv_off = (int64_t) S * h_v * S, stride = conv_off + (int64_t) C * 3;
+        const float eps = 1e-6f;
+        int tr_bad = 0, tr_n = 0;
+
+        // 7a. Forward tree (parent = 0, 1) with conv_l2_multi + step_norm_multi (+ xq_out)
+        std::vector<float> conv0((size_t) C * 3), wc((size_t) C * 4), qkv((size_t) T * C), st0((size_t) conv_off);
+        std::vector<float> g((size_t) T * h_v), bt((size_t) T * h_v), z((size_t) T * vd), gm(S, 1.0f);
+        for (auto& x : conv0) x = gauss(rng) * 0.2f;
+        for (auto& x : wc) x = gauss(rng) * 0.5f;
+        for (auto& x : qkv) x = gauss(rng);
+        for (auto& x : st0) x = gauss(rng) * 0.1f;
+        for (auto& x : g) x = -(0.5f + 2.0f * (float) (rng() % 100) / 100.0f);
+        for (auto& x : bt) x = (float) (rng() % 100) / 100.0f;
+        for (auto& x : z) x = gauss(rng);
+        for (auto& x : gm) x = 1.0f + 0.1f * gauss(rng);
+
+        auto dev_f = [&](size_t n) { float* p = nullptr; check(cudaMalloc(&p, n * 4), "tm"); return p; };
+        float *d_c0 = dev_f(conv0.size()), *d_wc = dev_f(wc.size()), *d_qkv = dev_f(qkv.size());
+        float *d_s0 = dev_f(st0.size()), *d_g = dev_f(g.size()), *d_bt = dev_f(bt.size());
+        float *d_z = dev_f(z.size()), *d_gm = dev_f(gm.size());
+        float *d_ht = dev_f(T * C), *d_yt = dev_f(T * vd);
+        float *d_ha = dev_f(T * C), *d_ya = dev_f(T * vd);
+        float *d_hb = dev_f(T * C), *d_yb = dev_f(T * vd);
+        float *d_pq = dev_f(T * C), *d_pg = dev_f(T * h_v), *d_pb = dev_f(T * h_v), *d_pz = dev_f(T * vd);
+        uint8_t *d_xq_t = nullptr, *d_xq_ref = nullptr;
+        const size_t xq_bytes = strata::kernels::native_q8_1_bytes(vd, T);
+        check(cudaMalloc(&d_xq_t, xq_bytes), "txq1");
+        check(cudaMalloc(&d_xq_ref, xq_bytes), "txq2");
+        cudaStream_t qs = nullptr;
+        check(cudaStreamCreate(&qs), "tqs");
+
+        check(cudaMemcpy(d_c0, conv0.data(), conv0.size() * 4, cudaMemcpyHostToDevice), "tc0");
+        check(cudaMemcpy(d_wc, wc.data(), wc.size() * 4, cudaMemcpyHostToDevice), "twc");
+        check(cudaMemcpy(d_qkv, qkv.data(), qkv.size() * 4, cudaMemcpyHostToDevice), "tqkv");
+        check(cudaMemcpy(d_s0, st0.data(), st0.size() * 4, cudaMemcpyHostToDevice), "ts0");
+        check(cudaMemcpy(d_g, g.data(), g.size() * 4, cudaMemcpyHostToDevice), "tg");
+        check(cudaMemcpy(d_bt, bt.data(), bt.size() * 4, cudaMemcpyHostToDevice), "tbt");
+        check(cudaMemcpy(d_z, z.data(), z.size() * 4, cudaMemcpyHostToDevice), "tz");
+        check(cudaMemcpy(d_gm, gm.data(), gm.size() * 4, cudaMemcpyHostToDevice), "tgm");
+
+        for (int par : {0, 1}) {
+            // Tree DUT
+            check(cudaMemset(d_ht, 0, (size_t) T * C * 4), "mht");
+            check(cudaMemset(d_yt, 0, (size_t) T * vd * 4), "myt");
+            check(cudaMemset(d_xq_t, 0, xq_bytes), "mxq");
+            strata::kernels::gdn_conv_l2_multi(d_c0, d_qkv, d_wc, d_ht, C, 2 * h_k, eps, T, qs, 0, false, fork, par);
+            strata::kernels::gdn_step_norm_multi(d_s0, d_ht, C, d_g, d_bt, d_z, d_gm, eps, d_yt, h_k, h_v, T,
+                                                 nullptr, qs, 0, d_xq_t, fork, par, nullptr);
+            check(cudaStreamSynchronize(qs), "tsync1");
+            check(cudaMemset(d_xq_ref, 0, xq_bytes), "mxqr");
+            strata::kernels::native_quantize_q8_1(d_yt, d_xq_ref, vd, T, qs);
+            check(cudaStreamSynchronize(qs), "tsyncq");
+
+            // Reference Branch A [0..fork-1]
+            strata::kernels::gdn_conv_l2_multi(d_c0, d_qkv, d_wc, d_ha, C, 2 * h_k, eps, fork, qs);
+            strata::kernels::gdn_step_norm_multi(d_s0, d_ha, C, d_g, d_bt, d_z, d_gm, eps, d_ya, h_k, h_v, fork, nullptr, qs);
+
+            // Reference Branch B packed [0..par, fork..T-1]
+            std::vector<int> br_idx;
+            for (int i = 0; i <= par; ++i) br_idx.push_back(i);
+            for (int i = fork; i < T; ++i) br_idx.push_back(i);
+            const int nb_tok = (int) br_idx.size();
+            std::vector<float> pq(nb_tok * C), pg(nb_tok * h_v), pb(nb_tok * h_v), pz(nb_tok * vd);
+            for (int r = 0; r < nb_tok; ++r) {
+                const int src_r = br_idx[r];
+                std::memcpy(&pq[(size_t) r * C], &qkv[(size_t) src_r * C], (size_t) C * 4);
+                std::memcpy(&pg[(size_t) r * h_v], &g[(size_t) src_r * h_v], (size_t) h_v * 4);
+                std::memcpy(&pb[(size_t) r * h_v], &bt[(size_t) src_r * h_v], (size_t) h_v * 4);
+                std::memcpy(&pz[(size_t) r * vd], &z[(size_t) src_r * vd], (size_t) vd * 4);
+            }
+            check(cudaMemcpy(d_pq, pq.data(), pq.size() * 4, cudaMemcpyHostToDevice), "tpq");
+            check(cudaMemcpy(d_pg, pg.data(), pg.size() * 4, cudaMemcpyHostToDevice), "tpg");
+            check(cudaMemcpy(d_pb, pb.data(), pb.size() * 4, cudaMemcpyHostToDevice), "tpb");
+            check(cudaMemcpy(d_pz, pz.data(), pz.size() * 4, cudaMemcpyHostToDevice), "tpz");
+            strata::kernels::gdn_conv_l2_multi(d_c0, d_pq, d_wc, d_hb, C, 2 * h_k, eps, nb_tok, qs);
+            strata::kernels::gdn_step_norm_multi(d_s0, d_hb, C, d_pg, d_pb, d_pz, d_gm, eps, d_yb, h_k, h_v, nb_tok, nullptr, qs);
+            check(cudaStreamSynchronize(qs), "tsync2");
+
+            std::vector<float> ht(T * C), yt(T * vd), ha(fork * C), ya(fork * vd), hb_v(nb_tok * C), yb_v(nb_tok * vd);
+            std::vector<uint8_t> xqt(xq_bytes), xqr(xq_bytes);
+            check(cudaMemcpy(ht.data(), d_ht, ht.size() * 4, cudaMemcpyDeviceToHost), "dht");
+            check(cudaMemcpy(yt.data(), d_yt, yt.size() * 4, cudaMemcpyDeviceToHost), "dyt");
+            check(cudaMemcpy(ha.data(), d_ha, ha.size() * 4, cudaMemcpyDeviceToHost), "dha");
+            check(cudaMemcpy(ya.data(), d_ya, ya.size() * 4, cudaMemcpyDeviceToHost), "dya");
+            check(cudaMemcpy(hb_v.data(), d_hb, hb_v.size() * 4, cudaMemcpyDeviceToHost), "dhb");
+            check(cudaMemcpy(yb_v.data(), d_yb, yb_v.size() * 4, cudaMemcpyDeviceToHost), "dyb");
+            check(cudaMemcpy(xqt.data(), d_xq_t, xq_bytes, cudaMemcpyDeviceToHost), "dxqt");
+            check(cudaMemcpy(xqr.data(), d_xq_ref, xq_bytes, cudaMemcpyDeviceToHost), "dxqr");
+
+            ++tr_n;
+            const int b_tail = T - fork;
+            if (std::memcmp(ht.data(), ha.data(), (size_t) fork * C * 4) != 0 ||
+                std::memcmp(yt.data(), ya.data(), (size_t) fork * vd * 4) != 0 ||
+                std::memcmp(&ht[(size_t) fork * C], &hb_v[(size_t) (par + 1) * C], (size_t) b_tail * C * 4) != 0 ||
+                std::memcmp(&yt[(size_t) fork * vd], &yb_v[(size_t) (par + 1) * vd], (size_t) b_tail * vd * 4) != 0 ||
+                std::memcmp(xqt.data(), xqr.data(), xq_bytes) != 0) {
+                std::printf("    *** GDN tree forward par=%d differs bitwise from linear refs ***\n", par);
+                ++tr_bad;
+            }
+        }
+        cudaStreamDestroy(qs);
+        cudaFree(d_c0); cudaFree(d_wc); cudaFree(d_qkv); cudaFree(d_s0); cudaFree(d_g); cudaFree(d_bt);
+        cudaFree(d_z); cudaFree(d_gm); cudaFree(d_ht); cudaFree(d_yt); cudaFree(d_ha); cudaFree(d_ya);
+        cudaFree(d_hb); cudaFree(d_yb); cudaFree(d_pq); cudaFree(d_pg); cudaFree(d_pb); cudaFree(d_pz);
+        cudaFree(d_xq_t); cudaFree(d_xq_ref);
+
+        // 7b. Tree commit (per-layer rows_dev AND gdn_commit_layers rows_dev) across L=5 layers
+        std::vector<float> l_st0((size_t) stride * L), l_hb((size_t) L * MT * C), l_qkv((size_t) L * MT * C),
+            l_gt((size_t) L * MT * h_v), l_bt((size_t) L * MT * h_v), l_z((size_t) MT * vd, 0.0f);
+        for (auto& x : l_st0) x = gauss(rng) * 0.1f;
+        for (auto& x : l_hb) x = gauss(rng) * 0.1f;
+        for (auto& x : l_qkv) x = gauss(rng);
+        for (auto& x : l_gt) x = -(0.5f + (float) (rng() % 100) / 50.0f);
+        for (auto& x : l_bt) x = (float) (rng() % 100) / 100.0f;
+
+        float *dl_r = dev_f(l_st0.size()), *dl_p = dev_f(l_st0.size()), *dl_b = dev_f(l_st0.size());
+        float *dl_h = dev_f(l_hb.size()), *dl_q = dev_f(l_qkv.size()), *dl_g = dev_f(l_gt.size()), *dl_bt = dev_f(l_bt.size());
+        float *dl_hp = dev_f(l_hb.size()), *dl_qp = dev_f(l_qkv.size()), *dl_gp = dev_f(l_gt.size()), *dl_btp = dev_f(l_bt.size());
+        float *dl_z = dev_f(l_z.size()), *dl_y = dev_f(l_z.size()), *dl_gm = dev_f(gm.size());
+        int32_t *dl_nk = nullptr, *dl_rows = nullptr;
+        check(cudaMalloc(&dl_nk, 4), "tnk"); check(cudaMalloc(&dl_rows, MT * 4), "trows");
+        check(cudaMemcpy(dl_h, l_hb.data(), l_hb.size() * 4, cudaMemcpyHostToDevice), "th");
+        check(cudaMemcpy(dl_q, l_qkv.data(), l_qkv.size() * 4, cudaMemcpyHostToDevice), "tq");
+        check(cudaMemcpy(dl_g, l_gt.data(), l_gt.size() * 4, cudaMemcpyHostToDevice), "tg2");
+        check(cudaMemcpy(dl_bt, l_bt.data(), l_bt.size() * 4, cudaMemcpyHostToDevice), "tb2");
+        check(cudaMemset(dl_z, 0, l_z.size() * 4), "tz2");
+        check(cudaMemcpy(dl_gm, gm.data(), gm.size() * 4, cudaMemcpyHostToDevice), "tgm2");
+
+        const int cases[3][5] = {
+            {3, 0, 3, 4, 0},
+            {4, 0, 1, 3, 4},
+            {3, 0, 1, 2, 0},
+        };
+        for (int ci = 0; ci < 3; ++ci) {
+            const int nk = cases[ci][0];
+            const int32_t* wr = &cases[ci][1];
+            std::vector<float> ph(l_hb.size(), 0.0f), pq(l_qkv.size(), 0.0f), pg(l_gt.size(), 0.0f), pbt(l_bt.size(), 0.0f);
+            for (int l = 0; l < L; ++l) {
+                for (int s_i = 0; s_i < nk; ++s_i) {
+                    const int src_r = wr[s_i];
+                    std::memcpy(&ph[((size_t) l * MT + s_i) * C], &l_hb[((size_t) l * MT + src_r) * C], (size_t) C * 4);
+                    std::memcpy(&pq[((size_t) l * MT + s_i) * C], &l_qkv[((size_t) l * MT + src_r) * C], (size_t) C * 4);
+                    std::memcpy(&pg[((size_t) l * MT + s_i) * h_v], &l_gt[((size_t) l * MT + src_r) * h_v], (size_t) h_v * 4);
+                    std::memcpy(&pbt[((size_t) l * MT + s_i) * h_v], &l_bt[((size_t) l * MT + src_r) * h_v], (size_t) h_v * 4);
+                }
+            }
+            check(cudaMemcpy(dl_nk, &nk, 4, cudaMemcpyHostToDevice), "tnk1");
+            check(cudaMemcpy(dl_rows, wr, nk * 4, cudaMemcpyHostToDevice), "trw");
+            check(cudaMemcpy(dl_hp, ph.data(), ph.size() * 4, cudaMemcpyHostToDevice), "thp");
+            check(cudaMemcpy(dl_qp, pq.data(), pq.size() * 4, cudaMemcpyHostToDevice), "tqp");
+            check(cudaMemcpy(dl_gp, pg.data(), pg.size() * 4, cudaMemcpyHostToDevice), "tgp");
+            check(cudaMemcpy(dl_btp, pbt.data(), pbt.size() * 4, cudaMemcpyHostToDevice), "tbp");
+            check(cudaMemcpy(dl_r, l_st0.data(), l_st0.size() * 4, cudaMemcpyHostToDevice), "tsr");
+            check(cudaMemcpy(dl_p, l_st0.data(), l_st0.size() * 4, cudaMemcpyHostToDevice), "tsp");
+            check(cudaMemcpy(dl_b, l_st0.data(), l_st0.size() * 4, cudaMemcpyHostToDevice), "tsb");
+
+            for (int l = 0; l < L; ++l) {
+                float* str = dl_r + (size_t) l * stride;
+                strata::kernels::gdn_conv_commit(str + conv_off, dl_qp + (size_t) l * MT * C, C, dl_nk, nullptr);
+                strata::kernels::gdn_step_norm_multi(str, dl_hp + (size_t) l * MT * C, C, dl_gp + (size_t) l * MT * h_v,
+                                                     dl_btp + (size_t) l * MT * h_v, dl_z, dl_gm, eps, dl_y, h_k, h_v, MT, dl_nk,
+                                                     nullptr, MT);
+
+                float* stp = dl_p + (size_t) l * stride;
+                strata::kernels::gdn_conv_commit(stp + conv_off, dl_q + (size_t) l * MT * C, C, dl_nk, nullptr, dl_rows);
+                strata::kernels::gdn_step_norm_multi(stp, dl_h + (size_t) l * MT * C, C, dl_g + (size_t) l * MT * h_v,
+                                                     dl_bt + (size_t) l * MT * h_v, dl_z, dl_gm, eps, dl_y, h_k, h_v, MT, dl_nk,
+                                                     nullptr, MT, nullptr, 0, 0, dl_rows);
+            }
+            const bool batched = strata::kernels::gdn_commit_layers(
+                dl_b, stride, conv_off, dl_q, (int64_t) MT * C, dl_h, (int64_t) MT * C,
+                dl_g, dl_bt, (int64_t) MT * h_v, C, h_k, h_v, MT, L, dl_nk, nullptr, dl_rows);
+            check(cudaDeviceSynchronize(), "tcsync");
+            std::vector<float> hr(l_st0.size()), hp(l_st0.size()), hb(l_st0.size());
+            check(cudaMemcpy(hr.data(), dl_r, hr.size() * 4, cudaMemcpyDeviceToHost), "dhr");
+            check(cudaMemcpy(hp.data(), dl_p, hp.size() * 4, cudaMemcpyDeviceToHost), "dhp");
+            check(cudaMemcpy(hb.data(), dl_b, hb.size() * 4, cudaMemcpyDeviceToHost), "dhb2");
+            ++tr_n;
+            if (std::memcmp(hr.data(), hp.data(), hr.size() * 4) != 0 ||
+                (batched && std::memcmp(hr.data(), hb.data(), hr.size() * 4) != 0)) {
+                std::printf("    *** GDN tree commit case %d differs bitwise ***\n", ci);
+                ++tr_bad;
+            }
+        }
+        cudaFree(dl_r); cudaFree(dl_p); cudaFree(dl_b); cudaFree(dl_h); cudaFree(dl_q); cudaFree(dl_g); cudaFree(dl_bt);
+        cudaFree(dl_hp); cudaFree(dl_qp); cudaFree(dl_gp); cudaFree(dl_btp); cudaFree(dl_z); cudaFree(dl_y); cudaFree(dl_gm);
+        cudaFree(dl_nk); cudaFree(dl_rows);
+        std::printf("  %-42s %s (%d cases, %d layers)\n", "gdn tree forward + commit_layers", tr_bad ? "*** NO ***" : "bitwise", tr_n, L);
+        bad += tr_bad;
+    }
+
     std::printf("\ngdn: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("gdn_parity OK\n");

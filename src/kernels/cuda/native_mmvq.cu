@@ -2497,8 +2497,34 @@ bool q8_sm60_on() {
     return on;
 #endif
 }
+bool q8_sm86_on() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    if (q8_sm60_on()) return false;
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_Q8_SM86");
+        return (v && v[0] != '\0') ? (v[0] != '0' ? 1 : 0) : -1;
+    }();
+    if (env >= 0) return env == 1;
+    static int per_dev[16] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
+    if (per_dev[dev] == 0) {
+        int maj = 0, min = 0;
+        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        per_dev[dev] = (ok && maj == 8 && min == 6) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#endif
+}
 #if !defined(__HIPCC__)
 #include "q8_sm60.cuh"
+#include "q8_sm86.cuh"
+#include "q8_sm86_fast.cuh"
+#include "q4_sm86.cuh"
 #endif
 
 // ============================ STRATA_Q8_PACKED=1: the packed Q8_0 decode layout (opt-in) ============================
@@ -2582,6 +2608,36 @@ __global__ void native_q8_0_packed_kernel(const int8_t* __restrict__ qs, const h
     }
 }
 
+struct Q4Packed { const uint8_t* qs; const half* d; int n_in, n_out; };
+std::unordered_map<const void*, Q4Packed>& q4_packed_registry() {
+    static std::unordered_map<const void*, Q4Packed> registry;
+    return registry;
+}
+bool q4_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+#if defined(__HIPCC__)
+    (void) weights; (void) x_q8_1; (void) y; (void) n_in; (void) n_out; (void) ncols; (void) stream;
+    return false;
+#else
+    auto& registry = q4_packed_registry();
+    if (!q8_sm86_on() || registry.empty()) return false;
+    const auto found = registry.find(weights);
+    if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out) return false;
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    bool all = true;
+    for (int j = 0; all && j < ncols; j += q4sm86::MAX_COLS) {
+        const int nj = ncols - j < q4sm86::MAX_COLS ? ncols - j : q4sm86::MAX_COLS;
+        all = q4sm86::launch(found->second.qs, found->second.d,
+                             static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * std::size_t(n_in / Q8K),
+                             y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj, static_cast<cudaStream_t>(stream));
+    }
+    if (!all) return false;
+    launch_check();
+    return true;
+#endif
+}
+
 struct Q8Packed { const int8_t* qs; const half* d; int n_in, n_out; };
 std::unordered_map<const void*, Q8Packed>& q8_packed_registry() {
     static std::unordered_map<const void*, Q8Packed> registry;
@@ -2608,6 +2664,29 @@ bool q8_packed_shape(int n_in, int n_out) {   // the shapes native_q8_0_packed_k
 bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     auto& registry = q8_packed_registry();
 #if !defined(__HIPCC__)
+    if (q8_sm86_on() && !registry.empty()) {
+        const auto found = registry.find(weights);
+        if (found != registry.end() && found->second.n_in == n_in && found->second.n_out == n_out) {
+            validate_pointer(x_q8_1);
+            validate_pointer(y);
+            validate_stream(stream);
+            bool all = true;
+            for (int j = 0; all && j < ncols; j += q8sm86::MAX_COLS) {
+                const int nj = ncols - j < q8sm86::MAX_COLS ? ncols - j : q8sm86::MAX_COLS;
+                all = q8sm86_fast::launch(found->second.qs, found->second.d,
+                                          static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * std::size_t(n_in / Q8K),
+                                          y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj,
+                                          static_cast<cudaStream_t>(stream)) ||
+                      q8sm86::launch(found->second.qs, found->second.d,
+                                     static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * std::size_t(n_in / Q8K),
+                                     y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj, static_cast<cudaStream_t>(stream));
+            }
+            if (all) {
+                launch_check();
+                return true;
+            }
+        }
+    }
     if (q8_sm60_on() && !registry.empty()) {
         const auto found = registry.find(weights);
         if (found != registry.end() && found->second.n_in == n_in && found->second.n_out == n_out) {
@@ -2816,16 +2895,30 @@ bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
 }
 } // namespace
 
+bool native_q8_0_in_place_enabled() {
+#if defined(__HIPCC__)
+    return false;
+#else
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_Q8_INPLACE");
+        return (v && v[0] != '\0') ? (v[0] != '0' ? 1 : 0) : -1;
+    }();
+    if (env >= 0) return env == 1;
+    return q8_sm86_on();
+#endif
+}
+
 bool native_q8_0_packed_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_Q8_PACKED");
         return v && v[0] == '1' && v[1] == '\0';
     }();
-    return enabled || q8_sm60_on();
+    return enabled || q8_sm60_on() || q8_sm86_on() || native_q8_0_in_place_enabled();
 }
 
 bool native_q8_0_packed_eligible(int n_in, int n_out) {
-    if (q8_sm60_on()) return n_in >= 128 && n_in % 32 == 0 && n_out > 0;   // the Pascal kernel takes any of them
+    if (q8_sm60_on() || q8_sm86_on() || native_q8_0_in_place_enabled())
+        return n_in >= 128 && n_in % 32 == 0 && n_out > 0;
     return q8_packed_shape(n_in, n_out);
 }
 
@@ -2911,6 +3004,37 @@ void native_q8_0_packed_register(const void* gguf_weights, const void* packed, i
 }
 
 void native_q8_0_packed_unregister(const void* gguf_weights) { q8_packed_registry().erase(gguf_weights); }
+void native_q4_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out) {
+    const auto* blocks = static_cast<const Q40Block*>(gguf_blocks);
+    auto* qs = static_cast<uint8_t*>(out);
+    auto* d = reinterpret_cast<half*>(qs + std::size_t(n_in / 2) * n_out);
+    const std::size_t count = std::size_t(n_in / 32) * n_out;
+    for (std::size_t b = 0; b < count; ++b) {
+        std::memcpy(qs + b * 16, blocks[b].qs, 16);
+        std::memcpy(d + b, &blocks[b].d, sizeof(half));
+    }
+}
+void native_q4_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out) {
+    validate_pointer(gguf_weights);
+    validate_pointer(packed);
+    if (n_in < 128 || n_in % 32 != 0 || n_out <= 0) throw std::invalid_argument("Q4_0 packed: ineligible shape");
+    const auto* qs = static_cast<const uint8_t*>(packed);
+    q4_packed_registry()[gguf_weights] =
+        Q4Packed{qs, reinterpret_cast<const half*>(qs + std::size_t(n_in / 2) * n_out), n_in, n_out};
+}
+void native_q4_0_packed_unregister(const void* gguf_weights) { q4_packed_registry().erase(gguf_weights); }
+
+bool native_q8_0_packed_lookup(const void* weights, const int8_t*& qs, const uint16_t*& d, int& n_in, int& n_out) {
+    auto& registry = q8_packed_registry();
+    if (registry.empty()) return false;
+    const auto found = registry.find(weights);
+    if (found == registry.end()) return false;
+    qs = found->second.qs;
+    d = reinterpret_cast<const uint16_t*>(found->second.d);
+    n_in = found->second.n_in;
+    n_out = found->second.n_out;
+    return true;
+}
 
 bool native_q8_0_sm60_pack_in_place(void* weights, int n_in, int n_out, const char* what) {
 #if defined(__HIPCC__)
@@ -3441,6 +3565,7 @@ void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q4_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    if (q4_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;
     small_mmvq<Q40Block, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
@@ -3472,13 +3597,49 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
                       int n_in, int n_out, int ncols, void* stream) {
+    if (ncols < 1 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
+        !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
+        return false;
+#if !defined(__HIPCC__)
+    if (ggml_type == 2 && q8_sm86_on()) {
+        const auto& q4reg = q4_packed_registry();
+        const auto i1 = q4reg.find(w1), i2 = q4reg.find(w2);
+        if (i1 != q4reg.end() && i2 != q4reg.end() &&
+            i1->second.n_in == n_in && i1->second.n_out == n_out &&
+            i2->second.n_in == n_in && i2->second.n_out == n_out) {
+            if (q4sm86::launch_pair(i1->second.qs, i1->second.d, i2->second.qs, i2->second.d,
+                                    static_cast<const Q81Block*>(x_q8_1), y1, y2, n_in, n_out, ncols,
+                                    static_cast<cudaStream_t>(stream))) {
+                launch_check();
+                return true;
+            }
+        }
+    }
+#endif
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
-    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
-        n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
+    if (ggml_type != 8 || !g_multi_exact || n_in / F::DIV < F::BPI)
         return false;
     const auto& reg = q8_packed_registry();
-    if (reg.count(w1) || reg.count(w2)) return false;
+    if (reg.count(w1) || reg.count(w2)) {
+#if !defined(__HIPCC__)
+        if (q8_sm86_on()) {
+            const auto i1 = reg.find(w1), i2 = reg.find(w2);
+            if (i1 != reg.end() && i2 != reg.end() &&
+                i1->second.n_in == n_in && i1->second.n_out == n_out &&
+                i2->second.n_in == n_in && i2->second.n_out == n_out) {
+                if (q8sm86::launch_pair(i1->second.qs, i1->second.d, i2->second.qs, i2->second.d,
+                                        static_cast<const Q81Block*>(x_q8_1), y1, y2, n_in, n_out, ncols,
+                                        static_cast<cudaStream_t>(stream))) {
+                    launch_check();
+                    return true;
+                }
+            }
+        }
+#endif
+        return false;
+    }
+    if (ncols < 2 || n_in / F::DIV < F::BPI) return false;
     const auto* a = static_cast<const Q80Block*>(w1);
     const auto* b = static_cast<const Q80Block*>(w2);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
@@ -3675,11 +3836,11 @@ constexpr IlRows kIlRows_61[] = {
 // shapes (the output projections have 6144 inputs, not 4096), per cell the rows count whose worst measured shape is under
 // 0.97 of native_mmvq's time. The four older rows are the shared table's; Q3_K (the Q2_0 pack's main dense type) is new.
 constexpr IlRows kIlRows_86[] = {
-    {23, {{0, 0, 0, 0, 0}, {0, 0, 2, 4, 4}, {0, 1, 1, 1, 1}}},   // IQ4_XS
-    {12, {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q4_K
-    {13, {{0, 0, 1, 1, 1}, {0, 4, 1, 1, 1}, {0, 1, 1, 1, 2}}},   // Q5_K
-    {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
-    {11, {{1, 2, 2, 2, 2}, {1, 1, 1, 2, 2}, {1, 1, 1, 1, 1}}},   // Q3_K (two runs; 2560x10240 at 4 columns 120 -> 70 us)
+    {23, {{0, 0, 2, 2, 1}, {0, 4, 4, 1, 1}, {1, 1, 2, 2, 2}}},   // IQ4_XS (RTX 3080 sm_86 measured)
+    {12, {{0, 2, 2, 2, 2}, {0, 2, 1, 2, 2}, {0, 0, 2, 2, 2}}},   // Q4_K (RTX 3080 sm_86 measured)
+    {13, {{0, 0, 2, 1, 4}, {0, 0, 2, 2, 4}, {0, 0, 2, 2, 2}}},   // Q5_K (RTX 3080 sm_86 measured)
+    {14, {{0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}, {0, 2, 1, 1, 2}}},   // Q6_K (RTX 3080 sm_86 measured)
+    {11, {{0, 1, 2, 2, 2}, {0, 1, 2, 1, 1}, {0, 1, 2, 2, 1}}},   // Q3_K (RTX 3080 sm_86 measured)
 };
 // RTX PRO 5000 Blackwell (sm_120), 147-verify: read off mmvq_il_parity --bench --emit-table with the engine's shapes, the
 // same 3% rule; it takes the interleaved kernels in more cells than the shared table (e.g. the Q5_K head at 2 columns
@@ -3757,9 +3918,17 @@ constexpr IlRows58 kIlRows58_80[] = {   // CMP 170HX, as kIlRows_80
     {14, {{0, 0, 4, 2, 4}, {0, 0, 2, 2, 2}, {0, 2, 2, 2, 2}, {0, 0, 4, 2, 4}}},   // Q6_K
     {11, {{0, 0, 4, 2, 4}, {0, 0, 4, 1, 4}, {0, 0, 1, 1, 1}, {1, 1, 1, 1, 1}}},   // Q3_K
 };
+constexpr IlRows58 kIlRows58_86[] = {   // RTX 3080 (sm_86), measured by mmvq_il_parity --bench --emit-table
+    {23, {{0, 4, 2, 2, 2}, {0, 4, 2, 2, 2}, {0, 4, 4, 2, 2}, {1, 4, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 4, 4, 2, 2}, {0, 4, 4, 2, 2}, {0, 4, 4, 4, 4}, {0, 4, 2, 2, 2}}},   // Q4_K
+    {13, {{0, 2, 2, 2, 2}, {0, 4, 4, 4, 4}, {1, 4, 2, 2, 2}, {1, 2, 2, 4, 4}}},   // Q5_K
+    {14, {{0, 0, 2, 2, 2}, {0, 4, 2, 2, 2}, {0, 4, 2, 2, 2}, {0, 0, 4, 4, 4}}},   // Q6_K
+    {11, {{0, 4, 4, 2, 2}, {0, 4, 1, 1, 1}, {1, 1, 1, 1, 1}, {1, 4, 4, 4, 4}}},   // Q3_K
+};
 struct Il58Arch { int cc; const IlRows58* t; size_t n; };
 constexpr Il58Arch kIl58Arch[] = {
     {80, kIlRows58_80, sizeof(kIlRows58_80) / sizeof(IlRows58)},
+    {86, kIlRows58_86, sizeof(kIlRows58_86) / sizeof(IlRows58)},
     {120, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},
     {1201, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},   // a 12.0 card with 80+ SMs (il_cc)
 };

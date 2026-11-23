@@ -518,6 +518,98 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
 // copies of one blob (about 180 MB at IQ2_XS/Q2_0, past the last-level cache) is walked ten experts at a time, so
 // every call reads cold weights.  Prints microseconds per native_expert_grouped call and the weight GB/s it implies.
 void bench_decode(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, const std::string& label, cudaStream_t s) {
+    if (std::getenv("BENCH_MULTI") != nullptr && std::getenv("BENCH_MULTI")[0] == '1') {
+        constexpr int POOL = 64, MAX_CAP = 40, ITERS = 120;
+        auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
+        uint8_t* dpool = nullptr;
+        if (cudaMalloc((void**) &dpool, (size_t) POOL * blob.size()) != cudaSuccess) { std::printf("%s: bench: no memory\n", label.c_str()); return; }
+        for (int i = 0; i < POOL; ++i) cudaMemcpy(dpool + (size_t) i * blob.size(), blob.data(), blob.size(), cudaMemcpyHostToDevice);
+        std::mt19937 rng(3);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> x((size_t) MAX_CAP * H);
+        for (auto& v : x) v = nd(rng);
+        float *dx, *dout;
+        void *dxq, *dscr;
+        unsigned long long* dptr;
+        int32_t *dstart, *dn, *ddst, *dtok;
+        cudaMalloc((void**) &dx, x.size() * 4);
+        cudaMalloc(&dxq, (size_t) MAX_CAP * H / 32 * 36);
+        cudaMalloc(&dscr, strata::kernels::native_expert_scratch_bytes(MAX_CAP, FF));
+        cudaMalloc((void**) &dout, (size_t) MAX_CAP * H * 4);
+        cudaMalloc((void**) &dptr, MAX_CAP * 8);
+        cudaMalloc((void**) &dstart, (MAX_CAP + 1) * 4);
+        cudaMalloc((void**) &dn, 4);
+        cudaMalloc((void**) &ddst, MAX_CAP * 4);
+        cudaMalloc((void**) &dtok, MAX_CAP * 4);
+        cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+        strata::kernels::quantize_q8_1_rows(dx, MAX_CAP, H, dxq, s);
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        struct Case { const char* name; int ng, ntok, cap; std::vector<int> counts; };
+        std::vector<Case> cases = {
+            {"T1_10g", 10, 1, 10, {1,1,1,1,1,1,1,1,1,1}},
+            {"T2_mix", 16, 2, 20, {2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1}},
+            {"T3_mix", 21, 3, 30, {3,3,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1}},
+            {"T4_mix", 26, 4, 40, {3,3,3,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}},
+            {"T4_d10", 10, 4, 40, {4,4,4,4,4,4,4,4,4,4}},
+        };
+        for (const auto& c : cases) {
+            std::vector<int32_t> st(c.ng + 1), dst, tok;
+            st[0] = 0;
+            for (int g = 0; g < c.ng; ++g) {
+                for (int k = 0; k < c.counts[g]; ++k) {
+                    dst.push_back((int32_t) dst.size());
+                    tok.push_back((g + k) % c.ntok);
+                }
+                st[g + 1] = (int32_t) dst.size();
+            }
+            cudaMemcpy(dstart, st.data(), (c.ng + 1) * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(dn, &c.ng, 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(ddst, dst.data(), dst.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(dtok, tok.data(), tok.size() * 4, cudaMemcpyHostToDevice);
+            std::vector<std::vector<unsigned long long>> sets;
+            for (int k = 0; k < POOL; ++k) {
+                std::vector<unsigned long long> v(c.ng);
+                for (int e = 0; e < c.ng; ++e) v[e] = (unsigned long long) (dpool + (size_t) ((k * 13 + e) % POOL) * blob.size());
+                sets.push_back(v);
+            }
+            double ph_us[4] = {};
+            for (int ph : {0, 1, 2, 3}) {
+                strata::kernels::native_expert_set_mode(-1, ph);
+                std::vector<double> us;
+                for (int rep = 0; rep < 5; ++rep) {
+                    for (int i = 0; i < 15; ++i) {
+                        cudaMemcpyAsync(dptr, sets[i % POOL].data(), c.ng * 8, cudaMemcpyHostToDevice, s);
+                        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, c.cap, c.cap, dxq, dscr, dout, s);
+                    }
+                    cudaStreamSynchronize(s);
+                    double tot = 0;
+                    for (int i = 0; i < ITERS; ++i) {
+                        cudaMemcpyAsync(dptr, sets[(i * 7) % POOL].data(), c.ng * 8, cudaMemcpyHostToDevice, s);
+                        cudaEventRecord(e0, s);
+                        strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, c.cap, c.cap, dxq, dscr, dout, s);
+                        cudaEventRecord(e1, s);
+                        cudaEventSynchronize(e1);
+                        float ms = 0.f;
+                        cudaEventElapsedTime(&ms, e0, e1);
+                        tot += ms;
+                    }
+                    us.push_back(tot / ITERS * 1e3);
+                }
+                std::sort(us.begin(), us.end());
+                ph_us[ph] = us[us.size() / 2];
+            }
+            strata::kernels::native_expert_set_mode(-1, 0);
+            std::printf("BENCH %-8s/%-6s %-6s G=%2d NE=%2d CAP=%2d | all %6.1f | gu %6.1f | gu+sw %6.1f | down %6.1f\n",
+                        ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), c.name, c.ng,
+                        (int) dst.size(), c.cap, ph_us[0], ph_us[3], ph_us[1], ph_us[2]);
+        }
+        cudaFree(dpool); cudaFree(dx); cudaFree(dxq); cudaFree(dscr); cudaFree(dout); cudaFree(dptr);
+        cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        return;
+    }
     constexpr int POOL = 64, TOP = 10, ITERS = 200;
     auto L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, H, FF);
     uint8_t* dpool = nullptr;

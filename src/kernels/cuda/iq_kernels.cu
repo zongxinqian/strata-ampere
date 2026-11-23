@@ -1310,10 +1310,10 @@ template<> struct S27<12> {   // Q4_K
         W r;
         const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
         const int* q4 = (const int*) (b->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
-        r.v[0] = q4[0];
-        r.v[1] = q4[4];
+        r.v[0] = __ldg(q4);
+        r.v[1] = __ldg(q4 + 4);
         k_scale_min(b->scales, bq8_offset, r.aux);
-        r.dm = b->dm;
+        r.dm = __ldg(&b->dm);
         return r;
     }
     __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
@@ -1341,12 +1341,12 @@ template<> struct S27<13> {   // Q5_K
         const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
         const int* ql = (const int*) (b->qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
         const int* qh = (const int*) (b->qh + 4 * ((iqs / 2) % 4));
-        r.vl[0] = ql[0];
-        r.vl[1] = ql[4];
-        r.vh[0] = qh[0] >> bq8_offset;
-        r.vh[1] = qh[4] >> bq8_offset;
+        r.vl[0] = __ldg(ql);
+        r.vl[1] = __ldg(ql + 4);
+        r.vh[0] = __ldg(qh) >> bq8_offset;
+        r.vh[1] = __ldg(qh + 4) >> bq8_offset;
         k_scale_min(b->scales, bq8_offset, r.aux);
-        r.dm = b->dm;
+        r.dm = __ldg(&b->dm);
         return r;
     }
     __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
@@ -1372,9 +1372,9 @@ template<> struct S27<7> {   // Q5_1
         const block_q5_1* b = (const block_q5_1*) vbq + kbx;
         W r;
 #pragma unroll
-        for (int i = 0; i < VDR_Q5_1; ++i) r.vl[i] = get_int_b4(b->qs, iqs + i);
-        r.qh = get_int_b4(b->qh, 0);
-        r.dm = b->dm;
+        for (int i = 0; i < VDR_Q5_1; ++i) r.vl[i] = __ldg(reinterpret_cast<const int*>(b->qs) + iqs + i);
+        r.qh = __ldg(reinterpret_cast<const int*>(b->qh));
+        r.dm = __ldg(&b->dm);
         return r;
     }
     __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
@@ -3883,8 +3883,8 @@ void s26_launch_l(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t 
 // apply (the activation words and the same integer / float expression), the same impl functions, so a row's lane-strided
 // k order, its terms and warp_sum are the old kernels': every output is bitwise the old one's (iq harness, memcmp).
 
-template<int TG, bool LX, int RPW, bool TS>
-__global__ void __launch_bounds__(256, 2) s27_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
+template<int TG, bool LX, int RPW, bool TS, int TH = 256, bool PRE = false>
+__global__ void __launch_bounds__(TH) s27_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                         const int32_t* __restrict__ grp_start,
                                                         const int32_t* __restrict__ n_groups,
                                                         const int32_t* __restrict__ ent_tok,
@@ -3892,16 +3892,18 @@ __global__ void __launch_bounds__(256, 2) s27_gu_kernel(const unsigned long long
                                                         float* __restrict__ gate, float* __restrict__ up) {
     using F = Fmt<TG>;
     using S = S27<TG>;
+    constexpr int GU_W = TH >> 5;
     __shared__ block_q8_1 s_x[LX ? GRP_NC * S26_XMAX : 1];
     const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row0 = blockIdx.x * GU_ROWS * RPW + warp;
-    const bool live = row0 + GU_ROWS * (RPW - 1) < 2 * L.n_ff;
+    const int row0 = blockIdx.x * GU_W * RPW + warp;
+    const bool live = row0 + GU_W * (RPW - 1) < 2 * L.n_ff;
     int rr[RPW];
     bool upq[RPW];
 #pragma unroll
     for (int q = 0; q < RPW; ++q) {
-        const int row = row0 + q * GU_ROWS;
+        const int row = row0 + q * GU_W;
         upq[q] = row >= L.n_ff;
         rr[q] = upq[q] ? row - (int) L.n_ff : row;
     }
@@ -3918,18 +3920,22 @@ __global__ void __launch_bounds__(256, 2) s27_gu_kernel(const unsigned long long
         const block_q8_1* xbase = xq;
         int off[GRP_NC];
         if constexpr (LX) {
-            __syncthreads();   // the previous chunk is done with s_x
-            constexpr int WPB = sizeof(block_q8_1) / sizeof(uint32_t);
-            const int total_w = n * xb * WPB;
-            for (int iw = threadIdx.x; iw < total_w; iw += 256) {
-                const int blk = iw / WPB, w = iw - blk * WPB;
-                const int c = blk / xb, j = blk - c * xb;
-                ((uint32_t*) &s_x[c * S26_XMAX + j])[w] = ((const uint32_t*) &xq[(size_t) ent_tok[e + c] * xb + j])[w];
-            }
+            if (n > 1) {
+                __syncthreads();   // the previous chunk is done with s_x
+                constexpr int WPB = sizeof(block_q8_1) / sizeof(uint32_t);
+                const int total_w = n * xb * WPB;
+                for (int iw = threadIdx.x; iw < total_w; iw += TH) {
+                    const int blk = iw / WPB, w = iw - blk * WPB;
+                    const int c = blk / xb, j = blk - c * xb;
+                    ((uint32_t*) &s_x[c * S26_XMAX + j])[w] = ((const uint32_t*) &xq[(size_t) ent_tok[e + c] * xb + j])[w];
+                }
 #pragma unroll
-            for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * S26_XMAX;
-            xbase = s_x;
-            __syncthreads();
+                for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * S26_XMAX;
+                xbase = s_x;
+                __syncthreads();
+            } else {
+                off[0] = ent_tok[e] * xb;
+            }
         } else {
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c) off[c] = ent_tok[e + min(c, n - 1)] * xb;
@@ -3942,6 +3948,41 @@ __global__ void __launch_bounds__(256, 2) s27_gu_kernel(const unsigned long long
             for (int c = 0; c < GRP_NC; ++c) s[q][c] = 0.0f;
         auto run_k = [&](auto N_tag) {
             constexpr int NN = decltype(N_tag)::value;
+            if constexpr (PRE) {
+                if (nb * F::ipb == 80) {
+                    const int k0 = lane, k1 = lane + 32, k2 = lane + 64;
+                    const int kbx0 = k0 / F::ipb, iqs0 = F::step * (k0 % F::ipb);
+                    const int kbx1 = k1 / F::ipb, iqs1 = F::step * (k1 % F::ipb);
+                    const int kbx2 = k2 / F::ipb, iqs2 = F::step * (k2 % F::ipb);
+                    typename S::W w0[RPW], w1[RPW], w2[RPW];
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q) w0[q] = S::load(wr[q], kbx0, iqs0);
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q) w1[q] = S::load(wr[q], kbx1, iqs1);
+                    if (lane < 16) {
+#pragma unroll
+                        for (int q = 0; q < RPW; ++q) w2[q] = S::load(wr[q], kbx2, iqs2);
+                    }
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                        for (int c = 0; c < NN; ++c)
+                            s[q][c] += S::apply(w0[q], xbase + off[c] + kbx0 * (F::qk / 32), iqs0);
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                        for (int c = 0; c < NN; ++c)
+                            s[q][c] += S::apply(w1[q], xbase + off[c] + kbx1 * (F::qk / 32), iqs1);
+                    if (lane < 16) {
+#pragma unroll
+                        for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                            for (int c = 0; c < NN; ++c)
+                                s[q][c] += S::apply(w2[q], xbase + off[c] + kbx2 * (F::qk / 32), iqs2);
+                    }
+                    return;
+                }
+            }
             for (int k = lane; k < nb * F::ipb; k += 32) {
                 const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
                 typename S::W w[RPW];
@@ -3987,44 +4028,50 @@ __global__ void __launch_bounds__(256, 2) s27_gu_kernel(const unsigned long long
     }
 }
 
-template<int TD, bool LX, int RPW, bool TS>
-__global__ void __launch_bounds__(256, 2) s27_down_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                          const int32_t* __restrict__ grp_start,
-                                                          const int32_t* __restrict__ n_groups,
-                                                          const int32_t* __restrict__ ent_dst,
-                                                          const block_q8_1* __restrict__ hq, NativeExpertLayout L,
-                                                          float* __restrict__ out) {
+template<int TD, bool LX, int RPW, bool TS, int TH = 256, bool PRE = false>
+__global__ void __launch_bounds__(TH) s27_down_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                         const int32_t* __restrict__ grp_start,
+                                                         const int32_t* __restrict__ n_groups,
+                                                         const int32_t* __restrict__ ent_dst,
+                                                         const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                         float* __restrict__ out) {
     using F = Fmt<TD>;
     using S = S27<TD>;
+    constexpr int DN_W = TH >> 5;
     __shared__ block_q8_1 s_h[LX ? GRP_NC * S26_HMAX : 1];
     const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r0 = blockIdx.x * 8 * RPW + warp;
-    const bool live = r0 + 8 * (RPW - 1) < L.n_embd;
+    const int r0 = blockIdx.x * DN_W * RPW + warp;
+    const bool live = r0 + DN_W * (RPW - 1) < L.n_embd;
     const int nb = (int) (L.n_ff / F::qk), hb = (int) (L.n_ff / 32);
     for (int g = blockIdx.y; g < ng; g += gridDim.y) {
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
     const uint8_t* wr[RPW];
 #pragma unroll
-    for (int q = 0; q < RPW; ++q) wr[q] = blob + L.down_off + (size_t) (r0 + 8 * q) * L.d_row;
+    for (int q = 0; q < RPW; ++q) wr[q] = blob + L.down_off + (size_t) (r0 + DN_W * q) * L.d_row;
     const int e0 = grp_start[g], e1 = grp_start[g + 1];
     for (int e = e0; e < e1; e += GRP_NC) {
         const int n = min(GRP_NC, e1 - e);
         const block_q8_1* hbase = hq;
         int off[GRP_NC];
         if constexpr (LX) {
-            __syncthreads();
-            constexpr int WPB = sizeof(block_q8_1) / sizeof(uint32_t);
-            const int total_w = n * hb * WPB;
-            for (int iw = threadIdx.x; iw < total_w; iw += 256) {
-                const int blk = iw / WPB, w = iw - blk * WPB;
-                const int c = blk / hb, j = blk - c * hb;
-                ((uint32_t*) &s_h[c * S26_HMAX + j])[w] = ((const uint32_t*) &hq[(size_t) (e + c) * hb + j])[w];
-            }
-            __syncthreads();
+            if (n > 1) {
+                __syncthreads();
+                constexpr int WPB = sizeof(block_q8_1) / sizeof(uint32_t);
+                const int total_w = n * hb * WPB;
+                for (int iw = threadIdx.x; iw < total_w; iw += TH) {
+                    const int blk = iw / WPB, w = iw - blk * WPB;
+                    const int c = blk / hb, j = blk - c * hb;
+                    ((uint32_t*) &s_h[c * S26_HMAX + j])[w] = ((const uint32_t*) &hq[(size_t) (e + c) * hb + j])[w];
+                }
+                __syncthreads();
 #pragma unroll
-            for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * S26_HMAX;
-            hbase = s_h;
+                for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * S26_HMAX;
+                hbase = s_h;
+            } else {
+                off[0] = e * hb;
+            }
         } else {
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c) off[c] = (e + min(c, n - 1)) * hb;
@@ -4037,6 +4084,41 @@ __global__ void __launch_bounds__(256, 2) s27_down_kernel(const unsigned long lo
             for (int c = 0; c < GRP_NC; ++c) s[q][c] = 0.0f;
         auto run_k = [&](auto N_tag) {
             constexpr int NN = decltype(N_tag)::value;
+            if constexpr (PRE) {
+                if (nb * F::ipb == 80) {
+                    const int k0 = lane, k1 = lane + 32, k2 = lane + 64;
+                    const int kbx0 = k0 / F::ipb, iqs0 = F::step * (k0 % F::ipb);
+                    const int kbx1 = k1 / F::ipb, iqs1 = F::step * (k1 % F::ipb);
+                    const int kbx2 = k2 / F::ipb, iqs2 = F::step * (k2 % F::ipb);
+                    typename S::W w0[RPW], w1[RPW], w2[RPW];
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q) w0[q] = S::load(wr[q], kbx0, iqs0);
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q) w1[q] = S::load(wr[q], kbx1, iqs1);
+                    if (lane < 16) {
+#pragma unroll
+                        for (int q = 0; q < RPW; ++q) w2[q] = S::load(wr[q], kbx2, iqs2);
+                    }
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                        for (int c = 0; c < NN; ++c)
+                            s[q][c] += S::apply(w0[q], hbase + off[c] + kbx0 * (F::qk / 32), iqs0);
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                        for (int c = 0; c < NN; ++c)
+                            s[q][c] += S::apply(w1[q], hbase + off[c] + kbx1 * (F::qk / 32), iqs1);
+                    if (lane < 16) {
+#pragma unroll
+                        for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                            for (int c = 0; c < NN; ++c)
+                                s[q][c] += S::apply(w2[q], hbase + off[c] + kbx2 * (F::qk / 32), iqs2);
+                    }
+                    return;
+                }
+            }
             for (int k = lane; k < nb * F::ipb; k += 32) {
                 const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
                 typename S::W w[RPW];
@@ -4062,7 +4144,7 @@ __global__ void __launch_bounds__(256, 2) s27_down_kernel(const unsigned long lo
             const int j = s26ts::tsum_token<P>(lane);
             const int q = j / GRP_NC, c = j % GRP_NC;
             if (lane == s26ts::tsum_lane<P>(j) && j < RPW * GRP_NC && c < n)
-                out[(size_t) ent_dst[e + c] * L.n_embd + r0 + 8 * q] = sum;
+                out[(size_t) ent_dst[e + c] * L.n_embd + r0 + DN_W * q] = sum;
             continue;
         }
 #pragma unroll
@@ -4074,28 +4156,274 @@ __global__ void __launch_bounds__(256, 2) s27_down_kernel(const unsigned long lo
         for (int q = 0; q < RPW; ++q)
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c)
-                if (c < n && lane == c) out[(size_t) ent_dst[e + c] * L.n_embd + r0 + 8 * q] = s[q][c];
+                if (c < n && lane == c) out[(size_t) ent_dst[e + c] * L.n_embd + r0 + DN_W * q] = s[q][c];
     }
     }
 }
 
-template<int TG, int TD, bool LX, int RG, int RD, bool TS>
-void s27_launch(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr,
-                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
-                const block_q8_1* X, float* gate, float* up, float* h, block_q8_1* hq, float* out, long long nh) {
-    const dim3 ggu((unsigned) (2 * L.n_ff / (GU_ROWS * RG)), (unsigned) cap_groups);
-    s27_gu_kernel<TG, LX, RG, TS><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-    s26_swiglu_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, hq, nh);
-    const dim3 gd((unsigned) (L.n_embd / (8 * RD)), (unsigned) cap_groups);
-    s27_down_kernel<TD, LX, RD, TS><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+
+// Fast S27 specialization for n_ff == 640 Q5_1 down projection:
+// TPR = 4 gives 20 / 4 = 5 full blocks per lane (100% active lanes, 0 tail idle),
+// coalesced 64-bit block loads once per block, and precomputed per-block min terms s_mu[c][b].
+template<int TH>
+__global__ void __launch_bounds__(TH) s27_q5_1_640_down_kernel(
+    const unsigned long long* __restrict__ grp_ptr,
+    const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups,
+    const int32_t* __restrict__ ent_dst,
+    const block_q8_1* __restrict__ hq,
+    NativeExpertLayout L,
+    float* __restrict__ out) {
+    constexpr int HB = 20;
+    constexpr int WPB = sizeof(block_q8_1) / sizeof(uint32_t);
+    __shared__ block_q8_1 s_h[GRP_NC][HB];
+    __shared__ float s_mu[GRP_NC][HB];
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+
+    const int tid = (int) threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int r_in_warp = lane >> 2, l4 = lane & 3;
+    const int row = (int) blockIdx.x * (TH >> 2) + warp * 8 + r_in_warp;
+    const bool live = row < (int) L.n_embd;
+
+    bool need_sync = false;
+    for (int g = (int) blockIdx.y; g < ng; g += (int) gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const uint8_t* row_ptr = live ? (blob + L.down_off + (size_t) row * L.d_row) : nullptr;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            if (need_sync) __syncthreads();
+            need_sync = true;
+            for (int blk = tid; blk < n * HB; blk += TH) {
+                const int c = blk / HB, j = blk - c * HB;
+                const uint32_t* src_w = reinterpret_cast<const uint32_t*>(&hq[(size_t) (e + c) * HB + j]);
+                uint32_t* dst_w = reinterpret_cast<uint32_t*>(&s_h[c][j]);
+                uint32_t wreg[WPB];
+#pragma unroll
+                for (int w = 0; w < WPB; ++w) wreg[w] = __ldg(src_w + w);
+#pragma unroll
+                for (int w = 0; w < WPB; ++w) dst_w[w] = wreg[w];
+                const block_q8_1* bq = reinterpret_cast<const block_q8_1*>(wreg);
+                const int* u = reinterpret_cast<const int*>(bq->qs);
+                int sumu = 0;
+#pragma unroll
+                for (int k = 0; k < 8; ++k) sumu = ggml_cuda_dp4a(0x01010101, u[k], sumu);
+                s_mu[c][j] = __low2float(bq->ds) * (float) sumu;
+            }
+            __syncthreads();
+            if (!live) continue;
+
+            auto run_c = [&](auto N_tag) {
+                constexpr int NN = decltype(N_tag)::value;
+                float acc[NN];
+#pragma unroll
+                for (int c = 0; c < NN; ++c) acc[c] = 0.0f;
+#pragma unroll
+                for (int p = 0; p < 5; ++p) {
+                    const int bk = p * 4 + l4;
+                    const uint2 dm_qh = __ldg(reinterpret_cast<const uint2*>(row_ptr + bk * 24));
+                    const uint2 qs01 = __ldg(reinterpret_cast<const uint2*>(row_ptr + bk * 24 + 8));
+                    const uint2 qs23 = __ldg(reinterpret_cast<const uint2*>(row_ptr + bk * 24 + 16));
+                    const half2 dmh = *reinterpret_cast<const half2*>(&dm_qh.x);
+                    const float2 dm5 = __half22float2(dmh);
+                    const uint32_t qh = dm_qh.y;
+                    const uint32_t vls[4] = {qs01.x, qs01.y, qs23.x, qs23.y};
+                    int vi0[4], vi1[4];
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const uint32_t vl = vls[q];
+                        const uint32_t vh = qh >> (4 * q);
+                        int a0 = (int) ((vl >> 0) & 0x0F0F0F0Fu);
+                        a0 |= (int) ((vh << 4) & 0x00000010u);
+                        a0 |= (int) ((vh << 11) & 0x00001000u);
+                        a0 |= (int) ((vh << 18) & 0x00100000u);
+                        a0 |= (int) ((vh << 25) & 0x10000000u);
+                        int a1 = (int) ((vl >> 4) & 0x0F0F0F0Fu);
+                        a1 |= (int) ((vh >> 12) & 0x00000010u);
+                        a1 |= (int) ((vh >> 5) & 0x00001000u);
+                        a1 |= (int) ((vh << 2) & 0x00100000u);
+                        a1 |= (int) ((vh << 9) & 0x10000000u);
+                        vi0[q] = a0;
+                        vi1[q] = a1;
+                    }
+#pragma unroll
+                    for (int c = 0; c < NN; ++c) {
+                        const block_q8_1& bq = s_h[c][bk];
+                        const float d8 = __low2float(bq.ds);
+                        const int* u = reinterpret_cast<const int*>(bq.qs);
+                        int sumi = 0;
+#pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            sumi = ggml_cuda_dp4a(vi0[q], u[q], sumi);
+                            sumi = ggml_cuda_dp4a(vi1[q], u[q + 4], sumi);
+                        }
+                        acc[c] += (float) sumi * (dm5.x * d8) + dm5.y * s_mu[c][bk];
+                    }
+                }
+#pragma unroll
+                for (int c = 0; c < NN; ++c) {
+                    float v = acc[c];
+                    v += __shfl_xor_sync(0xffffffffu, v, 2, 4);
+                    v += __shfl_xor_sync(0xffffffffu, v, 1, 4);
+                    if (l4 == 0) out[(size_t) ent_dst[e + c] * L.n_embd + row] = v;
+                }
+            };
+            if (n == 1) run_c(std::integral_constant<int, 1>{});
+            else if (n == 2) run_c(std::integral_constant<int, 2>{});
+            else if (n == 3) run_c(std::integral_constant<int, 3>{});
+            else run_c(std::integral_constant<int, GRP_NC>{});
+        }
+    }
 }
+
+// Hybrid S27 dispatch tuned on sm_86 (RTX 3080):
+// - gate/up: TSG=false beats TSG=true cleanly; RG=1 at cap<=20 (higher SM wave occupancy, L1 X bypass at n=1)
+//            and RG=4 at cap>20 (amortizes shared s_x reads across 4 rows/warp when multi-entry groups appear).
+// - down: TSD=true (tsum butterfly) wins everywhere; Q5_1 at cap<=10 uses zero-SMEM native_down_kernel<7>,
+//         RD=2 at small/medium cap (and cap<=30 for Q8_0), RD=4 at large multi-token batches.
 template<int TG, int TD>
 void s27_launch_ts(bool ts, const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t s,
                    const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                    const int32_t* ent_dst, const int32_t* ent_tok, const block_q8_1* X, float* gate, float* up, float* h,
-                   block_q8_1* hq, float* out, long long nh) {
-    if (ts) s27_launch<TG, TD, true, 4, 4, true>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
-    else s27_launch<TG, TD, true, 4, 4, false>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
+                   block_q8_1* hq, float* out, long long nh, int phase = 0) {
+    (void) ts;
+#if defined(__HIPCC__)
+    const int rg = 4, rd = 4, gth = 256, dth = 256;
+    const bool glx = true, dlx = true, pre = false, tsd = ts, sw_e = false;
+    const int64_t gy_gu = cap_groups;
+    const int64_t gy_dn = cap_groups;
+#else
+    static const int env_rg = [] { const char* v = std::getenv("STRATA_S27_RG"); return v ? std::atoi(v) : -1; }();
+    static const int env_rd = [] { const char* v = std::getenv("STRATA_S27_RD"); return v ? std::atoi(v) : -1; }();
+    static const int env_gth = [] { const char* v = std::getenv("STRATA_S27_GTH"); return v ? std::atoi(v) : -1; }();
+    static const int env_dth = [] { const char* v = std::getenv("STRATA_S27_DTH"); return v ? std::atoi(v) : -1; }();
+    static const int env_glx = [] { const char* v = std::getenv("STRATA_S27_GLX"); return v ? std::atoi(v) : -1; }();
+    static const int env_dlx = [] { const char* v = std::getenv("STRATA_S27_DLX"); return v ? std::atoi(v) : -1; }();
+    static const int env_pre = [] { const char* v = std::getenv("STRATA_S27_PRE"); return v ? std::atoi(v) : -1; }();
+    static const int env_gy = [] { const char* v = std::getenv("STRATA_S27_GY"); return v ? std::atoi(v) : 0; }();
+    static const int env_gy_gu = [] { const char* v = std::getenv("STRATA_S27_GY_GU"); return v ? std::atoi(v) : 0; }();
+    static const int env_gy_dn = [] { const char* v = std::getenv("STRATA_S27_GY_DN"); return v ? std::atoi(v) : 0; }();
+    static const int env_sw = [] { const char* v = std::getenv("STRATA_S27_SW"); return v ? std::atoi(v) : 1; }();
+    static const bool is_sm86 = [] {
+        int dev = 0, ma = 0, mn = 0;
+        const bool ok = cudaGetDevice(&dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        return ok && ma == 8 && mn == 6;
+    }();
+    const int64_t cap_ent = L.n_ff > 0 ? (int64_t) (nh / L.n_ff) : cap_groups;
+    const int rg = env_rg > 0 ? env_rg : (
+        is_sm86 ? ((TG == 13 && cap_groups <= 80) ? 1 : (cap_ent <= 80 ? 2 : 4))
+                : (cap_groups <= 20 ? 1 : 4));
+    const int rd = env_rd >= 0 ? env_rd : (
+        is_sm86
+            ? 4
+            : ((TD == 7 && cap_groups <= 10) ? 0 : (cap_groups <= (TD == 8 ? 30 : 20) ? 2 : 4)));
+    const int gth = env_gth > 0 ? ((env_gth == 128) ? 128 : 256) : (is_sm86 ? 128 : 256);
+    const int dth = env_dth > 0 ? ((env_dth == 128) ? 128 : 256) : (is_sm86 ? 128 : 256);
+    const bool glx = env_glx >= 0 ? (env_glx != 0) : (is_sm86 ? false : true);
+    const bool dlx = env_dlx >= 0 ? (env_dlx != 0) : (is_sm86 ? false : true);
+    const bool pre = env_pre >= 0 ? (env_pre != 0) : false;
+    const bool tsd = true;
+    const bool sw_e = env_sw != 0;
+    const int64_t gy_gu_def = env_gy_gu > 0 ? env_gy_gu : (env_gy > 0 ? env_gy : 16);
+    const int64_t gy_dn_def = env_gy_dn > 0 ? env_gy_dn : (env_gy > 0 ? env_gy : 16);
+    const int64_t gy_gu = gy_gu_def < cap_groups ? gy_gu_def : cap_groups;
+    const int64_t gy_dn = gy_dn_def < cap_groups ? gy_dn_def : cap_groups;
+#endif
+    static const int env_q51_fast = [] { const char* v = std::getenv("STRATA_S27_Q51_FAST"); return v ? std::atoi(v) : 1; }();
+    static const int env_q51_th = [] { const char* v = std::getenv("STRATA_S27_Q51_TH"); return v ? std::atoi(v) : 256; }();
+    if (phase != 2) {
+        auto launch_gu_cfg = [&](auto T_tag, auto LX_tag, auto PRE_tag) {
+            constexpr int TTH = decltype(T_tag)::value;
+            constexpr bool LLX = decltype(LX_tag)::value;
+            constexpr bool PPRE = decltype(PRE_tag)::value;
+            constexpr int GW = TTH >> 5;
+            const dim3 ggu((unsigned) (2 * L.n_ff / (GW * rg)), (unsigned) gy_gu);
+            if (rg == 1) s27_gu_kernel<TG, LLX, 1, false, TTH, PPRE><<<ggu, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else if (rg == 2) s27_gu_kernel<TG, LLX, 2, false, TTH, PPRE><<<ggu, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else s27_gu_kernel<TG, LLX, 4, false, TTH, false><<<ggu, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        };
+        if (gth == 128) {
+            if (glx) { if (pre) launch_gu_cfg(std::integral_constant<int,128>{}, std::true_type{}, std::true_type{}); else launch_gu_cfg(std::integral_constant<int,128>{}, std::true_type{}, std::false_type{}); }
+            else     { if (pre) launch_gu_cfg(std::integral_constant<int,128>{}, std::false_type{}, std::true_type{}); else launch_gu_cfg(std::integral_constant<int,128>{}, std::false_type{}, std::false_type{}); }
+        } else {
+            if (glx) { if (pre) launch_gu_cfg(std::integral_constant<int,256>{}, std::true_type{}, std::true_type{}); else launch_gu_cfg(std::integral_constant<int,256>{}, std::true_type{}, std::false_type{}); }
+            else     { if (pre) launch_gu_cfg(std::integral_constant<int,256>{}, std::false_type{}, std::true_type{}); else launch_gu_cfg(std::integral_constant<int,256>{}, std::false_type{}, std::false_type{}); }
+        }
+        if (phase == 3) return;
+        if (sw_e) {
+            const unsigned nb = (unsigned) ((nh + 255) / 256);
+            swiglu_q8_1_entries_kernel<<<nb < 136u ? nb : 136u, 256, 0, s>>>(gate, up, grp_start, n_groups, (int) L.n_ff, hq);
+        } else {
+            s26_swiglu_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, hq, nh);
+        }
+        if (phase == 1) return;
+    }
+    if constexpr (TD == 7) {
+        if (is_sm86 && env_q51_fast > 0 && L.n_ff == 640 && L.d_row == 480 && (L.down_off & 7u) == 0 && (L.n_embd % 32 == 0) && L.d_signs == nullptr) {
+            if (env_q51_th == 64) {
+                const dim3 gd((unsigned) (L.n_embd / 16), (unsigned) gy_dn);
+                s27_q5_1_640_down_kernel<64><<<gd, 64, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            } else if (env_q51_th == 256) {
+                const dim3 gd((unsigned) (L.n_embd / 64), (unsigned) gy_dn);
+                s27_q5_1_640_down_kernel<256><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            } else {
+                const dim3 gd((unsigned) (L.n_embd / 32), (unsigned) gy_dn);
+                s27_q5_1_640_down_kernel<128><<<gd, 128, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            }
+            return;
+        }
+    }
+    if (rd == 0) {
+        const dim3 gd0((unsigned) ((L.n_embd + 7) / 8), (unsigned) gy_dn);
+        native_down_kernel<TD><<<gd0, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    } else {
+        auto launch_dn_cfg = [&](auto T_tag, auto LX_tag, auto PRE_tag) {
+            constexpr int TTH = decltype(T_tag)::value;
+            constexpr bool LLX = decltype(LX_tag)::value;
+            constexpr bool PPRE = decltype(PRE_tag)::value;
+            constexpr int DW = TTH >> 5;
+            const dim3 gd((unsigned) (L.n_embd / (DW * rd)), (unsigned) gy_dn);
+            if (rd == 1) {
+                s27_down_kernel<TD, LLX, 1, tsd, TTH, PPRE><<<gd, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            } else if (rd == 2) {
+                s27_down_kernel<TD, LLX, 2, tsd, TTH, PPRE><<<gd, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            } else {
+                s27_down_kernel<TD, LLX, 4, tsd, TTH, false><<<gd, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            }
+        };
+        // Note: tsd is runtime const bool true on CUDA, pass template true directly on non-HIP
+        auto launch_dn_ts = [&](auto TS_tag) {
+            (void) TS_tag;
+            constexpr bool TTS = decltype(TS_tag)::value;
+            auto go = [&](auto T_tag, auto LX_tag, auto PRE_tag) {
+                constexpr int TTH = decltype(T_tag)::value;
+                constexpr bool LLX = decltype(LX_tag)::value;
+                constexpr bool PPRE = decltype(PRE_tag)::value;
+                constexpr int DW = TTH >> 5;
+                const int eff_rd = (rd >= 8 && L.n_embd % (DW * 8) == 0) ? 8 : (rd == 1 ? 1 : (rd == 2 ? 2 : 4));
+                const dim3 gd((unsigned) (L.n_embd / (DW * eff_rd)), (unsigned) gy_dn);
+                if (eff_rd == 1) s27_down_kernel<TD, LLX, 1, TTS, TTH, PPRE><<<gd, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                else if (eff_rd == 2) s27_down_kernel<TD, LLX, 2, TTS, TTH, PPRE><<<gd, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                else if (eff_rd == 8) s27_down_kernel<TD, LLX, 8, TTS, TTH, false><<<gd, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+                else s27_down_kernel<TD, LLX, 4, TTS, TTH, false><<<gd, TTH, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            };
+            if (dth == 128) {
+                if (dlx) { if (pre) go(std::integral_constant<int,128>{}, std::true_type{}, std::true_type{}); else go(std::integral_constant<int,128>{}, std::true_type{}, std::false_type{}); }
+                else     { if (pre) go(std::integral_constant<int,128>{}, std::false_type{}, std::true_type{}); else go(std::integral_constant<int,128>{}, std::false_type{}, std::false_type{}); }
+            } else {
+                if (dlx) { if (pre) go(std::integral_constant<int,256>{}, std::true_type{}, std::true_type{}); else go(std::integral_constant<int,256>{}, std::true_type{}, std::false_type{}); }
+                else     { if (pre) go(std::integral_constant<int,256>{}, std::false_type{}, std::true_type{}); else go(std::integral_constant<int,256>{}, std::false_type{}, std::false_type{}); }
+            }
+        };
+        (void) launch_dn_cfg;
+        if (tsd) launch_dn_ts(std::true_type{});
+        else launch_dn_ts(std::false_type{});
+    }
 }
 
 // ---- EXPDEC launch: knobs, shapes, rows per block
@@ -6509,17 +6837,21 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         (void) cudaGetLastError();
         return g12 || strix;
 #else
-        return false;
+        int dev = 0, maj = 0;
+        const bool ok = cudaGetDevice(&dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess;
+        if (!ok) (void) cudaGetLastError();
+        return ok && maj >= 8;
 #endif
     }();
     // Qwen3.6-35B-A3B (n_embd 2048, n_ff 512, Q4_K / Q5_K gate+up, Q5_K down): the same kernels, the geometry only sizes the grid
     const bool q36geo = L.n_embd == 2048 && L.n_ff == 512 && L.d_type == 13;
-    if (v2k && (L.gu_type == 12 || L.gu_type == 13) &&
+    if (v2k && L.had_block == 0 && (L.gu_type == 12 || L.gu_type == 13) &&
         (((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640) || q36geo)) {
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         const long long nh = (long long) cap_entries * L.n_ff;
         const int64_t gy_v2k = (grid_groups > 0 && grid_groups <= cap_groups) ? grid_groups : cap_groups;
-#define STRATA_V2K(G, D) s27_launch_ts<G, D>(ts, L, gy_v2k, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh)
+#define STRATA_V2K(G, D) s27_launch_ts<G, D>(ts, L, gy_v2k, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh, g_exp_phase)
         if (q36geo) {
             // the gate/up of the V2K path (4 rows per warp, the chunk's activations in LDS) + SwiGLU/q8_1, and the old down kernel:
             // for n_ff 512 the new down kernel measured slower (15.1 vs 13.4 us per layer on gfx1201, R9700)

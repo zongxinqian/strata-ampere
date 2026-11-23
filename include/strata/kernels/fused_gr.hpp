@@ -62,6 +62,12 @@ void fused_gr_read(const FusedGrArgs& a, void* stream);
 /// The inverse for a path with no Q8 kernel: bf16 (round to nearest even) of d * q for `n_blocks` Q8_0 blocks.
 void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, void* stream);
 void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream);
+/// In-place packed Q8_0 layout for `hc_q8`: [int8 qs[n_blocks*32], half d[n_blocks]] (0 extra VRAM).
+void fused_gr_pack_q8_0(uint8_t* q8, int64_t n_blocks, void* stream);
+/// In-place up-tiled packed Q8_0 layout for `hc_q8` `_up` weights (0 extra VRAM).
+void fused_gr_pack_up_q8_0(uint8_t* q8, int64_t n_out, int64_t n_in, void* stream);
+void fused_gr_unregister_q8_0(const void* q8);
+void fused_gr_set_q8_packed(int on);
 
 /// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
 /// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four

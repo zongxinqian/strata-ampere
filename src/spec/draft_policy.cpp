@@ -494,16 +494,34 @@ double DraftPolicy::lookup_rate(int match) const {
 
 double DraftPolicy::cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
-    if (cost_n_[bk_][t] > 0) return cost_[bk_][t];
-    // scale from the measured sizes, weighting each by how often it was seen
+    if (fixed_) {
+        if (cost_n_[bk_][t] > 0) return cost_[bk_][t];
+        double num = 0.0, den = 0.0;
+        for (int u = 1; u <= kMaxT; ++u)
+            if (cost_n_[bk_][u] > 0) {
+                const double w = std::min(cost_n_[bk_][u], 20.0);
+                num += w * cost_[bk_][u] * kShape[t] / kShape[u];
+                den += w;
+            }
+        return den > 0 ? num / den : kShape[t];
+    }
+    // Uncalibrated / live costs: keep monotonic in t so one cold startup outlier at T=1/2
+    // can never invert cost(1/2) > cost(3) and trap every future round at T=3.
+    double c[kMaxT + 1] = {};
     double num = 0.0, den = 0.0;
     for (int u = 1; u <= kMaxT; ++u)
         if (cost_n_[bk_][u] > 0) {
             const double w = std::min(cost_n_[bk_][u], 20.0);
-            num += w * cost_[bk_][u] * kShape[t] / kShape[u];
+            num += w * cost_[bk_][u] / kShape[u];
             den += w;
         }
-    return den > 0 ? num / den : kShape[t];
+    if (den <= 0.0) return kShape[t];
+    const double base = num / den;
+    for (int u = 1; u <= kMaxT; ++u)
+        c[u] = cost_n_[bk_][u] > 0 ? cost_[bk_][u] : base * kShape[u];
+    for (int u = kMaxT - 1; u >= 1; --u)
+        if (c[u] > c[u + 1]) c[u] = c[u + 1] * (kShape[u] / kShape[u + 1]);
+    return c[t];
 }
 
 double DraftPolicy::clamp_sample(int t, double ms) const {
@@ -957,46 +975,144 @@ int p_bucket(double p) {
 
 // Until a bucket has data a draft is as likely to hold as the MTP says (worth kPriorN observations); measured
 // acceptance of the MTP chain is not the same as its own softmax (code and thinking text are over-confident).
-double DraftPolicy::draft_rate(double p) const {
-    const int b = p_bucket(p);
-    const double centre = std::clamp(p, 0.0, 1.0);
+namespace {
+uint8_t spec_depth_cal_env() {
+    static const uint8_t v = [] {
+        const char* s = std::getenv("STRATA_SPEC_DEPTH_CAL");
+        return (uint8_t) ((s == nullptr || s[0] != '0') ? 1 : 0);
+    }();
+    return v;
+}
+}  // namespace
+
+double DraftPolicy::draft_rate(double p, int depth) const {
+    static constexpr double kEmpPrior[kPBuckets] = {0.06, 0.16, 0.30, 0.40, 0.53, 0.60, 0.67, 0.88};
+    static constexpr double kEmpPriorD1[kPBuckets] = {0.04, 0.09, 0.13, 0.21, 0.30, 0.48, 0.62, 0.87};
+    const double cp = std::clamp(p, 0.0, 1.0);
+    const int b = p_bucket(cp);
+    const int eb = std::clamp((int) (cp * (double) kPBuckets), 0, kPBuckets - 1);
+    if (spec_depth_cal_env() != 0 && depth >= 1) {
+        const double centre = 0.25 * cp + 0.75 * kEmpPriorD1[eb];
+        return (pa_ok_d1_[b] + kPriorN * centre) / (pa_n_d1_[b] + kPriorN);
+    }
+    const double centre = 0.5 * cp + 0.5 * kEmpPrior[eb];
     return (pa_ok_[b] + kPriorN * centre) / (pa_n_[b] + kPriorN);
 }
 
 void DraftPolicy::observe_probs(const float* p, int n, int accepted) {
     // draft j was reached when the drafts before it held; it held when j < accepted
+    const bool dc = spec_depth_cal_env() != 0;
     for (int j = 0; j < n && j <= accepted; ++j) {
         const int b = p_bucket(p[j]);
-        pa_ok_[b] = kCalDecay * pa_ok_[b] + (j < accepted ? 1.0 : 0.0);
-        pa_n_[b] = kCalDecay * pa_n_[b] + 1.0;
+        const double v = (j < accepted ? 1.0 : 0.0);
+        if (!dc || j == 0) {
+            pa_ok_[b] = kCalDecay * pa_ok_[b] + v;
+            pa_n_[b] = kCalDecay * pa_n_[b] + 1.0;
+        }
+        if (j >= 1) {
+            pa_ok_d1_[b] = kCalDecay * pa_ok_d1_[b] + v;
+            pa_n_d1_[b] = kCalDecay * pa_n_d1_[b] + 1.0;
+        }
     }
+}
+
+namespace {
+double spec_r_op_env() {
+    static const double v = [] {
+        const char* s = std::getenv("STRATA_SPEC_R_OP");
+        return (s != nullptr && s[0] != '\0') ? std::max(0.0, std::atof(s)) : 0.0;
+    }();
+    return v;
+}
+double spec_opt0_env() {
+    static const double v = [] {
+        const char* s = std::getenv("STRATA_SPEC_OPT0");
+        return (s != nullptr && s[0] != '\0') ? std::clamp(std::atof(s), 0.0, 0.99) : 0.0;
+    }();
+    return v;
+}
+uint8_t spec_no_hiconf_env() {
+    static const uint8_t v = [] {
+        const char* s = std::getenv("STRATA_SPEC_NO_HICONF");
+        return (uint8_t) ((s != nullptr && s[0] != '0' && s[0] != '\0') ? 1 : 0);
+    }();
+    return v;
+}
+bool tree_rop_env() {
+    static const bool on = [] {
+        const char* s = std::getenv("STRATA_TREE_ROP");
+        return s == nullptr || s[0] != '0';
+    }();
+    return on;
+}
+}  // namespace
+
+DraftPolicy::ChainSnapshot DraftPolicy::chain_snapshot(int cap) const {
+    ChainSnapshot sn;
+    sn.cap = std::clamp(cap, 1, max_t_);
+    sn.margin = margin_;
+    sn.robust = robust_ ? 1 : 0;
+    sn.r_op = spec_r_op_env();
+    sn.opt0 = spec_opt0_env();
+    sn.no_hiconf = spec_no_hiconf_env();
+    sn.depth_cal = spec_depth_cal_env();
+    for (int b = 0; b < 8; ++b) {
+        sn.pa_ok[b] = pa_ok_[b]; sn.pa_n[b] = pa_n_[b];
+        sn.pa_ok_d1[b] = pa_ok_d1_[b]; sn.pa_n_d1[b] = pa_n_d1_[b];
+    }
+    for (int r = 1; r <= kMaxT && r < 9; ++r) {
+        sn.cost_ms[r] = cost_ms(r);
+        sn.probe_ok[r] = (!fixed_ && cost_n_[bk_][r] < kProbes) ? 1 : 0;
+        sn.stale[r] = (robust_ && !fixed_ && cost_n_[bk_][r] > 0 && (rounds_ - last_[bk_][r] > 64.0)) ? 1 : 0;
+    }
+    return sn;
 }
 
 bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
     cap = std::clamp(cap, 1, max_t_);
+    const double r_op = spec_r_op_env();
+    const double opt0 = spec_opt0_env();
+    const bool allow_hiconf = spec_no_hiconf_env() == 0;
+    const bool rr = r_op > 0.0;
     if (idx == 0) {
         st = ChainState{};
-        st.best_v = 1.0 / cost_ms(1);
+        st.best_v = rr ? (1.0 - r_op * cost_ms(1)) : (1.0 / cost_ms(1));
     }
-    const double a = draft_rate(p);
+    const double a = draft_rate(p, idx);
     st.q *= a;
     st.e += st.q;
     const int rows = idx + 2;
     if (rows <= cap) {
-        const double v = st.e / cost_ms(rows);
-        if (v > st.best_v * (1.0 + margin_ / 3.0)) {
+        const double v = rr ? (st.e - r_op * cost_ms(rows)) : (st.e / cost_ms(rows));
+        if (rr ? (v > st.best_v) : (v > st.best_v * (1.0 + margin_ / 3.0))) {
             st.best_v = v;
             st.best_rows = rows;
         }
-        // a width not measured yet is tried a few times when the chain is likely to hold that far
-        if (!fixed_ && cost_n_[bk_][rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
+        // When cost-aware MTP is active (robust_), keep high-confidence syntactic chains (e.g. code)
+        // and re-probe widths whose measured cost went stale under an earlier cold request.
+        const bool reprobe = allow_hiconf && robust_ && !fixed_ && cost_n_[bk_][rows] > 0 && (rounds_ - last_[bk_][rows] > 64.0) && st.q >= 0.35;
+        const bool hi_conf = allow_hiconf && robust_ && a >= 0.72 && st.q >= 0.35;
+        if (hi_conf) {
+            st.best_v = std::max(st.best_v, v);
+            st.best_rows = rows;
+        } else if ((!fixed_ && cost_n_[bk_][rows] < kProbes && st.q >= 0.30) || reprobe) {
+            st.best_rows = rows;
+        }
     }
     st.kept = st.best_rows - 1;
     if (rows + 1 > cap) return false;                       // no row left for another draft
-    // one or two more drafts, each as likely to hold as this one did, could they beat the best width so far?
-    const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
-    const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
-    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (!fixed_ && cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15);
+    // one or two more drafts, each as likely to hold as this one did (or opt0 at step 0), could they beat best?
+    const double a_opt = (idx == 0 && opt0 > a) ? opt0 : a;
+    const double v1 = rr ? ((st.e + st.q * a_opt) - r_op * cost_ms(rows + 1)) : ((st.e + st.q * a_opt) / cost_ms(rows + 1));
+    const double v2 = rows + 2 <= cap
+        ? (rr ? ((st.e + st.q * a_opt + st.q * a_opt * a) - r_op * cost_ms(rows + 2))
+              : ((st.e + st.q * a_opt + st.q * a_opt * a) / cost_ms(rows + 2)))
+        : (rr ? -1e9 : 0.0);
+    const bool next_stale = allow_hiconf && robust_ && !fixed_ && cost_n_[bk_][rows + 1] > 0 && (rounds_ - last_[bk_][rows + 1] > 64.0) && st.q * a >= 0.35;
+    const bool beat = rr ? (std::max(v1, v2) > st.best_v) : (std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0));
+    return beat ||
+           (!fixed_ && cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.30) || next_stale ||
+           (allow_hiconf && robust_ && a >= 0.72 && st.q * a >= 0.35);
 }
 
 double DraftPolicy::chain_rate(int match) const {
@@ -1052,6 +1168,187 @@ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, doubl
     const int b = bucket(match), ok = accepted - (t_mtp - 1);
     cok_[b] = kDecay * cok_[b] + ok;
     cbad_[b] = kDecay * cbad_[b] + (ok < k ? 1.0 : 0.0);
+}
+
+namespace {
+
+double tree_cond_q(double p_a, double p_b) {
+    const double pa = std::clamp(p_a, 0.0, 0.99);
+    const double pb = std::clamp(p_b, 0.0, 1.0);
+    return std::clamp(pb / std::max(0.10, 1.0 - pa), 0.0, 1.0);
+}
+
+}  // namespace
+
+void DraftPolicy::observe_tree_b(float p_a, float p_b, bool hit) {
+    if (!(p_b >= 0.0f && p_b <= 1.0f)) return;
+    const int b = p_bucket(tree_cond_q((double) p_a, (double) p_b));
+    tb_ok_[b] = tb_ok_[b] * kCalDecay + (hit ? 1.0 : 0.0);
+    tb_n_[b] = tb_n_[b] * kCalDecay + 1.0;
+}
+
+void DraftPolicy::observe_branch_ms(double ms) {
+    if (!(ms > 0.0 && ms < 50.0)) return;
+    if (draft_branch_n_ <= 0.0) {
+        draft_branch_ms_ = ms;
+        draft_branch_n_ = 1.0;
+    } else {
+        draft_branch_ms_ = draft_branch_ms_ * 0.9 + ms * 0.1;
+        draft_branch_n_ = std::min(draft_branch_n_ + 1.0, 64.0);
+    }
+}
+
+double DraftPolicy::tree_b_rate(double p_a, double p_b) const {
+    const double q = tree_cond_q(p_a, p_b);
+    const int b = p_bucket(q);
+    const double prior = 0.72 * q;
+    return (tb_ok_[b] + kPriorN * prior) / (tb_n_[b] + kPriorN);
+}
+
+double DraftPolicy::branch_draft_ms() const {
+    return draft_branch_ms_;
+}
+
+double DraftPolicy::r_op() const {
+    return spec_r_op_env();
+}
+
+DraftPolicy::TreePick DraftPolicy::choose_tree(const float* draft_p, const float* top2_p, int n_d,
+                                               bool allow_d1, double min_rel_gain, int max_b) const {
+    TreePick res;
+    if (!draft_p || n_d <= 0 || max_t_ < 2) return res;
+    const int nd = std::min(n_d, std::min(max_t_ - 1, kMaxT - 1));
+    std::array<double, kMaxT> e_a{}, surv_a{};
+    e_a[0] = 1.0;
+    surv_a[0] = 1.0;
+    const double rop = tree_rop_env() ? spec_r_op_env() : 0.0;
+    const bool rr = rop > 0.0;
+    auto score = [&](double e, double ms) -> double {
+        const double c = std::max(1e-3, ms);
+        return rr ? (e - rop * c) : (e / c);
+    };
+
+    for (int i = 0; i < nd; ++i) {
+        const double r = draft_rate((double) draft_p[i], i);
+        surv_a[i + 1] = surv_a[i] * r;
+        e_a[i + 1] = e_a[i] + surv_a[i + 1];
+    }
+
+    double best_lin_v = score(1.0, cost_ms(1));
+    int best_lin_t = 1;
+    for (int na = 1; na <= nd; ++na) {
+        const int t = 1 + na;
+        if (t > max_t_ || !allowed(t)) continue;
+        const double v = score(e_a[na], cost_ms(t));
+        if (v > best_lin_v) {
+            best_lin_v = v;
+            best_lin_t = t;
+        }
+    }
+    res.T = best_lin_t;
+    res.lin_t = best_lin_t;
+    if (!top2_p || max_t_ < 3 || max_b < 1) return res;
+
+    double best_tree_v = -1e18;
+    double best_opt_v = -1e18;
+    const int max_p = (allow_d1 && nd >= 2 && max_t_ >= 4) ? 1 : 0;
+    const double margin = std::max(0.0, min_rel_gain);
+    const double req_lin_v = rr ? best_lin_v : (best_lin_v * (1.0 + margin));
+
+    for (int parent = 0; parent <= max_p; ++parent) {
+        const double pa = (double) draft_p[parent];
+        const double pb0 = (double) top2_p[parent];
+        if (!(pb0 > 0.0)) continue;
+        const double r_a = draft_rate(pa, parent);
+        const double miss_p = surv_a[parent] * (1.0 - r_a);
+        const double r_b0 = tree_b_rate(pa, pb0);
+        const double b_ev = miss_p * r_b0;
+        if (b_ev <= 0.01) continue;
+
+        for (int na = parent + 1; na <= nd; ++na) {
+            const int t1 = 1 + na + 1;
+            if (t1 <= max_t_ && allowed(t1)) {
+                const double e_tree = e_a[na] + b_ev;
+                const double c1 = std::max(1e-3, cost_ms(t1));
+                const double v_tree = score(e_tree, c1) - (rr ? margin * rop * c1 : 0.0);
+                if (v_tree > best_tree_v) {
+                    best_tree_v = v_tree;
+                    res.fork = 1 + na;
+                    res.parent = parent;
+                    res.n_a = na;
+                    res.n_b = 1;
+                    res.T = t1;
+                }
+            }
+            if (max_b >= 2) {
+                for (int nb = 2; nb <= max_b; ++nb) {
+                    const int tb = 1 + na + nb;
+                    if (tb > max_t_ || !allowed(tb)) continue;
+                    double mult = 1.0, p_cont = 1.0;
+                    for (int j = 1; j < nb; ++j) {
+                        p_cont *= 0.85;
+                        mult += p_cont;
+                    }
+                    const double e_opt = e_a[na] + b_ev * mult;
+                    const double c_opt = std::max(1e-3, cost_ms(tb)) + branch_draft_ms();
+                    const double v_opt = score(e_opt, c_opt) - (rr ? margin * rop * c_opt : 0.0);
+                    best_opt_v = std::max(best_opt_v, v_opt);
+                }
+            }
+        }
+    }
+
+    if (best_tree_v > req_lin_v) {
+        const double denom = rr ? std::max(0.1, rop * cost_ms(res.T)) : best_lin_v;
+        res.gain = (best_tree_v - best_lin_v) / denom;
+    } else {
+        res.fork = 0;
+        res.parent = 0;
+        res.n_a = 0;
+        res.n_b = 0;
+        res.T = best_lin_t;
+        res.gain = 0.0;
+    }
+    const double thresh = std::max(req_lin_v, best_tree_v);
+    res.probe_branch = (max_b >= 2 && best_opt_v > thresh);
+    return res;
+}
+
+int DraftPolicy::choose_tree_b_len(int parent, int n_a, float p_a, float p_b0,
+                                     const float* draft_p, const float* b_p, int n_bp) const {
+    if (!draft_p || parent < 0 || n_a < parent + 1 || 1 + n_a + 1 > max_t_) return 1;
+    const double rop = tree_rop_env() ? spec_r_op_env() : 0.0;
+    const bool rr = rop > 0.0;
+    auto score = [&](double e, double ms) -> double {
+        const double c = std::max(1e-3, ms);
+        return rr ? (e - rop * c) : (e / c);
+    };
+    double surv = 1.0, e_a = 1.0;
+    for (int i = 0; i < n_a; ++i) {
+        surv *= draft_rate((double) draft_p[i], i);
+        e_a += surv;
+    }
+    double surv_p = 1.0;
+    for (int i = 0; i < parent; ++i) surv_p *= draft_rate((double) draft_p[i], i);
+    const double miss_p = surv_p * (1.0 - draft_rate((double) p_a, parent));
+    const double b_ev = miss_p * tree_b_rate((double) p_a, (double) p_b0);
+    double best_v = score(e_a + b_ev, cost_ms(1 + n_a + 1));
+    int best_b = 1;
+    double cont = 1.0, mult = 1.0;
+    for (int j = 0; b_p && j < n_bp; ++j) {
+        const int nb = 2 + j;
+        const int t = 1 + n_a + nb;
+        if (t > max_t_) break;
+        cont *= draft_rate((double) b_p[j], parent + 1 + j);
+        mult += cont;
+        if (!allowed(t)) continue;
+        const double v = score(e_a + b_ev * mult, cost_ms(t));
+        if (v > best_v) {
+            best_v = v;
+            best_b = nb;
+        }
+    }
+    return best_b;
 }
 
 }  // namespace strata::spec

@@ -5,6 +5,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/core/tc_sm75.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/sm120_series.hpp"
 
@@ -344,6 +345,30 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     }
 }
 
+template <typename T, bool ALIGNED16>
+__global__ void dequant_q8_0_packed_kernel(const int8_t* __restrict__ qs, const uint16_t* __restrict__ ds,
+                                           int64_t row0, int64_t rows, int64_t gpr, int64_t ld, T* __restrict__ out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * gpr * 4) return;
+    const int64_t g = i >> 2, r = g / gpr, gi = g - r * gpr;
+    const int piece = (int) (i & 3);
+    const int64_t blk = (row0 + r) * gpr + gi;
+    const float d = __half2float(__ushort_as_half(ds[blk]));
+    const uint64_t q8 = *reinterpret_cast<const uint64_t*>(qs + blk * 32 + 8 * piece);
+    __align__(16) T v[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) put(v, k, (float) (int8_t) ((q8 >> (8 * k)) & 0xFF) * d);
+    T* dst = out + r * ld + gi * 32 + 8 * piece;
+    if constexpr (ALIGNED16) {
+        uint4* o = reinterpret_cast<uint4*>(dst);
+#pragma unroll
+        for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = reinterpret_cast<const uint4*>(v)[k];
+    } else {
+#pragma unroll
+        for (int k = 0; k < 8; ++k) dst[k] = v[k];
+    }
+}
+
 template <typename T>
 void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream,
             int64_t ld = 0) {
@@ -358,6 +383,20 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
+    if (type == 8) {
+        const int8_t* p_qs = nullptr;
+        const uint16_t* p_d = nullptr;
+        int p_nin = 0, p_nout = 0;
+        if (native_q8_0_packed_lookup(blocks, p_qs, p_d, p_nin, p_nout) && p_nin == cols && row0 >= 0 && row0 + rows <= p_nout) {
+            const bool al16 = (reinterpret_cast<uintptr_t>(out) & 15) == 0 && ((size_t) ld * sizeof(T)) % 16 == 0;
+            const unsigned pgrid = (unsigned) ((4 * total + 255) / 256);
+            if (al16) dequant_q8_0_packed_kernel<T, true><<<pgrid, 256, 0, st>>>(p_qs, p_d, row0, rows, gpr, ld, out);
+            else dequant_q8_0_packed_kernel<T, false><<<pgrid, 256, 0, st>>>(p_qs, p_d, row0, rows, gpr, ld, out);
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { std::fprintf(stderr, "dequant packed launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return;
+        }
+    }
     if (type == 8 && ld == cols && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 &&
         (reinterpret_cast<uintptr_t>(out) & 15) == 0) {   // contiguous rows only (the kernel writes out + g * 32)
         dequant_q8_0_kernel<T><<<(unsigned) ((4 * total + 255) / 256), 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out);

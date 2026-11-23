@@ -20,6 +20,7 @@
 //   - `sampler_kernel` (`STRATA_OLD_SAMPLER=1`), the kernel of engine 0.1.20, kept as the reference.
 // The two new ones share `sampled_tail_warp` (top_p / min_p / temperature / draw on one warp).
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/spec_proposal.hpp"
@@ -1278,8 +1279,35 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             return !v || std::atoi(v) != 0;
         }();
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
+        auto try_split_argmax = [&]() -> bool {
+            if (!(multi && shmem == 0 && !p.logit_bias && n_tokens <= 8 && n_vocab >= 16384 &&
+                  argmax_rows_wanted() && !stream_capturing(stream)))
+                return false;
+            int dev = 0;
+            if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+            static std::mutex mu;
+            static void* sc[64] = {};
+            void* sbuf = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                if (sc[dev] == nullptr) {
+                    const uint64_t bytes = argmax_rows_scratch_bytes(8);
+                    void* tmp = nullptr;
+                    if (cudaMalloc(&tmp, (size_t) bytes) != cudaSuccess) return false;
+                    if (cudaMemset(tmp, 0, (size_t) bytes) != cudaSuccess) {
+                        cudaFree(tmp);
+                        return false;
+                    }
+                    sc[dev] = tmp;
+                }
+                sbuf = sc[dev];
+            }
+            argmax_rows(logits, n_tokens, n_vocab, sbuf, out, stream);
+            return true;
+        };
         const int gthreads = 1024;
-        if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
+        if (!(multi && shmem == 0 && !p.logit_bias && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)) &&
+            !try_split_argmax())
             sampler_greedy_kernel<<<(unsigned) n_tokens, gthreads, shmem, (cudaStream_t) stream>>>(
                 logits, n_vocab, history, history_len, p, p.penalty_last_n, p.penalty_last_n, out);
     } else if (sampled_path() == SampledPath::Old) {

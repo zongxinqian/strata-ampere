@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
                             us[0], us[1], same ? "bitwise equal" : "DIFFERS", h);
                 if (!same) ++failures;
             }
+    K::fused_gr_set_fast(0);
     {   // the Q8_0 read against the bf16 read: relative RMS error of lo / mixed / R / inject, and the q8_1 image against mixed
         const std::vector<uint8_t> qd = q8_0_of_bf16(wd, D), qu = q8_0_of_bf16(wu, LR);
         uint8_t *dqd, *dqu, *dqm; unsigned* dcnt;
@@ -210,6 +211,56 @@ int main(int argc, char** argv) {
             std::printf("Q8 vs bf16 T %d apply %d | rel rms lo %.4f mixed %.4f | max |dR,dinject| %.3g | q8_1 image vs mixed rel rms %.4f | hash %016llx\n", T, apply,
                         std::sqrt(num / den), std::sqrt(nm / dm), rn, std::sqrt(qn / qd2), hq);
         }
+        std::printf("--- Packed Q8_0 in-place parity ---\n");
+        K::fused_gr_pack_q8_0(dqd, (int64_t) qd.size() / 34, s);
+        K::fused_gr_pack_up_q8_0(dqu, D, LR, s);
+        for (int T = t_lo; T <= t_hi; ++T) for (int apply = 0; apply < 2; ++apply) {
+            K::FusedGrArgs a[TM];
+            for (int t = 0; t < T; ++t) {
+                a[t].R = dR + (size_t) t * D; a[t].R_out = dR + (size_t) t * D; a[t].apply = apply;
+                a[t].bo_prev = dbo + (size_t) t * N; a[t].inj_prev = dinj + (size_t) t * HC;
+                a[t].w_norm = dwn; a[t].w_down = dwd; a[t].w_up = dwu; a[t].w_inject = dwi;
+                a[t].lo = dlo + (size_t) t * LR; a[t].rs = drs + (size_t) t * HC;
+                a[t].inject_out = dio + (size_t) t * HC; a[t].mixed = dmix + (size_t) t * N;
+            }
+            std::vector<float> o[2]; std::vector<uint8_t> img;
+            for (int q = 0; q < 2; ++q) {
+                for (int t = 0; t < T; ++t) {
+                    a[t].q8_down = q ? dqd : nullptr; a[t].q8_up = q ? dqu : nullptr;
+                    a[t].q8_mixed = (uint8_t*) dqm + (size_t) t * (N / 32) * 36; a[t].q8_cnt = dcnt;
+                }
+                cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
+                cudaMemset(dqm, 0, (size_t) TM * (N / 32) * 36);
+                K::fused_gr_read_multi(a, T, dxn, s);
+                cudaStreamSynchronize(s);
+                o[q].resize((size_t) T * (LR + N + D + HC));
+                float* p = o[q].data();
+                cudaMemcpy(p, dlo, (size_t) T * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) T * LR;
+                cudaMemcpy(p, dmix, (size_t) T * N * 4, cudaMemcpyDeviceToHost); p += (size_t) T * N;
+                cudaMemcpy(p, dR, (size_t) T * D * 4, cudaMemcpyDeviceToHost); p += (size_t) T * D;
+                cudaMemcpy(p, dio, (size_t) T * HC * 4, cudaMemcpyDeviceToHost);
+                if (q) { img.resize((size_t) T * (N / 32) * 36); cudaMemcpy(img.data(), dqm, img.size(), cudaMemcpyDeviceToHost); }
+            }
+            double num = 0, den = 0, nm = 0, dm = 0, rn = 0, qn = 0, qd2 = 0;
+            for (size_t i = 0; i < (size_t) T * LR; ++i) { num += std::pow(o[1][i] - o[0][i], 2); den += std::pow(o[0][i], 2); }
+            for (size_t i = (size_t) T * LR; i < (size_t) T * (LR + N); ++i) { nm += std::pow(o[1][i] - o[0][i], 2); dm += std::pow(o[0][i], 2); }
+            for (size_t i = (size_t) T * (LR + N); i < o[0].size(); ++i) rn = std::fmax(rn, std::fabs(o[1][i] - o[0][i]));
+            for (int t = 0; t < T; ++t) for (int g = 0; g < N / 32; ++g) {
+                const uint8_t* b = &img[((size_t) t * (N / 32) + g) * 36];
+                uint16_t h; std::memcpy(&h, b, 2);
+                const uint32_t sg = (h >> 15) & 1, ex = (h >> 10) & 31, mn = h & 1023;
+                const float d = (ex ? std::ldexp(1.0f + mn / 1024.0f, (int) ex - 15) : std::ldexp(mn / 1024.0f, -14)) * (sg ? -1.f : 1.f);
+                for (int j = 0; j < 32; ++j) {
+                    const float ref = o[1][(size_t) T * LR + (size_t) t * N + g * 32 + j];
+                    qn += std::pow(d * (int8_t) b[4 + j] - ref, 2); qd2 += ref * ref;
+                }
+            }
+            if (rn > 1e-4) ++failures;
+            std::printf("Q8-PK vs bf16 T %d apply %d | rel rms lo %.4f mixed %.4f | max |dR,dinject| %.3g | q8_1 vs mixed %.4f\n",
+                        T, apply, std::sqrt(num / den), std::sqrt(nm / dm), rn, std::sqrt(qn / qd2));
+        }
+        K::fused_gr_unregister_q8_0(dqd); K::fused_gr_unregister_q8_0(dqu);
+        cudaFree(dqd); cudaFree(dqu); cudaFree(dqm); cudaFree(dcnt);
     }
     if (cold_sets > 1) {
         // the engine reads a different layer's weights every time: rotate over `cold_sets` copies (13 MB each)
@@ -233,7 +284,17 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &dst, (size_t) iters * 4 * 8);
         std::vector<unsigned long long> hst((size_t) iters * 4);
         std::vector<K::FusedGrArgs> as((size_t) cold_sets * 8);
-        for (int T = t_lo; T <= t_hi; ++T) for (int f = 0; f < 3; ++f) {
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass == 1) {
+                for (int c = 0; c < cold_sets; ++c) {
+                    K::fused_gr_pack_q8_0(cqd[c], (int64_t) qd.size() / 34, s);
+                    K::fused_gr_pack_up_q8_0(cqu[c], D, LR, s);
+                }
+                K::fused_gr_set_q8_packed(1);
+            } else {
+                K::fused_gr_set_q8_packed(0);
+            }
+        for (int T = t_lo; T <= t_hi; ++T) for (int f = (pass ? 3 : 0); f < (pass ? 4 : 3); ++f) {
             K::fused_gr_set_fast(f == 1);
             for (int c = 0; c < cold_sets; ++c)
                 for (int t = 0; t < T; ++t) {
@@ -243,7 +304,7 @@ int main(int argc, char** argv) {
                     a.bo_prev = dbo + (size_t) t * N; a.inj_prev = dinj + (size_t) t * HC;
                     a.w_norm = cwn[c]; a.w_down = cwd[c]; a.w_up = cwu[c]; a.w_inject = cwi[c];
                     if (with_q) { a.q8_mixed = dqm + (size_t) t * (N / 32) * 36; a.q8_cnt = dcnt; }
-                    if (f == 2) { a.q8_down = cqd[c]; a.q8_up = cqu[c]; }
+                    if (f >= 2) { a.q8_down = cqd[c]; a.q8_up = cqu[c]; }
                     a.lo = dlo + (size_t) t * LR; a.rs = drs + (size_t) t * HC;
                     a.inject_out = dio + (size_t) t * HC; a.mixed = dmix + (size_t) t * N;
                 }
@@ -271,7 +332,7 @@ int main(int argc, char** argv) {
             auto med = [](std::vector<double>& v) { std::sort(v.begin(), v.end()); return v[v.size() / 2] / 1e3; };
             std::printf("COLD(%d sets) fast %d T %d | read %6.1f us (events) | stamps median: norm %5.1f down %5.1f up %5.1f us (incl. a stamp kernel each)\n",
                         cold_sets, f, T, 1e3 * ms / iters, med(n_), med(d_), med(u_));
-        }
+        } }
     }
     std::printf("fused_gr_bench: %d differing\n", failures);
     return failures ? 1 : 0;

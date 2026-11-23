@@ -246,9 +246,16 @@ public:
     /// Plan v0.3 P6: `run_split` for multi-token jobs (at most `kMaxSplitMulti`); the rows of each expert are
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
+    /// Parallel token activation descriptors for Surgery 6.18 (quantize tokens inside `drain_fused_multi`).
+    struct SplitPreAct {
+        int n_toks = 0;
+        const float* const* x = nullptr;
+        void* const* dst = nullptr;
+    };
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
-                                NativeArithmetic arithmetic = NativeArithmetic::Default);
+                                NativeArithmetic arithmetic = NativeArithmetic::Default,
+                                const SplitPreAct* pre_act = nullptr);
     /// Non-blocking async multi-native dispatch (STRATA_PIPE_ASYNC_BELL): host thread stays free to serve
     /// another GPU's doorbell while workers drain GateUp/Down phases, and can steal one ~5 us task via
     /// `async_help_one()` or cancel a doomed speculative window via `async_abort()`.
@@ -389,6 +396,15 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
+    bool fuse_hq_ = false;
+    int fused_p5_per_ = 0;
+    const SplitPreAct* pre_act_ = nullptr;
+    int fused_act_need_ = 0;
+    alignas(64) std::atomic<uint32_t> fused_act_done_{0};
+    alignas(64) std::atomic<uint32_t> fused_p5_done_{0};
+    alignas(64) std::atomic<uint32_t> fused_p5_go_{0};
+    alignas(64) std::atomic<uint32_t> fused_p6_done_{0};
+    void drain_fused_multi(int tid, int nt_total, uint32_t epoch, bool is_host);
     std::vector<SplitBufMulti> split_multi_;
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the

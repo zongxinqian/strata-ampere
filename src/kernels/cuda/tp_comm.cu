@@ -26,6 +26,22 @@ __device__ __forceinline__ void store_wt_f4(float4* p, float4 v) {
                  : "memory");
 }
 
+__device__ __forceinline__ uint4 load_cv_u4(const uint4* p) {
+    uint4 v;
+    asm volatile("ld.global.cv.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p)
+                 : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void store_wt_u4(uint4* p, uint4 v) {
+    asm volatile("st.global.wt.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+}
+
 __global__ void tp_allreduce_kernel(float* __restrict__ local_buf,
                                     float* __restrict__ my_map_base,
                                     const float* __restrict__ peer_map_base,
@@ -51,15 +67,27 @@ __global__ void tp_allreduce_kernel(float* __restrict__ local_buf,
     }
     __syncthreads();
     if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+            if (pf >= step) break;
+        }
+#elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
         __threadfence_system();
+        asm volatile("st.relaxed.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        do {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+        } while (pf < step);
+#else
         *my_flag = step;
         __threadfence_system();
         while (*peer_flag < step) {
-#if __CUDA_ARCH__ >= 700
-            __nanosleep(40);
-#endif
         }
         __threadfence_system();
+#endif
     }
     __syncthreads();
     for (int i = tid; i < n4; i += blockDim.x) {
@@ -69,6 +97,158 @@ __global__ void tp_allreduce_kernel(float* __restrict__ local_buf,
     }
     for (int i = (n4 << 2) + tid; i < n_elems; i += blockDim.x) {
         local_buf[i] += *(const volatile float*) (peer_map + i);
+    }
+}
+
+__global__ void tp_allreduce_bf16_kernel(float* __restrict__ local_buf,
+                                         float* __restrict__ my_map_base,
+                                         const float* __restrict__ peer_map_base,
+                                         volatile uint32_t* __restrict__ my_flag,
+                                         volatile uint32_t* __restrict__ peer_flag,
+                                         int n_elems,
+                                         size_t slot_floats,
+                                         uint32_t step) {
+    const int tid = threadIdx.x;
+    const size_t slot_off = (size_t) (step & (TpComm::kRingSlots - 1u)) * slot_floats;
+    float* my_map = my_map_base + slot_off;
+    const float* peer_map = peer_map_base + slot_off;
+
+    const int n8 = n_elems >> 3;
+    float4* l4 = reinterpret_cast<float4*>(local_buf);
+    uint4* m4 = reinterpret_cast<uint4*>(my_map);
+    const uint4* p4 = reinterpret_cast<const uint4*>(peer_map);
+    for (int i = tid; i < n8; i += blockDim.x) {
+        const float4 a = l4[2 * i];
+        const float4 b = l4[2 * i + 1];
+        const __nv_bfloat162 p0 = __floats2bfloat162_rn(a.x, a.y);
+        const __nv_bfloat162 p1 = __floats2bfloat162_rn(a.z, a.w);
+        const __nv_bfloat162 p2 = __floats2bfloat162_rn(b.x, b.y);
+        const __nv_bfloat162 p3 = __floats2bfloat162_rn(b.z, b.w);
+        uint4 v;
+        std::memcpy(&v.x, &p0, 4);
+        std::memcpy(&v.y, &p1, 4);
+        std::memcpy(&v.z, &p2, 4);
+        std::memcpy(&v.w, &p3, 4);
+        store_wt_u4(m4 + i, v);
+    }
+    __syncthreads();
+    if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+            if (pf >= step) break;
+        }
+#elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        __threadfence_system();
+        asm volatile("st.relaxed.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        do {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+        } while (pf < step);
+#else
+        *my_flag = step;
+        __threadfence_system();
+        while (*peer_flag < step) {
+        }
+        __threadfence_system();
+#endif
+    }
+    __syncthreads();
+    for (int i = tid; i < n8; i += blockDim.x) {
+        float4 a = l4[2 * i];
+        float4 b = l4[2 * i + 1];
+        const uint4 v = load_cv_u4(p4 + i);
+        __nv_bfloat162 p0, p1, p2, p3;
+        std::memcpy(&p0, &v.x, 4);
+        std::memcpy(&p1, &v.y, 4);
+        std::memcpy(&p2, &v.z, 4);
+        std::memcpy(&p3, &v.w, 4);
+        const float2 f0 = __bfloat1622float2(p0);
+        const float2 f1 = __bfloat1622float2(p1);
+        const float2 f2 = __bfloat1622float2(p2);
+        const float2 f3 = __bfloat1622float2(p3);
+        a.x += f0.x; a.y += f0.y; a.z += f1.x; a.w += f1.y;
+        b.x += f2.x; b.y += f2.y; b.z += f3.x; b.w += f3.y;
+        l4[2 * i] = a;
+        l4[2 * i + 1] = b;
+    }
+}
+
+__global__ void tp_allreduce_fp16_kernel(float* __restrict__ local_buf,
+                                         float* __restrict__ my_map_base,
+                                         const float* __restrict__ peer_map_base,
+                                         volatile uint32_t* __restrict__ my_flag,
+                                         volatile uint32_t* __restrict__ peer_flag,
+                                         int n_elems,
+                                         size_t slot_floats,
+                                         uint32_t step) {
+    const int tid = threadIdx.x;
+    const size_t slot_off = (size_t) (step & (TpComm::kRingSlots - 1u)) * slot_floats;
+    float* my_map = my_map_base + slot_off;
+    const float* peer_map = peer_map_base + slot_off;
+
+    const int n8 = n_elems >> 3;
+    float4* l4 = reinterpret_cast<float4*>(local_buf);
+    uint4* m4 = reinterpret_cast<uint4*>(my_map);
+    const uint4* p4 = reinterpret_cast<const uint4*>(peer_map);
+    for (int i = tid; i < n8; i += blockDim.x) {
+        const float4 a = l4[2 * i];
+        const float4 b = l4[2 * i + 1];
+        const __half2 p0 = __floats2half2_rn(a.x, a.y);
+        const __half2 p1 = __floats2half2_rn(a.z, a.w);
+        const __half2 p2 = __floats2half2_rn(b.x, b.y);
+        const __half2 p3 = __floats2half2_rn(b.z, b.w);
+        uint4 v;
+        std::memcpy(&v.x, &p0, 4);
+        std::memcpy(&v.y, &p1, 4);
+        std::memcpy(&v.z, &p2, 4);
+        std::memcpy(&v.w, &p3, 4);
+        store_wt_u4(m4 + i, v);
+    }
+    __syncthreads();
+    if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+            if (pf >= step) break;
+        }
+#elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        __threadfence_system();
+        asm volatile("st.relaxed.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        do {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+        } while (pf < step);
+#else
+        *my_flag = step;
+        __threadfence_system();
+        while (*peer_flag < step) {
+        }
+        __threadfence_system();
+#endif
+    }
+    __syncthreads();
+    for (int i = tid; i < n8; i += blockDim.x) {
+        float4 a = l4[2 * i];
+        float4 b = l4[2 * i + 1];
+        const uint4 v = load_cv_u4(p4 + i);
+        __half2 p0, p1, p2, p3;
+        std::memcpy(&p0, &v.x, 4);
+        std::memcpy(&p1, &v.y, 4);
+        std::memcpy(&p2, &v.z, 4);
+        std::memcpy(&p3, &v.w, 4);
+        const float2 f0 = __half22float2(p0);
+        const float2 f1 = __half22float2(p1);
+        const float2 f2 = __half22float2(p2);
+        const float2 f3 = __half22float2(p3);
+        a.x += f0.x; a.y += f0.y; a.z += f1.x; a.w += f1.y;
+        b.x += f2.x; b.y += f2.y; b.z += f3.x; b.w += f3.y;
+        l4[2 * i] = a;
+        l4[2 * i + 1] = b;
     }
 }
 
@@ -364,7 +544,27 @@ void TpComm::reset(uint32_t base) {
 }
 
 void TpComm::allreduce_add(float* local_buf, int n_elems, uint32_t step, int rank, void* stream) {
-    const int threads = n_elems > 32768 ? 1024 : 256;
+    static const int dec_mode = [] {
+        const char* d = std::getenv("STRATA_TP_AR_DECODE");
+        const char* v = (d != nullptr && d[0] != '\0') ? d : std::getenv("STRATA_TP_AR_MODE");
+        if (v == nullptr) return 1;
+        if (std::strcmp(v, "fp32") == 0 || std::strcmp(v, "0") == 0) return 0;
+        if (std::strcmp(v, "fp16") == 0 || std::strcmp(v, "half") == 0) return 2;
+        return 1;
+    }();
+    if (dec_mode >= 1 && (n_elems & 7) == 0 && (size_t) n_elems * 2u <= slot_floats_ * sizeof(float)) {
+        if (dec_mode == 2) {
+            tp_allreduce_fp16_kernel<<<1, 512, 0, (cudaStream_t) stream>>>(
+                local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
+                m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+        } else {
+            tp_allreduce_bf16_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
+                local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
+                m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+        }
+        return;
+    }
+    const int threads = n_elems > 32768 ? 1024 : 512;
     tp_allreduce_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(
         local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
         m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);

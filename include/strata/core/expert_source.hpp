@@ -618,6 +618,7 @@ struct ExpertDispatch {
     GpuPlanSink* plan = nullptr;
     GpuPlanSink* tp_plan1 = nullptr;
     const int32_t* tp_res1 = nullptr;
+    bool tp2_dev_plan = false;             ///< GPU0 & GPU1 build their own hit plans via tp2_resident_plan
     const uint8_t* tp_cache_base1 = nullptr;
     const uint64_t* tp_cache_slot_off1 = nullptr;
     int pcie_num = 0;

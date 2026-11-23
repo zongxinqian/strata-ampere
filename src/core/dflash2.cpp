@@ -34,6 +34,41 @@ bool mapped(size_t bytes, void** h, void** d) {
 }
 
 constexpr int GGML_Q8_0 = 8;
+constexpr int GGML_Q4_0 = 2;
+
+#if defined(STRATA_OWN_CPU_QUANT)
+}  // namespace
+}  // namespace strata::core
+#include "strata/quant/act.hpp"
+#include "strata/quant/dequant.hpp"
+namespace strata::core {
+namespace {
+bool df2_to_float(int type, const void* src, float* dst, int64_t n) {
+    return strata::quant::dequant_row((strata::quant::Type) type, src, dst, n);
+}
+void df2_quant_q4_0(const float* x, void* dst, int64_t n) { strata::quant::quantize_q4_0_ref(x, dst, n); }
+#elif defined(STRATA_NATIVE_EXPERTS)
+}  // namespace
+}  // namespace strata::core
+#include "ggml.h"
+namespace strata::core {
+namespace {
+bool df2_to_float(int type, const void* src, float* dst, int64_t n) {
+    const auto* t = ggml_get_type_traits((ggml_type) type);
+    if (t == nullptr || t->to_float == nullptr) return false;
+    t->to_float(src, dst, n);
+    return true;
+}
+void df2_quant_q4_0(const float* x, void* dst, int64_t n) { ggml_quantize_chunk(GGML_TYPE_Q4_0, x, dst, 0, 1, n, nullptr); }
+#endif
+
+bool df2_head_q4_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DF2_HEAD_Q4");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
 
 }  // namespace
 
@@ -327,7 +362,7 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
     std::vector<int32_t> vocab;
     // STRATA_DF2_HEAD=native: the drafter runs its head on the target's own resident head (every vocabulary row, no 213 MiB pruned copy, no vocabulary file read)
     // (a head on another card, a layer split's last stage, is not read in place: the pruned copy is gathered there and copied over, as before)
-    const bool head_native = Dflash2Drafter::head_native() && (head_device < 0 || head_device == device_);
+    const bool head_native = Dflash2Drafter::head_native() && (head_device < 0 || head_device == device_) && !head->is_sharded();
     if (!vocab_file.empty() && !head_native) {
         if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
             std::fseek(vf, 0, SEEK_END);
@@ -342,13 +377,18 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
     }
     const void* hw = head->weights();
     const int64_t row_bytes = (int64_t) head->row_bytes();
+    int bind_head_type = head->type();
+    int64_t bind_row_bytes = row_bytes;
     int64_t head_rows = row_bytes > 0 ? (int64_t) (head->weight_bytes() / (uint64_t) row_bytes) : 0;
-    if (!vocab.empty() && shared_.rows != nullptr && !std::getenv("STRATA_DF2_SHARE_HEAD_OFF") && shared_.type == head->type() &&
+    if (!vocab.empty() && shared_.rows != nullptr && !std::getenv("STRATA_DF2_SHARE_HEAD_OFF") &&
+        (shared_.type == head->type() || shared_.type == GGML_Q4_0) &&
         shared_.n == (int64_t) vocab.size() && shared_.vocab_host != nullptr && *shared_.vocab_host == vocab && shared_.vocab_dev != nullptr) {
-        // DF-05: the MTP drafter gathered these very rows (same vocabulary ids in the same order, the main head's own layout and type): use them
+        // DF-05: the MTP drafter gathered these very rows (plain or Q4_0): share them without duplicating VRAM
         dhead_ = const_cast<uint8_t*>(shared_.rows);
         dhead_shared_ = true;
         hw = dhead_;
+        bind_head_type = shared_.type;
+        if (bind_head_type == GGML_Q4_0 && (N_ % 32) == 0) bind_row_bytes = (N_ / 32) * 18;
         head_rows = (int64_t) vocab.size();
     } else if (!vocab.empty() && head_device >= 0 && head_device != device_) {
         // the head is on another card: gather the subset's rows there, copy them over once
@@ -385,17 +425,64 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
             err = "dflash2: the draft vocabulary's head rows do not fit";
             return false;
         }
-        cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
-        kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, nullptr);
-        cudaDeviceSynchronize();
+        if (head->is_sharded()) {
+            if (!head->gather_rows_to_device(vocab.data(), (int64_t) vocab.size(), dhead_, err)) {
+                cudaFree(dv);
+                return false;
+            }
+        } else {
+            cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
+            kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, nullptr);
+            cudaDeviceSynchronize();
+        }
         cudaFree(dv);
-        vram_ += (uint64_t) ((int64_t) vocab.size() * row_bytes);
+        uint64_t dhead_bytes = (uint64_t) ((int64_t) vocab.size() * row_bytes);
+#if defined(STRATA_OWN_CPU_QUANT) || defined(STRATA_NATIVE_EXPERTS)
+        if (df2_head_q4_enabled() && (N_ % 32) == 0 && bind_head_type != GGML_Q4_0) {
+            const size_t out_row = (size_t) (N_ / 32) * 18;
+            std::vector<uint8_t> src(dhead_bytes), dst((size_t) vocab.size() * out_row);
+            if (cudaMemcpy(src.data(), dhead_, src.size(), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = "dflash2: reading draft head for Q4_0 conversion failed";
+                return false;
+            }
+            std::vector<float> row((size_t) N_);
+            bool ok_q4 = true;
+            for (size_t r = 0; r < vocab.size(); ++r) {
+                if (!df2_to_float(bind_head_type, src.data() + r * (size_t) row_bytes, row.data(), N_)) {
+                    ok_q4 = false;
+                    break;
+                }
+                df2_quant_q4_0(row.data(), dst.data() + r * out_row, N_);
+            }
+            if (ok_q4) {
+                uint8_t* q4_buf = nullptr;
+                if (cudaMalloc((void**) &q4_buf, dst.size()) == cudaSuccess) {
+                    if (cudaMemcpy(q4_buf, dst.data(), dst.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                        cudaFree(q4_buf);
+                        err = "dflash2: uploading Q4_0 draft head failed";
+                        return false;
+                    }
+                    cudaFree(dhead_);
+                    dhead_ = q4_buf;
+                    dhead_bytes = (uint64_t) dst.size();
+                    bind_head_type = GGML_Q4_0;
+                    bind_row_bytes = (int64_t) out_row;
+                } else {
+                    (void) cudaGetLastError();
+                }
+            }
+        }
+#endif
+        vram_ += dhead_bytes;
         hw = dhead_;
         head_rows = (int64_t) vocab.size();
     }
-    if (!bind_raw(embed, hw, head->type(), head_rows, vocab, err)) return false;
-    std::fprintf(stderr, "strata dflash2: %lld-token draft head (%.1f MiB%s), drafter %.0f MiB of VRAM (%s weights)\n", (long long) n_dvocab_,
-                 (double) (n_dvocab_ * row_bytes) / 1048576.0, dhead_shared_ ? ", the MTP drafter's copy, no second one" : "", (double) vram_ / 1048576.0, q4_ ? "Q4_0" : "Q8_0");
+    if (!bind_raw(embed, hw, bind_head_type, head_rows, vocab, err)) return false;
+    std::fprintf(stderr, "strata dflash2: %lld-token draft head%s (%.1f MiB%s), drafter %.0f MiB of VRAM (%s weights)\n", (long long) n_dvocab_,
+                 bind_head_type == GGML_Q4_0 ? " as Q4_0" : "",
+                 (double) (n_dvocab_ * bind_row_bytes) / 1048576.0,
+                 dhead_shared_ ? ", the MTP drafter's copy, no second one" : "",
+                 (double) vram_ / 1048576.0, q4_ ? "Q4_0" : "Q8_0");
     // the pack's selector codebooks as Q4_0 rows (tools/dflash2_pack.py --q4_0-selector; strata_control/drafting.py reads this text from the program to know it can use that pack)
     if (find("candidate_selector.predecessor_codebook").dtype == "q4_0")
         std::fprintf(stderr, "strata dflash2: selector codebooks: Q4_0 rows (about 174 MiB less than bf16)\n");

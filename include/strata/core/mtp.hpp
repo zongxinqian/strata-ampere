@@ -23,6 +23,7 @@
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -77,6 +78,9 @@ public:
     /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
     static bool top2_env();
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
+    float top2_prob(int j) const { return j >= 0 && j < (int) top2_prob_.size() ? top2_prob_[(size_t) j] : 0.0f; }
+    const int32_t* last_top2_ids() const { return top2_.data(); }
+    const float* last_top2_probs() const { return top2_prob_.data(); }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
 
@@ -142,11 +146,14 @@ public:
     /// drafter's K/V holds every accepted cell and its graphs keep max_t() rows.
     bool draft_long(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                     float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr);
+    bool draft_branch(int parent, int32_t b_tok, int64_t p, int a, int b_steps, int32_t* drafts_b,
+                      float* probs_b, int* n_drafts, std::string& err);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     /// STRATA_SPEC_COST: called after each draft step with (index, probability) instead of the `min_p` test; false ends the chain.
     /// Also called once for the last step of a chain that reached its length (so the rule sees every draft). Empty: min_p decides.
     void set_chain_rule(std::function<bool(int, float)> f) { chain_rule_ = std::move(f); }
+    void set_chain_snapshot(std::function<strata::kernels::MtpCondChainRule()> f) { chain_snap_fn_ = std::move(f); }
 
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr);
@@ -160,7 +167,9 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
+    void set_head_peer(int peer_dev) { head_peer_dev_ = peer_dev; }
     std::function<bool(int, float)> chain_rule_;
+    std::function<strata::kernels::MtpCondChainRule()> chain_snap_fn_;
     bool coupled() const { return coupled_active_; }
     /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): this request's drafts are SAMPLED from
     /// q and each draft j's distribution is in spec_q() + j * kSpecQStride (ids, -1 terminated; then float bits),
@@ -240,16 +249,26 @@ private:
     }
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
     /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
-    bool record_front(int T, int row0, cudaStream_t cs, std::string& err);
+    bool record_front(int T, int row0, cudaStream_t cs, std::string& err, bool host_emb = false);
+    void stage_emb_raw(int T, const int32_t* tokens);
     /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
     bool record_rest(int step_row, cudaStream_t cs, std::string& err);
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
+    bool record_round_body(int T, bool coupled, std::string& err);
+    bool record_step_body(int j, bool coupled, std::string& err);
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
+    bool capture_round_cond(int T, int max_steps, bool use_chain, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
+    cudaGraphExec_t cond_round_exec_[9] = {};
+    int cond_steps_[9] = {};
+    bool cond_broken_[9] = {};
+    cudaGraphExec_t cond_chain_exec_[9] = {};
+    int cond_chain_steps_[9] = {};
+    bool cond_chain_broken_[9] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
@@ -279,6 +298,11 @@ private:
     bool q4_ = false, q4_head_ = false;
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
     std::vector<std::pair<std::string, uint64_t>> q4_off_;
+    std::vector<const void*> q4_packed_ptrs_;
+    uint8_t* hc_q8_buf_ = nullptr;
+    std::vector<std::pair<std::string, const uint8_t*>> hc_q8_map_;
+    const uint8_t* hc_q8(const char* name) const;
+    bool make_hc_q8(std::string& err);
     int dhead_type_ = -1;                    ///< the draft head subset's ggml type (the main head's, or Q4_0)
     std::string dvocab_path_;
     std::string vocab_file() const { return dvocab_path_.empty() ? rt_dir_ + "/draft_vocab.bin" : dvocab_path_; }
@@ -288,6 +312,7 @@ private:
     bool make_q4_head(std::string& err);
     void record_top2(int j);
     std::vector<int32_t> top2_, dvocab_host_;
+    std::vector<float> top2_prob_;
     std::vector<float> lg_host_;
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
@@ -331,9 +356,16 @@ private:
     // mapped staging: tokens, step records (2*max_t rows), positions per head (2*max_t rows), the selected row,
     // the drafts out
     int32_t *h_tok_ = nullptr, *m_tok_ = nullptr, *h_step_ = nullptr, *m_step_ = nullptr;
+    uint8_t *h_emb_raw_ = nullptr, *m_emb_raw_ = nullptr;
+    float* emb_raw_d_ = nullptr;
+    size_t emb_row_bytes_ = 0;
+    size_t emb_raw_cap_ = 0;
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
+    float *h_cond_min_p_ = nullptr, *m_cond_min_p_ = nullptr;
+    strata::kernels::MtpCondChainRule *h_cond_chain_ = nullptr, *m_cond_chain_ = nullptr;
+    strata::kernels::MtpCondChainState* cond_chain_st_ = nullptr;
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
@@ -348,6 +380,10 @@ private:
     float rr_margin_ = 0.0f;
     int rr_lo_ = 6, rr_hi_ = 9;
     float* probs_ = nullptr;
+    float* R_save_ = nullptr;
+    float* R_save1_ = nullptr;
+    float* out2_prob_ = nullptr;
+    int32_t* out2_id_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' and row_top_prob_split's partials and counters
     uint8_t* top_scratch_ = nullptr;
     // device
@@ -373,6 +409,34 @@ private:
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;
+
+    // Surgery 6.20: TP2 split draft head across device_ (GPU0) and head_peer_dev_ (GPU1)
+    int head_peer_dev_ = -1;
+    bool tp2_head_ = false;
+    int64_t n_dhead0_ = 0, n_dhead1_ = 0, n_dhead1_pad_ = 0;
+    int tp2_step_ = 0;
+    uint8_t* dhead1_ = nullptr;
+    uint8_t* xq1_ = nullptr;
+    float* head_logits1_ = nullptr;
+    cudaStream_t cs1_ = nullptr;
+    int32_t *tp2_blk0_id_ = nullptr, *tp2_blk1_id_ = nullptr, *tp2_out0_id_ = nullptr;
+    float *tp2_blk0_max_ = nullptr, *tp2_blk1_max_ = nullptr, *tp2_part0_ = nullptr, *tp2_part1_ = nullptr;
+    float *tp2_out0_max_ = nullptr, *tp2_out0_sum_ = nullptr;
+    unsigned int *tp2_ctr0_ = nullptr, *tp2_ctr1_ = nullptr;
+    uint64_t *tp2_d0_round_ = nullptr, *tp2_d1_round_ = nullptr;
+    uint8_t *tp2_xq_h_ = nullptr, *tp2_xq_m0_ = nullptr, *tp2_xq_m1_ = nullptr;
+    strata::kernels::MtpHeadPartial *tp2_hp_h_ = nullptr, *tp2_hp_m0_ = nullptr, *tp2_hp_m1_ = nullptr;
+    uint64_t *tp2_go_h_ = nullptr, *tp2_go_m0_ = nullptr, *tp2_go_m1_ = nullptr;
+    uint64_t *tp2_done_h_ = nullptr, *tp2_done_m0_ = nullptr, *tp2_done_m1_ = nullptr;
+    float *tp2_logits_h_ = nullptr, *tp2_logits_m0_ = nullptr, *tp2_logits_m1_ = nullptr;
+    cudaGraphExec_t tp2_peer_round_exec_ = nullptr, tp2_peer_round_c_exec_ = nullptr;
+    cudaGraphExec_t tp2_peer_step_exec_[9] = {}, tp2_peer_step_c_exec_[9] = {};
+    cudaGraphExec_t tp2_peer_cond_exec_[9] = {};
+    int tp2_peer_cond_steps_[9] = {};
+    bool tp2_peer_cond_broken_[9] = {};
+    bool capture_tp2_peer_round(bool coupled, std::string& err);
+    bool capture_tp2_peer_step(int j, bool coupled, std::string& err);
+    bool capture_tp2_peer_cond(int max_steps, std::string& err);
 };
 
 }  // namespace strata::core

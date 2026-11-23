@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -104,10 +105,15 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
 /// native_q8_0_mmvq calls (keyed by its GGUF-layout device pointer, which stays valid for the prompt path) read the
 /// packed copy instead; every output is bitwise equal to the GGUF-layout kernels.
 bool native_q8_0_packed_enabled();
+bool native_q8_0_in_place_enabled();
 bool native_q8_0_packed_eligible(int n_in, int n_out);
 void native_q8_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out);
 void native_q8_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out);
 void native_q8_0_packed_unregister(const void* gguf_weights);
+void native_q4_0_pack_host(const void* gguf_blocks, void* out, int n_in, int n_out);
+void native_q4_0_packed_register(const void* gguf_weights, const void* packed, int n_in, int n_out);
+void native_q4_0_packed_unregister(const void* gguf_weights);
+bool native_q8_0_packed_lookup(const void* weights, const int8_t*& qs, const uint16_t*& d, int& n_in, int& n_out);
 /// STRATA_Q8_SM60=1 (opt-in, Pascal GP100): every Q8_0 dense matrix is packed as above whatever its shape, and the
 /// Q8_0 decode GEMVs run a kernel written for compute capability 6.0 (q8_sm60.cuh; not bitwise the exact kernels).
 /// native_q8_0_sm60_pack packs a device matrix here (the head) and owns the copy until native_q8_0_sm60_release;

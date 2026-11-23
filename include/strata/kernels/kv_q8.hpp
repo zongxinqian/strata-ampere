@@ -43,4 +43,17 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
                        const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
                        const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream);
 
+struct QsaKvLayers {
+    static constexpr int kMax = 24;
+    int8_t* k_q[kMax] = {};
+    int8_t* v_q[kMax] = {};
+    uint16_t* k_scale[kMax] = {};
+    uint16_t* v_scale[kMax] = {};
+    const int32_t* page_table[kMax] = {};
+    KvHostPools host[kMax] = {};
+};
+/// Tree verify commit: for s = 1 .. *n_keep - 1 where rows_dev[s] != s, copy Q8 KV cell (pos0 + rows_dev[s]) -> (pos0 + s)
+/// in both VRAM pages and host KV pools across all QSA layers.
+void kv_copy_tree_layers(const QsaKvLayers& layers, int n_layers, const int32_t* n_keep,
+                         const int32_t* pos0_i64_words, const int32_t* rows_dev, const QsaShapes& s, void* stream);
 }  // namespace strata::kernels

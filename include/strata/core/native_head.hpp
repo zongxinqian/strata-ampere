@@ -20,6 +20,9 @@ public:
     NativeHead& operator=(const NativeHead&) = delete;
 
     bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    bool load_shard(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out_total,
+                    int64_t row0, int64_t row_count, std::string& err);
+    bool gather_rows_to_device(const int32_t* ids, int64_t count, void* dst_dev, std::string& err) const;
     void unload();
     /// Moves the loaded weights from VRAM to mapped pinned host memory (a card too short for it: every logits row then reads them over PCIe).  False: not loaded, already
     /// on the host, or a repacked layout that stays in VRAM.
@@ -35,6 +38,10 @@ public:
     int device() const { return device_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
+    int n_out() const { return n_out_; }
+    int n_out_total() const { return n_out_total_ > 0 ? n_out_total_ : n_out_; }
+    int row0() const { return row0_; }
+    bool is_sharded() const { return n_out_total_ > 0 && n_out_ < n_out_total_; }
 
 private:
     void* weights_ = nullptr;
@@ -42,6 +49,8 @@ private:
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
+    int n_out_total_ = 0, row0_ = 0;
+    std::vector<std::string> shards_;
     int type_ = -1;
     int device_ = -1;
 };
@@ -65,6 +74,9 @@ public:
     int type() const { return type_; }
     /// The table was placed in VRAM (STRATA_EMBED_VRAM=1, or the pinned / alias fallbacks) rather than mapped.
     bool in_vram() const { return dev_ != nullptr && host_ == nullptr; }
+    const void* host() const { return host_; }
+    size_t row_bytes() const { return row_; }
+    int64_t n_vocab() const { return n_vocab_; }
 
 private:
     void* host_ = nullptr;

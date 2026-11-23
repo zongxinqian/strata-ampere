@@ -67,6 +67,69 @@ int main(int argc, char** argv) {
     CK(cudaMemset(dz, 0, 16));
     cudaStream_t s;
     CK(cudaStreamCreate(&s));
+    {   // Bitwise parity check: native_router_top10_bell vs native_router_top10_multi + doorbell_publish_res_value
+        std::vector<float> lref(8 * NE), wt_ref(8 * KK), wt_new(8 * KK), x_ref(8 * N), x_new(8 * N);
+        std::vector<int32_t> id_ref(8 * KK), id_new(8 * KK), ido_ref(8 * KK), ido_new(8 * KK), res_test(NE);
+        for (auto& v : lref) v = nd(rng);
+        float *dl, *dw1, *dw2, *dx1, *dx2;
+        int32_t *di1, *di2, *do1, *do2, *dr;
+        uint32_t *hs1, *hs2, *ds1, *ds2;
+        CK(cudaMalloc(&dl, 8 * NE * 4)); CK(cudaMemcpy(dl, lref.data(), 8 * NE * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dw1, 8 * KK * 4)); CK(cudaMalloc(&dw2, 8 * KK * 4));
+        CK(cudaMalloc(&di1, 8 * KK * 4)); CK(cudaMalloc(&di2, 8 * KK * 4));
+        CK(cudaMalloc(&do1, 8 * KK * 4)); CK(cudaMalloc(&do2, 8 * KK * 4));
+        CK(cudaMalloc(&dx1, 8 * N * 4)); CK(cudaMalloc(&dx2, 8 * N * 4));
+        CK(cudaMalloc(&dr, NE * 4));
+        CK(cudaHostAlloc(&hs1, 64, cudaHostAllocMapped | cudaHostAllocPortable));
+        CK(cudaHostAlloc(&hs2, 64, cudaHostAllocMapped | cudaHostAllocPortable));
+        CK(cudaHostGetDevicePointer(&ds1, hs1, 0)); CK(cudaHostGetDevicePointer(&ds2, hs2, 0));
+        std::vector<float> xbig(8 * N);
+        for (auto& v : xbig) v = nd(rng);
+        float* dxin; CK(cudaMalloc(&dxin, 8 * N * 4)); CK(cudaMemcpy(dxin, xbig.data(), 8 * N * 4, cudaMemcpyHostToDevice));
+        for (int n_test : {1, 2, 3, 6, 8}) {
+            for (int per_tok : {0, 1}) {
+                for (int mc = 0; mc < 4; ++mc) {
+                    if (mc == 0) std::fill(res_test.begin(), res_test.end(), 0);         // all hit
+                    else if (mc == 1) std::fill(res_test.begin(), res_test.end(), -1);   // all miss
+                    else {                                                                // partial miss
+                        for (int i = 0; i < NE; ++i) res_test[i] = (i & 1) ? 0 : -1;
+                    }
+                    CK(cudaMemcpy(dr, res_test.data(), NE * 4, cudaMemcpyHostToDevice));
+                    CK(cudaMemsetAsync(dx1, 0x5a, n_test * N * 4, s));
+                    CK(cudaMemsetAsync(dx2, 0x5a, n_test * N * 4, s));
+                    *hs1 = 17; *hs2 = 17;
+                    const int32_t* dres_ptr = (mc == 3) ? nullptr : dr;
+                    K::native_router_top10_multi(dl, di1, dw1, n_test, s);
+                    K::doorbell_publish_res_value(dxin, di1, dres_ptr, NE, (int64_t) n_test * N, (int64_t) n_test * KK,
+                                                  dx1, do1, ds1, 42u, s, per_tok ? KK : 0);
+                    K::native_router_top10_bell(dl, di2, dw2, dxin, dres_ptr, N, n_test,
+                                                dx2, do2, ds2, 42u, per_tok != 0, s);
+                    CK(cudaStreamSynchronize(s));
+                    CK(cudaMemcpy(id_ref.data(), di1, n_test * KK * 4, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(id_new.data(), di2, n_test * KK * 4, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(ido_ref.data(), do1, n_test * KK * 4, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(ido_new.data(), do2, n_test * KK * 4, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(wt_ref.data(), dw1, n_test * KK * 4, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(wt_new.data(), dw2, n_test * KK * 4, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(x_ref.data(), dx1, n_test * N * 4, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(x_new.data(), dx2, n_test * N * 4, cudaMemcpyDeviceToHost));
+                    if (*hs1 != *hs2 || *hs1 != 42u ||
+                        std::memcmp(id_ref.data(), id_new.data(), n_test * KK * 4) != 0 ||
+                        std::memcmp(ido_ref.data(), ido_new.data(), n_test * KK * 4) != 0 ||
+                        std::memcmp(wt_ref.data(), wt_new.data(), n_test * KK * 4) != 0 ||
+                        std::memcmp(x_ref.data(), x_new.data(), n_test * N * 4) != 0) {
+                        std::fprintf(stderr, "PARITY FAIL: n=%d per_tok=%d mc=%d seq=(%u,%u)\n",
+                                     n_test, per_tok, mc, *hs1, *hs2);
+                        return 1;
+                    }
+                }
+            }
+        }
+        std::printf("router_top10_bell parity: ALL 40 cases bitwise IDENTICAL\n");
+        cudaFree(dl); cudaFree(dw1); cudaFree(dw2); cudaFree(di1); cudaFree(di2);
+        cudaFree(do1); cudaFree(do2); cudaFree(dx1); cudaFree(dx2); cudaFree(dr); cudaFree(dxin);
+        cudaFreeHost(hs1); cudaFreeHost(hs2);
+    }
     {   // outputs of the router GEMV for several shapes and token counts as FNV hashes: compare across STRATA_MMVF_PF=0/1
         const int shapes[][2] = {{2560, 512}, {2560, 256}, {2560, 64}, {1280, 513}, {640, 100}, {4096, 50}, {2048, 7}, {256, 33}, {8192, 90}};
         for (const auto& sh : shapes) {
@@ -141,16 +204,21 @@ int main(int argc, char** argv) {
         }
     }
     // mode bits: 1 mmvf, 2 route, 4 doorbell, 8 an empty kernel per layer (the node floor)
-    const char* names[] = {"empty node", "mmvf", "route", "mmvf+route", "doorbell", "mmvf+doorbell", "route+doorbell", "mmvf+route+doorbell"};
-    for (int mode = 0; mode < 8; ++mode) {
+    const char* names[] = {"empty node", "mmvf", "route", "mmvf+route", "doorbell", "mmvf+doorbell", "route+doorbell", "mmvf+route+doorbell", "mmvf+route_bell"};
+    for (int mode = 0; mode < 9; ++mode) {
         cudaGraph_t g;
         cudaGraphExec_t ge;
         CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
         for (int l = 0; l < L; ++l) {
             if (mode == 0) K::gpu_stamp((unsigned long long*) dz, 0, s);
             if (mode & 1) K::bf16_gemv_fp32_mmvf_multi(dx, N, dw[l], dlog, NE, N, NE, T, s);
-            if (mode & 2) K::native_router_top10_multi(dlog, dids, dwt, T, s);
-            if (mode & 4) K::doorbell_publish_res(dx, dids, dres, NE, (int64_t) T * N, (int64_t) T * KK, dxo, dids_o, dseq, s);
+            if (mode == 8) {
+                K::bf16_gemv_fp32_mmvf_multi(dx, N, dw[l], dlog, NE, N, NE, T, s);
+                K::native_router_top10_bell(dlog, dids, dwt, dx, dres, N, T, dxo, dids_o, dseq, 0u, true, s);
+            } else {
+                if (mode & 2) K::native_router_top10_multi(dlog, dids, dwt, T, s);
+                if (mode & 4) K::doorbell_publish_res(dx, dids, dres, NE, (int64_t) T * N, (int64_t) T * KK, dxo, dids_o, dseq, s);
+            }
         }
         CK(cudaStreamEndCapture(s, &g));
         CK(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0));

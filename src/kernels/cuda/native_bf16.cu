@@ -214,6 +214,111 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const u
             if (EXACT_T || k < n_tok) y[(size_t) k * ldy + blockIdx.x] = acc[k];
 }
 
+// 1-wave 128-thread kernel for n_in == 2560 on <= 68 SMs (e.g. 512 x 128 fits in 1 wave vs 2 waves at 256t):
+// computes exact thread indices t (0..127) then t+128 (128..255) in two passes so partials[k][0..7] & sum are bit-identical to 256t!
+template <int NT, bool EXACT_T, bool AUX = false>
+__global__ void __launch_bounds__(128) bf16_f32_mmvf_router128_kernel(
+        const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
+        float* __restrict__ y_, int64_t ldy, int n_tok,
+        int n_out = 0, const uint16_t* __restrict__ w_aux = nullptr, float* __restrict__ y_aux = nullptr,
+        int64_t ldy_aux = 0) {
+    float* STRATA_PDL_RESTRICT y = y_;
+    int row_idx = (int) blockIdx.x;
+    if constexpr (AUX) {
+        if (row_idx >= n_out) {
+            w = w_aux;
+            y = y_aux;
+            ldy = ldy_aux;
+            row_idx = 0;
+        }
+    }
+    const int t = threadIdx.x;
+    const uint16_t* row = w + (size_t) row_idx * 2560;
+    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
+    __shared__ float partials[NT][32];
+    if (t < 32) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) partials[k][t] = 0.0f;
+    }
+    __syncthreads();
+    pdl_wait();
+    // Pass 0: pairs t + qq * 256 (threads 0..127 of 256t)
+    {
+        float acc[NT];
+#pragma unroll
+        for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+        uint32_t wv[5];
+        float2 xv[NT][5];
+#pragma unroll
+        for (int qq = 0; qq < 5; ++qq) wv[qq] = __ldg(weights2 + t + qq * 256);
+#pragma unroll
+        for (int qq = 0; qq < 5; ++qq)
+#pragma unroll
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) xv[k][qq] = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + (t + qq * 256));
+#pragma unroll
+        for (int qq = 0; qq < 5; ++qq) {
+            const float w0 = f32_from_bf16((uint16_t) wv[qq]), w1 = f32_from_bf16((uint16_t) (wv[qq] >> 16));
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                if (EXACT_T || k < n_tok) {
+                    acc[k] = __fmaf_rn(w0, xv[k][qq].x, acc[k]);
+                    acc[k] = __fmaf_rn(w1, xv[k][qq].y, acc[k]);
+                }
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < NT; ++k)
+            if (EXACT_T || k < n_tok) acc[k] = mmvf_warp_sum(acc[k]);
+        if ((t & 31) == 0)
+#pragma unroll
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) partials[k][t / 32] = acc[k];
+    }
+    // Pass 1: pairs (t + 128) + qq * 256 (threads 128..255 of 256t)
+    {
+        float acc[NT];
+#pragma unroll
+        for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+        uint32_t wv[5];
+        float2 xv[NT][5];
+#pragma unroll
+        for (int qq = 0; qq < 5; ++qq) wv[qq] = __ldg(weights2 + (t + 128) + qq * 256);
+#pragma unroll
+        for (int qq = 0; qq < 5; ++qq)
+#pragma unroll
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) xv[k][qq] = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + ((t + 128) + qq * 256));
+#pragma unroll
+        for (int qq = 0; qq < 5; ++qq) {
+            const float w0 = f32_from_bf16((uint16_t) wv[qq]), w1 = f32_from_bf16((uint16_t) (wv[qq] >> 16));
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                if (EXACT_T || k < n_tok) {
+                    acc[k] = __fmaf_rn(w0, xv[k][qq].x, acc[k]);
+                    acc[k] = __fmaf_rn(w1, xv[k][qq].y, acc[k]);
+                }
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < NT; ++k)
+            if (EXACT_T || k < n_tok) acc[k] = mmvf_warp_sum(acc[k]);
+        if ((t & 31) == 0)
+#pragma unroll
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) partials[k][4 + t / 32] = acc[k];
+    }
+    __syncthreads();
+    if (t < 32) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k)
+            if (EXACT_T || k < n_tok) {
+                const float s = mmvf_warp_sum(partials[k][t]);
+                if (t == 0) y[(size_t) k * ldy + row_idx] = s;
+            }
+    }
+}
+
 // S25 (STRATA_MMVF_ROWS=1): RPB output rows per block. Each block read its row's weights once but all T activation
 // rows again (n_out blocks x T x n_in floats through L2 - the part that grew with T); here a block reads the
 // activations once for RPB rows. Per output, thread t still walks pairs t, t + BLOCK_SIZE, ... with the same two
@@ -388,6 +493,33 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream) {
     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+    static const bool use_1wave = [] {
+        const char* v = std::getenv("STRATA_MMVF_1WAVE");
+        return v == nullptr || v[0] != '0';
+    }();
+    static const bool use_1wave_aux = [] {
+        const char* v = std::getenv("STRATA_MMVF_1WAVE_AUX");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (!rows && use_1wave && use_1wave_aux && n_in == 2560 && n_out >= 128 && n_tok >= 2 && n_tok <= 8 &&
+        (ldx & 1) == 0 && x != nullptr && w != nullptr && y != nullptr && w_aux != nullptr && y_aux != nullptr &&
+        (reinterpret_cast<uintptr_t>(x) & 7u) == 0 && mmvf_fast() == 1) {
+        const cudaStream_t st = (cudaStream_t) stream;
+        const int no = (int) n_out;
+        const unsigned nb = (unsigned) (no + 1);
+        switch (n_tok) {
+            case 2: launch_pdl(bf16_f32_mmvf_router128_kernel<2, true, true>, dim3(nb), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, no, w_aux, y_aux, ldy_aux); break;
+            case 3: launch_pdl(bf16_f32_mmvf_router128_kernel<3, true, true>, dim3(nb), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, no, w_aux, y_aux, ldy_aux); break;
+            case 4: launch_pdl(bf16_f32_mmvf_router128_kernel<4, true, true>, dim3(nb), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, no, w_aux, y_aux, ldy_aux); break;
+            case 5: launch_pdl(bf16_f32_mmvf_router128_kernel<5, true, true>, dim3(nb), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, no, w_aux, y_aux, ldy_aux); break;
+            case 6: launch_pdl(bf16_f32_mmvf_router128_kernel<6, true, true>, dim3(nb), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, no, w_aux, y_aux, ldy_aux); break;
+            default: launch_pdl(bf16_f32_mmvf_router128_kernel<8, false, true>, dim3(nb), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, no, w_aux, y_aux, ldy_aux); break;
+        }
+        const cudaError_t result = cudaGetLastError();
+        if (result != cudaSuccess)
+            throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi_aux launch: ") + cudaGetErrorString(result));
+        return true;
+    }
     // exactly the conditions under which both calls would take the rows / multi kernels at the same block size
     if (!rows || n_out < 64 || n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
@@ -429,6 +561,25 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             case 192: launch_rows<192>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
             case 224: launch_rows<224>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
             default: launch_rows<256>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+        }
+        const cudaError_t result = cudaGetLastError();
+        if (result != cudaSuccess)
+            throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
+        return;
+    }
+    static const bool use_1wave = [] {
+        const char* v = std::getenv("STRATA_MMVF_1WAVE");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (use_1wave && n_in == 2560 && n_out >= 128 && n_tok <= 8 && mmvf_fast() == 1) {
+        switch (n_tok) {
+            case 1: launch_pdl(bf16_f32_mmvf_router128_kernel<1, true>, dim3((unsigned) n_out), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, 0, (const uint16_t*) nullptr, (float*) nullptr, (int64_t) 0); break;
+            case 2: launch_pdl(bf16_f32_mmvf_router128_kernel<2, true>, dim3((unsigned) n_out), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, 0, (const uint16_t*) nullptr, (float*) nullptr, (int64_t) 0); break;
+            case 3: launch_pdl(bf16_f32_mmvf_router128_kernel<3, true>, dim3((unsigned) n_out), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, 0, (const uint16_t*) nullptr, (float*) nullptr, (int64_t) 0); break;
+            case 4: launch_pdl(bf16_f32_mmvf_router128_kernel<4, true>, dim3((unsigned) n_out), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, 0, (const uint16_t*) nullptr, (float*) nullptr, (int64_t) 0); break;
+            case 5: launch_pdl(bf16_f32_mmvf_router128_kernel<5, true>, dim3((unsigned) n_out), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, 0, (const uint16_t*) nullptr, (float*) nullptr, (int64_t) 0); break;
+            case 6: launch_pdl(bf16_f32_mmvf_router128_kernel<6, true>, dim3((unsigned) n_out), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, 0, (const uint16_t*) nullptr, (float*) nullptr, (int64_t) 0); break;
+            default: launch_pdl(bf16_f32_mmvf_router128_kernel<8, false>, dim3((unsigned) n_out), dim3(128), 0, st, x, ldx, w, y, ldy, n_tok, 0, (const uint16_t*) nullptr, (float*) nullptr, (int64_t) 0); break;
         }
         const cudaError_t result = cudaGetLastError();
         if (result != cudaSuccess)

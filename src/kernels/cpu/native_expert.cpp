@@ -257,7 +257,7 @@ bool iq256_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
 }
 
-bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
+bool kq256_supported(int type) noexcept { return type == 12 || type == 13 || type == 7 || type == 8; }
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
@@ -436,6 +436,16 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act).from_float(h, dst, f.n_ff);
 }
 
+bool native_quant_h_fusable(const NativeFmt& f) noexcept {
+    return !f.had_d && !q2_native_kernels(f.gu_type) && !q2_native_kernels(f.d_type) &&
+           (f.n_ff % 32 == 0) && pq::blck_size_of(f.d_act) == 32 && !act_dump().on;
+}
+
+void native_quant_h_slice(const NativeFmt& f, const float* h, void* dst, int r0, int r1) {
+    const size_t bb = pq::type_size_of(f.d_act);
+    pq::traits(f.d_act).from_float(h + r0, static_cast<uint8_t*>(dst) + (size_t) (r0 / 32) * bb, r1 - r0);
+}
+
 int native_gu_mt_min(int gu_type) {
     // #152: from how many tokens the multi-token kernels run (ggml's vec_dot below that).  The default 2 is the
     // measured-fastest rule, but a token's expert rows then round differently alone than in a group, so greedy output
@@ -555,10 +565,15 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
-    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
-    // KQ matches the ggml AVX2/FMA dot; other builds keep their own singleton arithmetic.
-    if (kq && f.gu_type == 12 && nt >= 2 &&
-        (Arithmetic == NativeArithmetic::Default || (flavour_avx2()))) {   // one token: ggml's own dot below (the same bits, less overhead)
+    static const bool kq = [] {
+        const char* no = std::getenv("STRATA_NO_KQ256");
+        if (no != nullptr && std::atoi(no) != 0) return false;
+        const char* v = std::getenv("STRATA_KQ256");
+        return cpu_avx2_ok() && (v == nullptr || std::atoi(v) != 0);
+    }();
+    // KQ matches the ggml AVX2/FMA dot for Q4_K / Q5_K (nt >= 1); other builds keep their own singleton arithmetic.
+    if (kq && (f.gu_type == 12 || f.gu_type == 13) && nt >= 1 &&
+        (Arithmetic == NativeArithmetic::Default || (flavour_avx2()))) {
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
@@ -648,7 +663,12 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
-    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool kq = [] {
+        const char* no = std::getenv("STRATA_NO_KQ256");
+        if (no != nullptr && std::atoi(no) != 0) return false;
+        const char* v = std::getenv("STRATA_KQ256");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.
@@ -656,7 +676,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8) &&
+    if (cpu_avx2_ok() && kq && nt >= 1 && (f.d_type == 7 || f.d_type == 8) &&
         (Arithmetic == NativeArithmetic::Default || (flavour_avx2()))) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

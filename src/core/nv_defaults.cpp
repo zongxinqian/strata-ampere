@@ -43,6 +43,7 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_GU_SWIGLU", "1"},           // -0.8, -1.4
             {"STRATA_QSA_ROWS", "1"},            // -0.5, -1.2
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
+            {"STRATA_SMALL_UNR", "3"},           // bitwise BF16 router + GDN a/b constant-trip unroll
         };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;

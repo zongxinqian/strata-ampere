@@ -16,6 +16,7 @@
 
 #include "strata/kernels/window_limits.hpp"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels {
@@ -34,9 +35,11 @@ inline constexpr int kVerifyLongT = kVerifyMaxT > kVerifyNarrowT ? kVerifyMaxT :
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise
 /// `fused_gdn_conv_l2` per token.
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
-                       int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0, bool commit = false);
+                       int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0, bool commit = false,
+                       int tree_fork = 0, int tree_parent = 0);
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
-void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
+void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream,
+                     const int32_t* rows_dev = nullptr);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
 /// gdn_conv_l2_multi and gdn_ab_multi in one launch (143-amdk)
 void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
@@ -64,7 +67,8 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
                           void* stream);
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+                         const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr,
+                         int tree_fork = 0, int tree_parent = 0, const int32_t* rows_dev = nullptr);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as
@@ -73,7 +77,8 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// state-only kernel (STRATA_GDN_SPLIT=1, STRATA_GDN_COMMIT_SPLIT=0, STRATA_DBG_GDN=1): the caller then keeps the loop.
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
-                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream);
+                       int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream,
+                       const int32_t* rows_dev = nullptr);
 /// (xq_out, S26 STRATA_QFUSE: also write the q8_1 image of output rows [t_out_begin, n_tok) there - the bytes
 /// native_quantize_q8_1(y + t_out_begin * value_dim, xq_out, value_dim, n_tok - t_out_begin) would write.)
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
@@ -119,6 +124,12 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
+/// TP2 partial residency: builds `res_self` groups (`counts[0], start, dst, tok, ptr`), sets `counts[1] = nhits0`,
+/// appends `res_peer` hits to `dst[nhits0..nhits0+nhits1)`, sets `counts[3] = nhits0 + nhits1`, and sets
+/// `*skip = (nhits0 + nhits1 == n_entries) ? ring : 0` when `skip != nullptr`. `res_peer` may be null (GPU1).
+void tp2_resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_self, const int32_t* res_peer,
+                       int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+                       int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
@@ -169,7 +180,50 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 /// row = *row_dev (device memory).  `out` may be mapped host memory.
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs = nullptr,
-                float* out_p = nullptr);
+                float* out_p = nullptr, const int32_t* tok2_in = nullptr, const float* prob2_in = nullptr,
+                int out2_off = 0, float* R_save = nullptr);
+void mtp_branch_prep(float* dst_R, const float* src_R, int64_t hcn, int32_t* dst_tok, int32_t tok_val, void* stream);
+uint64_t argmax_top2_prob_scratch_bytes();
+void argmax_top2_prob(const float* logits, int n_vocab, void* scratch, int32_t* out1, float* prob1,
+                      int32_t* out2, float* prob2, void* stream, const int32_t* row_dev = nullptr);
+void qsa_tree_idx_snap(const int32_t* step0, const float* tail, const float* dead, const float* pooled,
+                       const int32_t* block_pos, int64_t max_blocks, int idx_dim, int idx_block,
+                       float* snap, void* stream);
+void qsa_tree_idx_restore(const int32_t* step0, float* tail, float* dead, float* pooled,
+                          int32_t* block_pos, int64_t max_blocks, int idx_dim, int idx_block,
+                          const float* snap, void* stream);
+void qsa_tree_remap_sel(int32_t* sel_b, int n_entries, const int32_t* step0, int fork, int parent,
+                        int n_b, void* stream);
+void copy_tree_R_rows(float* R, int64_t hcn, const int32_t* n_keep, const int32_t* rows_dev, void* stream);
+/// Conditional MTP graph gate: sets conditional handle to 1 when probs[*row_dev] >= *min_p_ptr, else 0 (writing -2 to out_mapped[step_idx + 1] if non-null).
+void mtp_cond_gate(const float* probs, const int32_t* row_dev, const float* min_p_ptr,
+                   unsigned long long handle, void* stream,
+                   int32_t* out_mapped = nullptr, int step_idx = 0);
+struct MtpCondChainRule {
+    double pa_ok[8];
+    double pa_n[8];
+    double pa_ok_d1[8];
+    double pa_n_d1[8];
+    double cost_ms[9];
+    uint8_t probe_ok[9];
+    uint8_t stale[9];
+    double margin;
+    int cap;
+    uint8_t robust;
+    double r_op;
+    double opt0;
+    uint8_t no_hiconf;
+    uint8_t depth_cal;
+};
+struct MtpCondChainState {
+    double q;
+    double e;
+    double best_v;
+    int best_rows;
+};
+void mtp_cond_gate_chain(const float* probs, const int32_t* row_dev, const MtpCondChainRule* rule,
+                         MtpCondChainState* state, int step_idx, int32_t* out_mapped,
+                         unsigned long long handle, void* stream);
 /// --pipeline-windows, the drafter's chain teacher forced: `*tok = force[j]` when force[j] >= 0 (`force` is mapped
 /// host memory, read when the kernel runs), else `*tok` is left as it is.
 void force_token(int32_t* tok, const int32_t* force, int j, void* stream);
@@ -187,13 +241,53 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 /// -inf): bitwise sample_tokens' greedy pick.  Up to 128 blocks a row scan slices of it, the row's last block merges
 /// their picks.  `scratch`: argmax_rows_scratch_bytes(n_rows), zero before the first launch (each launch leaves it
 /// so).  Graph-capturable.
+struct ArgHalf {
+    float v;
+    int32_t i;
+};
 uint64_t argmax_rows_scratch_bytes(int n_rows);
 void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream);
+void argmax_rows_val(const float* logits, int n_rows, int n, int row_offset, void* scratch, ArgHalf* out_half, void* stream);
+void publish_argmax_half(const ArgHalf* dev_half, ArgHalf* mapped_half, uint32_t* mapped_flag, int n_rows, void* stream);
+void merge_argmax_half(const ArgHalf* dev_half0, const ArgHalf* mapped_half1, const uint32_t* mapped_flag1, int n_rows,
+                       int32_t* out, void* stream);
 /// row_top_prob over 8 blocks a row, each computing 4 of its 32 warps' sums, the row's last block adding the 32 in
 /// order: bitwise row_top_prob.  `scratch`: row_top_prob_scratch_bytes(n_rows), zero before the first launch.
 uint64_t row_top_prob_scratch_bytes(int n_rows);
 void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* scratch,
                         void* stream);
+/// Surgery 6.20: TP2 sharded MTP draft head across GPU0 + GPU1 (mapped pinned host sync, zero P2P required).
+struct MtpHeadPartial {
+    int32_t id;
+    float maxv;
+    float sumexp;
+    int32_t id2;
+    float maxv2;
+};
+void mtp_tp2_bump_round(uint64_t* d_round, void* stream);
+void mtp_tp2_publish_x(const uint8_t* xq_src, uint8_t* mapped_xq, uint64_t* mapped_go,
+                       uint64_t* d_round, uint32_t step_j, std::size_t n_bytes, void* stream,
+                       bool bump_round = false);
+void mtp_tp2_abort_peer(const uint64_t* d_round, uint64_t* mapped_go, void* stream);
+void mtp_tp2_peer_wait(const uint64_t* mapped_go, const uint8_t* mapped_xq, uint8_t* xq_dst,
+                       uint64_t* d_round, uint32_t step_j, std::size_t n_bytes,
+                       unsigned long long cond_handle, void* stream);
+void mtp_tp2_head_argmax_sumexp(const float* logits, int n, int row_offset,
+                                int32_t* blk_id, float* blk_max, float* partials, unsigned int* ctr,
+                                int32_t* out_id, float* out_max, float* out_sum,
+                                MtpHeadPartial* mapped_hp, uint64_t* mapped_done,
+                                const uint64_t* d_round, uint32_t step_j, void* stream,
+                                int32_t* out2_id = nullptr, float* out2_max = nullptr);
+void mtp_tp2_merge_head(const int32_t* id0, const float* max0, const float* sum0,
+                        const MtpHeadPartial* mapped_hp, const uint64_t* mapped_done,
+                        const uint64_t* d_round, uint32_t step_j,
+                        int32_t* out_id, float* out_prob, void* stream,
+                        int32_t* out2_id = nullptr, float* out2_prob = nullptr,
+                        const int32_t* dvocab = nullptr);
+void mtp_tp2_peer_copy_logits(const float* logits1, float* mapped_logits, uint64_t* mapped_done,
+                              const uint64_t* d_round, uint32_t step_j, int n, unsigned int* ctr, void* stream);
+void mtp_tp2_merge_logits(const float* mapped_logits, float* logits_dst, const uint64_t* mapped_done,
+                          const uint64_t* d_round, uint32_t step_j, int n, void* stream);
 /// #879 guard: flags[t * kNonfiniteBlocks + b] = 1 when slice b of row t (n floats a row) holds a NaN or an infinity,
 /// else 0, for n_rows rows.  Every word is written on every launch (nothing to clear between windows), so `flags` can
 /// be mapped host memory read after the window's own sync.  Graph-capturable; CUDA and HIP.

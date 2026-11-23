@@ -40,6 +40,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
 /// calls with the history advanced after each; it also writes `snap` (T x 9 x 10240): the history after each token,
 /// as the per-token path's copies leave it for the commit.
 void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
-                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream);
+                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream,
+                                   int tree_fork = 0, int tree_parent = 0);
 
 } // namespace strata::kernels

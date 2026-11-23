@@ -247,7 +247,8 @@ __global__ void copy_rows_from_mapped_kernel(float4* __restrict__ dst, const vol
         }
         int h = 0;
         const int c = *count;
-        for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
+        if (c >= (int) gridDim.x) h = 1;
+        else for (int i = 0; i < c; ++i) h |= hit_rows[i] == row;
         hit = h;
     }
     __syncthreads();
@@ -328,7 +329,61 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
 
 __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                             const int32_t* __restrict__ d_res, int n_expert, int n, int k,
-                                            float* x_out, int32_t* ids_out, uint32_t* seq) {
+                                            float* x_out, int32_t* ids_out, uint32_t* seq, uint32_t value, int k_tok) {
+    if (k_tok > 0 && k > 0 && (k % k_tok) == 0 && (k / k_tok) <= 32 && (n % (k / k_tok)) == 0) {
+        __shared__ uint32_t tok_mask;
+        if (threadIdx.x == 0) tok_mask = 0u;
+        __syncthreads();
+        if ((int) threadIdx.x < k) {
+            const int32_t id = ids[threadIdx.x];
+            ids_out[threadIdx.x] = id;
+            if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0)
+                atomicOr(&tok_mask, 1u << ((int) threadIdx.x / k_tok));
+        }
+        __syncthreads();
+        const uint32_t mask = tok_mask;
+        if (mask != 0u) {
+            const int n_tok = k / k_tok;
+            const int per = n / n_tok;
+            const uint32_t full = n_tok == 32 ? 0xffffffffu : ((1u << n_tok) - 1u);
+            const bool aligned4 = ((((uintptr_t) x | (uintptr_t) x_out) & 15u) == 0) && ((per & 3) == 0);
+            if (mask == full) {
+                if (aligned4) {
+                    const int n4 = n >> 2;
+                    const float4* __restrict__ x4 = reinterpret_cast<const float4*>(x);
+                    float4* __restrict__ o4 = reinterpret_cast<float4*>(x_out);
+                    for (int i = threadIdx.x; i < n4; i += blockDim.x) o4[i] = x4[i];
+                } else {
+                    for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+                }
+            } else {
+                for (int t = 0; t < n_tok; ++t) {
+                    if (((mask >> t) & 1u) == 0u) continue;
+                    const float* xt = x + (size_t) t * per;
+                    float* ot = x_out + (size_t) t * per;
+                    if (aligned4) {
+                        const int p4 = per >> 2;
+                        const float4* __restrict__ x4 = reinterpret_cast<const float4*>(xt);
+                        float4* __restrict__ o4 = reinterpret_cast<float4*>(ot);
+                        for (int i = threadIdx.x; i < p4; i += blockDim.x) o4[i] = x4[i];
+                    } else {
+                        for (int i = threadIdx.x; i < per; i += blockDim.x) ot[i] = xt[i];
+                    }
+                }
+            }
+            __threadfence_system();
+        } else if ((int) threadIdx.x < k) {
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            *(volatile uint32_t*) seq = value != 0u ? value : (*(volatile uint32_t*) seq + 1u);
+#if defined(__HIPCC__)
+            __threadfence_system();
+#endif
+        }
+        return;
+    }
     int any_miss = 0;
     if ((int) threadIdx.x < k) {
         const int32_t id = ids[threadIdx.x];
@@ -336,14 +391,21 @@ __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const i
         if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) any_miss = 1;
     }
     if (__syncthreads_or(any_miss)) {
-        for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+        if ((((uintptr_t) x | (uintptr_t) x_out) & 15u) == 0 && (n & 3) == 0) {
+            const int n4 = n >> 2;
+            const float4* __restrict__ x4 = reinterpret_cast<const float4*>(x);
+            float4* __restrict__ o4 = reinterpret_cast<float4*>(x_out);
+            for (int i = threadIdx.x; i < n4; i += blockDim.x) o4[i] = x4[i];
+        } else {
+            for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+        }
         __threadfence_system();
     } else if ((int) threadIdx.x < k) {
         __threadfence_system();
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+        *(volatile uint32_t*) seq = value != 0u ? value : (*(volatile uint32_t*) seq + 1u);
 #if defined(__HIPCC__)  // #697: HIP only; on RDNA4 the volatile store alone can sit in L2 until the stream syncs
         __threadfence_system();
 #endif
@@ -384,9 +446,15 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
                           float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
+    doorbell_publish_res_value(x, ids, d_res, n_expert, n, k, x_out, ids_out, d_seq, 0u, stream);
+}
+
+void doorbell_publish_res_value(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
+                                float* x_out, int32_t* ids_out, uint32_t* d_seq, uint32_t value, void* stream,
+                                int k_tok) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
     doorbell_publish_res_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, d_res, n_expert, (int) n, (int) k,
-                                                                        x_out, ids_out, d_seq);
+                                                                        x_out, ids_out, d_seq, value, k_tok);
     check_launch("doorbell_publish_res");
 }
 

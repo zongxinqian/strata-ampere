@@ -226,4 +226,92 @@ void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_s
     check("kv_gather_q8 launch");
 }
 
+
+namespace {
+__global__ void kv_copy_tree_layers_kernel(QsaKvLayers layers, int n_layers, const int32_t* __restrict__ n_keep,
+                                           const int32_t* __restrict__ pos0_words, const int32_t* __restrict__ rows_dev,
+                                           int kv_heads, int head_dim, int page_size) {
+    const int nk = *n_keep;
+    if (nk <= 1) return;
+    bool need = false;
+    for (int s = 1; s < nk; ++s) {
+        if (rows_dev[s] != s) { need = true; break; }
+    }
+    if (!need) return;
+
+    const int layer = (int) blockIdx.z;
+    if (layer >= n_layers) return;
+    const int64_t pos0 = (int64_t) ((uint64_t) (uint32_t) pos0_words[0] | ((uint64_t) (uint32_t) pos0_words[1] << 32));
+    const int idx = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = kv_heads * head_dim;
+    if (idx >= total) return;
+    const int h = idx / head_dim;
+    const int e = idx - h * head_dim;
+    const int groups = head_dim / KV_Q8_GROUP;
+    const bool is_scale_owner = (e % KV_Q8_GROUP) == 0;
+    const int g = e / KV_Q8_GROUP;
+
+    int8_t* const dkq = layers.k_q[layer];
+    int8_t* const dvq = layers.v_q[layer];
+    uint16_t* const dks = layers.k_scale[layer];
+    uint16_t* const dvs = layers.v_scale[layer];
+    const int32_t* const pt = layers.page_table[layer];
+    const KvHostPools hp = layers.host[layer];
+
+    for (int s = 1; s < nk; ++s) {
+        const int src_step = rows_dev[s];
+        if (src_step == s) continue;
+        const long long p_dst = pos0 + (long long) s;
+        const long long p_src = pos0 + (long long) src_step;
+        const long long hrow_d = ((p_dst / page_size) * kv_heads + h) * page_size + (p_dst % page_size);
+        const long long hrow_s = ((p_src / page_size) * kv_heads + h) * page_size + (p_src % page_size);
+
+        if (hp.k_q != nullptr) {
+            hp.k_q[hrow_d * head_dim + e] = hp.k_q[hrow_s * head_dim + e];
+            hp.v_q[hrow_d * head_dim + e] = hp.v_q[hrow_s * head_dim + e];
+            if (is_scale_owner) {
+                hp.k_scale[hrow_d * groups + g] = hp.k_scale[hrow_s * groups + g];
+                hp.v_scale[hrow_d * groups + g] = hp.v_scale[hrow_s * groups + g];
+            }
+        }
+        const long long page_d = pt ? (long long) pt[p_dst / page_size] : -1;
+        if (page_d >= 0) {
+            const long long page_s = pt ? (long long) pt[p_src / page_size] : -1;
+            const long long row_d = (page_d * kv_heads + h) * page_size + (p_dst % page_size);
+            if (page_s >= 0) {
+                const long long row_s = (page_s * kv_heads + h) * page_size + (p_src % page_size);
+                dkq[row_d * head_dim + e] = dkq[row_s * head_dim + e];
+                dvq[row_d * head_dim + e] = dvq[row_s * head_dim + e];
+                if (is_scale_owner) {
+                    dks[row_d * groups + g] = dks[row_s * groups + g];
+                    dvs[row_d * groups + g] = dvs[row_s * groups + g];
+                }
+            } else if (hp.k_q != nullptr) {
+                dkq[row_d * head_dim + e] = hp.k_q[hrow_s * head_dim + e];
+                dvq[row_d * head_dim + e] = hp.v_q[hrow_s * head_dim + e];
+                if (is_scale_owner) {
+                    dks[row_d * groups + g] = hp.k_scale[hrow_s * groups + g];
+                    dvs[row_d * groups + g] = hp.v_scale[hrow_s * groups + g];
+                }
+            }
+        }
+    }
+}
+}  // namespace
+
+void kv_copy_tree_layers(const QsaKvLayers& layers, int n_layers, const int32_t* n_keep,
+                         const int32_t* pos0_i64_words, const int32_t* rows_dev, const QsaShapes& s, void* stream) {
+    if (n_layers <= 0) return;
+    if (n_layers > QsaKvLayers::kMax || !n_keep || !pos0_i64_words || !rows_dev) {
+        std::fprintf(stderr, "kv_copy_tree_layers: invalid arguments\n");
+        std::exit(1);
+    }
+    const int total = (int) s.n_head_kv * (int) s.head_dim;
+    const int threads = 256;
+    const dim3 grid((unsigned) ((total + threads - 1) / threads), 1u, (unsigned) n_layers);
+    kv_copy_tree_layers_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(
+        layers, n_layers, n_keep, pos0_i64_words, rows_dev, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size);
+}
+
 }  // namespace strata::kernels
+

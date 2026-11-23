@@ -460,9 +460,13 @@ int check_tables() {
         }
     }
     if (native_mmvq_il_rows_for(89, 99, 2, 2560) != 0 || native_mmvq_il_rows_for(89, 12, 5, 2560) != 0 ||
-        native_mmvq_il_rows_for(86, 12, 5, 2560) != 0 || native_mmvq_il_rows_for(120, 12, 9, 2560) != 0) {
+        native_mmvq_il_rows_for(120, 12, 9, 2560) != 0) {
         ++bad;
         std::printf("FAIL table: an unknown type or ncols must be 0\n");
+    }
+    if (native_mmvq_il_rows_for(86, 12, 5, 2560) == 0) {
+        ++bad;
+        std::printf("FAIL table: sm_86 Q5_K ncols=5 must be enabled\n");
     }
     return bad;
 }

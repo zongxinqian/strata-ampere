@@ -154,16 +154,23 @@ __global__ void broadcast_batch_kernel(const float* value, const float* gate, fl
     const size_t t = i / D, d = i % D;
     gated[i] = __fmul_rn(value[t * N + d % N], gate[t * H + d / N]);
 }
+__device__ __forceinline__ int ple_tree_back(int t, int back, int fork, int parent) {
+    if (fork <= 0) return t - back;
+    int cur = t;
+    for (int s = 0; s < back; ++s) cur = (cur == fork) ? parent : (cur - 1);
+    return cur;
+}
 // the dilated conv (taps 9, 6, 3 tokens back and this one) and the residual; a tap before the chunk reads the history
+template <bool TREE>
 __global__ void conv_residual_batch_kernel(const float* history, const float* normalized, const uint16_t* weights,
-                                           float* hidden, const float* gated, int T) {
+                                           float* hidden, const float* gated, int T, int fork, int parent) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(T) * D) return;
     const int t = int(i / D), c = int(i % D);
     float sum = 0;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const int p = t - 9 + 3 * k;             // the token this tap reads (k == 3: this one)
+        const int p = TREE ? ple_tree_back(t, 9 - 3 * k, fork, parent) : (t - 9 + 3 * k);
         const float x = p >= 0 ? normalized[size_t(p) * D + c] : history[size_t(c) * HISTORY + (9 + p)];
         const float wk = __half2float(__ushort_as_half(weights[c * 4 + k]));
         const float term = __fmul_rn(x, wk);
@@ -188,7 +195,9 @@ __global__ void history_batch_kernel(float* history, const float* normalized, in
 
 // history_batch_kernel that also writes the history after each of the T tokens (`snap`, T x 9 x 10240): pure copies,
 // the values T history advances (ple_history_advance) leave
-__global__ void history_batch_snap_kernel(float* history, const float* normalized, int T, float* snap) {
+template <bool TREE>
+__global__ void history_batch_snap_kernel(float* history, const float* normalized, int T, float* snap,
+                                          int fork, int parent) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= D) return;
     float h0[HISTORY];
@@ -198,14 +207,14 @@ __global__ void history_batch_snap_kernel(float* history, const float* normalize
         float* out = snap + size_t(t) * HISTORY * D + size_t(c) * HISTORY;
 #pragma unroll
         for (int r = 0; r < HISTORY; ++r) {
-            const int p = r + t + 1 - HISTORY;      // after t + 1 advances row r holds token p, or an older row
-            out[r] = p >= 0 ? normalized[size_t(p) * D + c] : h0[r + t + 1];
+            const int p = TREE ? ple_tree_back(t, HISTORY - 1 - r, fork, parent) : (r + t + 1 - HISTORY);
+            out[r] = p >= 0 ? normalized[size_t(p) * D + c] : h0[HISTORY + p];
         }
     }
 #pragma unroll
     for (int r = 0; r < HISTORY; ++r) {
-        const int p = r + T - HISTORY;
-        history[size_t(c) * HISTORY + r] = p >= 0 ? normalized[size_t(p) * D + c] : h0[r + T];
+        const int p = TREE ? ple_tree_back(T - 1, HISTORY - 1 - r, fork, parent) : (r + T - HISTORY);
+        history[size_t(c) * HISTORY + r] = p >= 0 ? normalized[size_t(p) * D + c] : h0[HISTORY + p];
     }
 }
 
@@ -267,13 +276,14 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     gate_kernel<<<rows, 512, 0, st>>>(key, query_norm, gate, 1.0f / std::sqrt(float(N)));
     broadcast_batch_kernel<<<blocks, 256, 0, st>>>(value, gate, gated, T);
     rms_rep_kernel<<<rows, 1024, 0, st>>>(gated, w.norm_conv, query_norm);
-    conv_residual_batch_kernel<<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T);
+    conv_residual_batch_kernel<false><<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T, 0, 0);
     history_batch_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T);
     launch_check();
 }
 
 void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
-                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream) {
+                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream,
+                                   int tree_fork, int tree_parent) {
     if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate || !snap)
         throw std::invalid_argument("native PLE postops batch (snapshots): null input or empty batch");
     auto st = static_cast<cudaStream_t>(stream);
@@ -284,8 +294,13 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
     gate_kernel<<<rows, 512, 0, st>>>(key, query_norm, gate, 1.0f / std::sqrt(float(N)));
     broadcast_batch_kernel<<<blocks, 256, 0, st>>>(value, gate, gated, T);
     rms_rep_rt_kernel<<<rows, 1024, 0, st>>>(gated, w.norm_conv, query_norm, N, NG_RMS_EPS);
-    conv_residual_batch_kernel<<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T);
-    history_batch_snap_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T, snap);
+    if (tree_fork > 0) {
+        conv_residual_batch_kernel<true><<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T, tree_fork, tree_parent);
+        history_batch_snap_kernel<true><<<D / 256, 256, 0, st>>>(history, query_norm, T, snap, tree_fork, tree_parent);
+    } else {
+        conv_residual_batch_kernel<false><<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T, 0, 0);
+        history_batch_snap_kernel<false><<<D / 256, 256, 0, st>>>(history, query_norm, T, snap, 0, 0);
+    }
     launch_check();
 }
 } // namespace strata::kernels

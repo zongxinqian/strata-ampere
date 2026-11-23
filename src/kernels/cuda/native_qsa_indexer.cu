@@ -53,14 +53,16 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
-                        const int32_t* __restrict__ mtab, const RopeTab& rt) {
+                        const int32_t* __restrict__ mtab, const RopeTab& rt,
+                        const int32_t* __restrict__ rows_dev = nullptr) {
     __shared__ float values[D];
     __shared__ float partials[32];
     const int d = threadIdx.x;
     for (int step_idx = 0; step_idx < n_steps; ++step_idx) {
         const int pos = pos_dev[(std::size_t) step_idx * pos_stride];
         if (pos >= 0 && pos < max_cells) {
-            const float* raw_step = raw + (std::size_t) step_idx * D;
+            const int row_s = rows_dev ? rows_dev[step_idx] : step_idx;
+            const float* raw_step = raw + (std::size_t) row_s * D;
             const int slot = pos % R;
             float incoming = 0.0f;
             if (d < D) {
@@ -124,9 +126,9 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
-                        const int32_t* __restrict__ mtab, RopeTab rt) {
+                        const int32_t* __restrict__ mtab, RopeTab rt, const int32_t* __restrict__ rows_dev) {
     append_body<TAB>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
-                     theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
+                     theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt, rows_dev);
 }
 // engine-latency: the commit's appends of several QSA layers in one launch, one block per layer (blockIdx.x); each block
 // first restores its layer's tail from the window's snapshot (the commit's copy_from_mapped), then runs append's body
@@ -134,7 +136,7 @@ template <bool TAB>
 __global__ void append_layers(const float* __restrict__ raw0, long long raw_stride, const int32_t* __restrict__ pos_dev,
                               int pos_stride, int n_steps, int pos_base, float epsilon, QsaIndexerLayers L, int max_cells,
                               float theta_scale, float freq_scale, float corr_low, float corr_high, float ext_factor,
-                              float mscale, const int32_t* __restrict__ mtab, RopeTab rt) {
+                              float mscale, const int32_t* __restrict__ mtab, RopeTab rt, const int32_t* __restrict__ rows_dev) {
     const int i = blockIdx.x;
     float* tail = L.tail[i];
     if (L.tail_src[i] != nullptr) {
@@ -143,7 +145,7 @@ __global__ void append_layers(const float* __restrict__ raw0, long long raw_stri
     }
     append_body<TAB>(raw0 + (long long) i * raw_stride, pos_dev, pos_stride, n_steps, pos_base, L.gamma[i], epsilon, tail,
                      L.dead[i], L.pooled[i], L.block_pos[i], max_cells, theta_scale, freq_scale, corr_low, corr_high,
-                     ext_factor, mscale, mtab, rt);
+                     ext_factor, mscale, mtab, rt, rows_dev);
 }
 // ---- C-2: the batched append.  The pooled key of a completed block b (its last cell pos = 4b+3), computed with
 // the single append's arithmetic: keys rounded through F16, summed tail[0]+tail[1]+tail[2]+incoming in that order,
@@ -269,7 +271,8 @@ bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxe
 void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device,
                                      int pos_stride, int n_steps, int32_t pos_base,
                                      const float* gamma, float epsilon, const QsaIndexerBuffers& b,
-                                     const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
+                                     const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream,
+                                     const int32_t* rows_dev) {
     if (n_steps <= 0) return;
     if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
         max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
@@ -288,11 +291,11 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
     if (rt.cos != nullptr)
         append<true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
             b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
-            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt,rows_dev);
     else
         append<false><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
             b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
-            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
+            k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt,rows_dev);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
@@ -300,7 +303,8 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
 void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_stride, const int32_t* relative_pos_device,
                                             int pos_stride, int n_steps, int32_t pos_base, float epsilon,
                                             const QsaIndexerLayers& layers, int n_layers, const QsaShapes& s,
-                                            int64_t max_cells, const RopeScaling& scaling, void* stream) {
+                                            int64_t max_cells, const RopeScaling& scaling, void* stream,
+                                            const int32_t* rows_dev) {
     if (n_steps <= 0 || n_layers <= 0) return;
     if (!stream || n_layers > QsaIndexerLayers::kMax || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
         max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
@@ -323,11 +327,11 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
     if (rt.cos != nullptr)
         append_layers<true><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
             pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
-            k.attn_factor, mrope_table(), rt);
+            k.attn_factor, mrope_table(), rt, rows_dev);
     else
         append_layers<false><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
             pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
-            k.attn_factor, mrope_table(), rt);
+            k.attn_factor, mrope_table(), rt, rows_dev);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

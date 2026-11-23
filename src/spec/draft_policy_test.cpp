@@ -952,6 +952,35 @@ int main() {
         std::error_code ec;
         fs::remove_all(dir, ec);
     }
+    {
+        // Tree speculation chooser + calibrated priors + conditional tree_b_rate
+        DraftPolicy tp(7);
+        const double costs[7] = {10.5, 12.1, 14.4, 18.8, 22.0, 25.0, 28.0};
+        tp.set_fixed_costs(costs, 7, 0);
+        const float dp_mid[3] = {0.45f, 0.30f, 0.20f};
+        const float t2_mid[3] = {0.35f, 0.15f, 0.10f};
+        const DraftPolicy::TreePick p_tree = tp.choose_tree(dp_mid, t2_mid, 3, true, 0.02, 1);
+        check(p_tree.fork == 2 && p_tree.parent == 0 && p_tree.n_a == 1 && p_tree.n_b == 1 && p_tree.T == 3 && p_tree.gain > 0.02,
+              "tree: mid-confidence d0 + strong top2 selects 1-fork T=3 tree");
+        const float t2_weak[3] = {0.05f, 0.05f, 0.05f};
+        const DraftPolicy::TreePick p_lin = tp.choose_tree(dp_mid, t2_weak, 3, true, 0.02, 1);
+        check(p_lin.fork == 0 && p_lin.T == 2 && p_lin.lin_t == 2, "tree: weak top2 keeps linear window");
+        const float dp_hi[5] = {0.95f, 0.95f, 0.95f, 0.95f, 0.95f};
+        const float t2_lo[5] = {0.03f, 0.03f, 0.03f, 0.03f, 0.03f};
+        const DraftPolicy::TreePick p_hi = tp.choose_tree(dp_hi, t2_lo, 5, true, 0.02, 1);
+        check(p_hi.fork == 0 && p_hi.T == 6, "tree: confident linear chain stays linear T=6");
+        const double cheap4[7] = {10.5, 12.1, 14.0, 15.2, 18.0, 21.0, 24.0};
+        DraftPolicy tc(7);
+        tc.set_fixed_costs(cheap4, 7, 0);
+        const float bp[2] = {0.95f, 0.92f};
+        const int nb = tc.choose_tree_b_len(0, 1, 0.45f, 0.35f, dp_mid, bp, 2);
+        check(nb == 2, "tree: confident b1 with cheap T=4 extends Branch B to nb=2");
+        const double before_b = tp.tree_b_rate(0.45, 0.35);
+        for (int i = 0; i < 20; ++i) tp.observe_tree_b(0.45f, 0.35f, true);
+        check(tp.tree_b_rate(0.45, 0.35) > before_b, "tree: observe_tree_b hits raise conditional rate");
+        for (int i = 0; i < 40; ++i) tp.observe_tree_b(0.45f, 0.35f, false);
+        check(tp.tree_b_rate(0.45, 0.35) < before_b, "tree: observe_tree_b misses lower conditional rate");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

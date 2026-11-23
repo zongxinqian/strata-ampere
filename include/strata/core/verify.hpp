@@ -30,12 +30,16 @@
 #include "strata/core/tp_comm.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/window_limits.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <functional>
 #include <map>
 #include <cstdint>
@@ -89,6 +93,8 @@ using PoolMultiAsyncFn = void (*)(void* user, const float* x_f, const int32_t* i
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
+    const int32_t* d_res_self = nullptr; ///< TP2 GPU0: GPU0's own [n_layers * n_expert] slot or -1
+    const int32_t* d_res_peer = nullptr; ///< TP2 GPU0: GPU1's [n_layers * n_expert] slot or -1
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
@@ -123,6 +129,10 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// 1-fork speculative tree verification: Branch A [0..fork-1], Branch B [fork..T-1] anchored at `parent` (0 or 1).
+    bool run_tree(int T, int fork, int parent, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
+                  int32_t* out, std::string& err);
+    static bool tree_kv_supported(const SessionState& ss, const ModelGeometry& g);
     /// --lookup-max-t: capture the T-token window graph now instead of on first use.  false with `no_vram` set: the
     /// graph found no VRAM - nothing else changed, and a smaller window can run instead.  A layer split's stages
     /// keep the capture on first use (true, nothing done).
@@ -230,11 +240,16 @@ public:
         tp_ = tp; tp_rank_ = rank; tp_head_owner_ = head_owner; tp_peer_ = peer;
         if (tp != nullptr) { device_plan_ = false; all_resident_ = false; }
     }
+    bool tp2_dev_plan_runtime() const;
+    bool set_tp_head_peer(strata::kernels::ArgHalf* h_arg, uint32_t* h_flag);
+    strata::kernels::ArgHalf* h_head_arg() const { return h_head_arg_; }
+    uint32_t* h_head_flag() const { return h_head_flag_; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    bool commit_tree(int n_keep, const int32_t* win_rows, std::string& err);
 
     /// Is the last window's state change still undone (only `commit` / `pl_commit_async` advances it)?  False for a one-token
     /// window that advanced the state itself (see commit), and on every stage of a chain.  serve_skip_stopped_window asks this
@@ -443,6 +458,7 @@ public:
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    void set_no_pcie(bool on) { no_pcie_ = on; if (next_) next_->set_no_pcie(on); }
 
     /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
     /// each step's GPU work (the plan's arrival, the PCIe part's start, the wait for the CPU's rows; GPU clock), the host
@@ -468,6 +484,12 @@ public:
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
+    bool capture_tree(int T, int fork, int parent, std::string& err);
+    bool capture_common(int T, int fork, int parent, cudaGraphExec_t& dst_exec, std::string& err);
+    bool run_common(int T, int fork, int parent, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user,
+                    int32_t* out, std::string& err);
+    bool commit_common(int n_keep, const int32_t* win_rows, std::string& err);
+    cudaGraphExec_t lookup_tree_exec(int T, int fork, int parent) const;
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
@@ -606,7 +628,9 @@ private:
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
+    bool tp2_dev_plan_ = false;           ///< TP2: GPU0 & GPU1 build their own hit plans on-device
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
+    uint32_t* router_ctr_ = nullptr;      ///< single-block barrier counter for fused router+bell+plan
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
@@ -626,7 +650,8 @@ private:
     int prelaunched_ = 0;                ///< prelaunch ran for a window of this size: run skips staging + launch
     /// The overlapped split: stage this window's inputs and launch its graph now (the graph waits on the hand-off
     /// flag); `run` then only serves the host side.  Called on a helper thread while the previous stage runs.
-    bool prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    bool prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err,
+                   int fork = 0, int parent = 0);
     bool chain_overlap() const;          ///< this stage hands off through a flag to a next stage that waits on it
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
@@ -635,7 +660,7 @@ private:
     bool tp_head_owner_ = true;
     Verifier* tp_peer_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
-    void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
+    void stage_inputs(int T, const int32_t* tokens, int64_t pos0, int fork = 0, int parent = 0);
     bool staged_ = false;
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
@@ -687,6 +712,18 @@ private:
     cudaGraphExec_t exec_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     bool launched_[2][strata::kernels::kVerifyLongT + 1] = {}, launched_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
     int sel_long_ = 0;
+    int tree_fork_rec_ = 0;
+    int tree_parent_rec_ = 0;
+    int prelaunched_fork_ = 0;
+    int prelaunched_parent_ = 0;
+    struct TreeExecEntry { cudaGraphExec_t exec = nullptr; uint64_t last_use = 0; };
+    std::map<uint32_t, TreeExecEntry> exec_tree_;
+    mutable uint64_t tree_use_tick_ = 0;
+    int32_t* h_step_tree_ = nullptr;
+    int32_t* m_step_tree_ = nullptr;
+    int32_t* step_tree_ = nullptr;
+    float* qsa_idx_snap_pre_ = nullptr;
+    float* qsa_idx_snap_br_ = nullptr;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;
@@ -696,6 +733,10 @@ private:
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
     bool capture_oom_ = false;          // the last capture's instantiate found no VRAM (prepare)
     cudaGraphExec_t commit_exec_ = nullptr;
+    cudaStream_t commit_gdn_cs_ = nullptr;
+    cudaEvent_t commit_gdn_fork_ = nullptr, commit_gdn_done_ = nullptr;
+    cudaGraphExec_t commit_gdn_exec_ = nullptr;
+    bool commit_gdn_pending_ = false;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
@@ -731,6 +772,10 @@ private:
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
+    uint32_t* h_ple_flag_ = nullptr; uint32_t* m_ple_flag_ = nullptr;  // early PLE ready flag (!ar_on)
+    uint8_t* h_emb_raw_ = nullptr; uint8_t* m_emb_raw_ = nullptr;
+    size_t emb_row_bytes_ = 0;
+    size_t emb_raw_cap_ = 0;
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     // set_pcie_balance: per step (layer x group, stride 2 groups) the GPU's clock as the plan arrives, as the PCIe
     // part starts and as it waits for the CPU rows (4 words a step); the pool's ms, its experts, the PCIe ones, and
@@ -741,6 +786,7 @@ private:
     std::vector<char> bal_ok_;
     PcieModel* bal_ = nullptr;
     bool bal_paused_ = false;
+    bool no_pcie_ = false;
     void pcie_balance_window(int64_t steps, int G);
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
@@ -765,8 +811,9 @@ private:
 
     // device
     void* arena_ = nullptr;
-    int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
-    float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
+    int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr, *ident_emb_ = nullptr;
+    float *ple_ = nullptr, *emb_ = nullptr, *emb_raw_d_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
+    void stage_emb_raw(int T, const int32_t* tokens);
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     uint8_t* xil_ = nullptr;                                  // fork F4: the interleaved copy of xq_'s 2-4 columns
@@ -798,7 +845,37 @@ private:
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
+    int64_t head_local_n_ = 0;
+    int head_row0_ = 0;
+    bool tp_head_sharded_ = false;
+    strata::kernels::ArgHalf* h_head_arg_ = nullptr;
+    strata::kernels::ArgHalf* m_head_arg_ = nullptr;
+    uint32_t* h_head_flag_ = nullptr;
+    uint32_t* m_head_flag_ = nullptr;
+    strata::kernels::ArgHalf* m_head_arg_peer_ = nullptr;
+    uint32_t* m_head_flag_peer_ = nullptr;
+    strata::kernels::ArgHalf* arg_half_dev_ = nullptr;
+    float* full_logits_dev_ = nullptr;
+    mutable std::vector<float> full_logits_host_;
+    bool copy_full_logits_host(int T, float* dst_host) const;
+    float* ensure_full_logits_dev(int T);
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
+
+    // Concurrent TP1 verify graph launch worker (overlaps GPU1 cudaGraphLaunch with GPU0)
+    std::thread tp_launch_thr_;
+    std::mutex tp_launch_mu_;
+    std::condition_variable tp_launch_cv_;
+    cudaGraphExec_t tp_launch_exec_ = nullptr;
+    cudaStream_t tp_launch_cs_ = nullptr;
+    cudaError_t tp_launch_err_ = cudaSuccess;
+    uint64_t tp_launch_req_ = 0;
+    uint64_t tp_launch_done_ = 0;
+    int tp_launch_dev_ = -1;
+    bool tp_launch_stop_ = false;
+    void ensure_tp1_launcher(int dev);
+    void stop_tp1_launcher();
+    void start_tp1_launch(cudaGraphExec_t exec, cudaStream_t cs);
+    bool wait_tp1_launch(std::string& err);
 };
 
 }  // namespace strata::core

@@ -184,6 +184,76 @@ int main(int argc, char**) {
         bad += cfg_bad;
     }
 
+    // ---- hits_added / hits_added_gated / vec4 hits_gated (bitwise against combine_k10 + scalar gated)
+    {
+        int bad_added = 0, bad_agated = 0, bad_vgated = 0, cases = 0;
+        const int N = 2560, K = 10;
+        for (int n = 1; n <= 8; ++n) {
+            std::vector<float> misses((size_t) n * K * N, 0.0f), hits((size_t) n * K * N, 0.0f);
+            std::vector<float> comb((size_t) n * K * N, 0.0f), w((size_t) n * K), sh((size_t) n * N), sg((size_t) n);
+            std::vector<int32_t> dst;
+            for (int r = 0; r < n * K; ++r) {
+                const bool is_hit = (rng() % 2) == 0;
+                if (is_hit) {
+                    dst.push_back(r);
+                    for (int col = 0; col < N; ++col) {
+                        const float v = gauss(rng);
+                        hits[(size_t) r * N + col] = v;
+                        comb[(size_t) r * N + col] = v;
+                    }
+                } else {
+                    for (int col = 0; col < N; ++col) {
+                        const float v = (col & 15) == 0 ? -0.0f : gauss(rng);
+                        misses[(size_t) r * N + col] = v;
+                        comb[(size_t) r * N + col] = v;
+                    }
+                }
+            }
+            const int32_t cnt = (int32_t) dst.size();
+            for (auto& v : w) v = (float) (rng() % 1000) / 1000.0f;
+            for (auto& v : sh) v = gauss(rng);
+            for (auto& v : sg) v = gauss(rng);
+            float* d_m = up(misses);
+            float* d_h = up(hits);
+            float* d_c = up(comb);
+            float* d_w = up(w);
+            float* d_s = up(sh);
+            float* d_sg = up(sg);
+            int32_t* d_dst = dst.empty() ? up(std::vector<int32_t>{0}) : up(dst);
+            int32_t* d_cnt = up(std::vector<int32_t>{cnt});
+            float *d_o1 = nullptr, *d_o2 = nullptr, *d_o3 = nullptr, *d_o4 = nullptr;
+            check(cudaMalloc(&d_o1, (size_t) n * N * 4 + 64), "o1");
+            check(cudaMalloc(&d_o2, (size_t) n * N * 4 + 64), "o2");
+            check(cudaMalloc(&d_o3, (size_t) n * N * 4 + 64), "o3");
+            check(cudaMalloc(&d_o4, (size_t) n * N * 4 + 64), "o4");
+            native_moe_combine_multi(d_c, d_w, d_s, d_o1, N, K, n, st);
+            native_moe_combine_multi_hits_added(d_m, d_h, d_dst, d_cnt, d_w, d_s, d_o2, N, K, n, st);
+            float* out_ref_gated = d_o3 + 1;
+            native_moe_combine_multi_hits_gated(d_c, d_w, d_s, d_sg, out_ref_gated, N, K, n, st);
+            native_moe_combine_multi_hits_added_gated(d_m, d_h, d_dst, d_cnt, d_w, d_s, d_sg, d_o4, N, K, n, st);
+            check(cudaDeviceSynchronize(), "sync");
+            const auto r_plain = down(d_o1, (size_t) n * N);
+            const auto g_added = down(d_o2, (size_t) n * N);
+            const auto r_gated = down(out_ref_gated, (size_t) n * N);
+            const auto g_agated = down(d_o4, (size_t) n * N);
+            check(cudaMemsetAsync(d_o1, 0, (size_t) n * N * 4, st), "z");
+            native_moe_combine_multi_hits_gated(d_c, d_w, d_s, d_sg, d_o1, N, K, n, st);
+            check(cudaDeviceSynchronize(), "sync2");
+            const auto g_vgated = down(d_o1, (size_t) n * N);
+            // Reference 3: hits_gated(k=10) == vec4? Also compute un-contracted vs contracted
+            cases += 3;
+            if (std::memcmp(g_added.data(), r_plain.data(), r_plain.size() * 4) != 0) ++bad_added;
+            if (std::memcmp(g_agated.data(), r_gated.data(), r_gated.size() * 4) != 0) ++bad_agated;
+            if (std::memcmp(g_vgated.data(), r_gated.data(), r_gated.size() * 4) != 0) ++bad_vgated;
+            cudaFree(d_m); cudaFree(d_h); cudaFree(d_c); cudaFree(d_w); cudaFree(d_s); cudaFree(d_sg);
+            cudaFree(d_dst); cudaFree(d_cnt); cudaFree(d_o1); cudaFree(d_o2); cudaFree(d_o3); cudaFree(d_o4);
+        }
+        const int tot_bad = bad_added + bad_agated + bad_vgated;
+        std::printf("  %-52s %s (added=%d agated=%d vgated=%d / %d)\n", "combine hits_added / hits_added_gated / vec4_gated",
+                    tot_bad ? "*** NO ***" : "bitwise", bad_added, bad_agated, bad_vgated, cases);
+        bad += tot_bad;
+    }
+
     std::printf("\nnative_multi: %d failures\n", bad);
     if (bad) return 1;
     std::printf("native_multi_parity OK\n");

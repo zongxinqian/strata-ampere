@@ -22,6 +22,7 @@ NativeHead::~NativeHead() {
 void NativeHead::unload() {
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (weights_) strata::kernels::native_q8_0_sm60_release(weights_);
+    if (weights_) strata::kernels::native_q8_0_packed_unregister(weights_);
     if (scratch_) cudaFree(scratch_);
     if (host_) cudaFreeHost(host_);   // the mapped-host fallback (weights_ is its device alias)
     else if (weights_) cudaFree(weights_);
@@ -31,9 +32,15 @@ void NativeHead::unload() {
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
+    return load_shard(shards, n_in, n_out, 0, n_out, err);
+}
+
+bool NativeHead::load_shard(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out_total,
+                            int64_t row0, int64_t row_count, std::string& err) {
     if (loaded()) { err = "native head is already loaded"; return false; }
-    if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
-        err = "native head requires positive int32 dimensions and whole 256-value rows";
+    if (n_in <= 0 || n_out_total <= 0 || row0 < 0 || row_count <= 0 || row0 + row_count > n_out_total ||
+        n_in > INT_MAX || n_out_total > INT_MAX || n_in % 256 || (row0 % 256) != 0) {
+        err = "native head requires positive int32 dimensions, whole 256-value rows, and 256-row aligned shard";
         return false;
     }
     try {
@@ -46,16 +53,21 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         const strata::TensorInfo* tensor = model.find("output.weight", &at);
         const strata::GgufFile& gguf = model.shard(at);
         if (!tensor || !strata::kernels::native_mmvq_supported((int) tensor->type) || tensor->shape.size() != 2 ||
-            tensor->shape[0] != (uint64_t) n_in || tensor->shape[1] != (uint64_t) n_out) {
+            tensor->shape[0] != (uint64_t) n_in || tensor->shape[1] != (uint64_t) n_out_total) {
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
             return false;
         }
-        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
+        const uint64_t total_bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out_total);
         const uint64_t payload = gguf.file_size() - gguf.data_start();
-        if (tensor->offset > payload || bytes > payload - tensor->offset) {
+        if (tensor->offset > payload || total_bytes > payload - tensor->offset) {
             err = "native head: truncated output.weight payload";
             return false;
         }
+        const uint64_t row_b = total_bytes / (uint64_t) n_out_total;
+        const uint64_t byte_off = (uint64_t) row0 * row_b;
+        const uint64_t bytes = (uint64_t) row_count * row_b;
+        const uint8_t* src_ptr = static_cast<const uint8_t*>(gguf.tensor_data(*tensor)) + byte_off;
+        const int64_t n_out = row_count;
         void* weights = nullptr;
         void* scratch = nullptr;
         void* host = nullptr;
@@ -72,7 +84,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             void* hp = nullptr;
             void* dp = nullptr;
             if (cudaHostAlloc(&hp, bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess && cudaHostGetDevicePointer(&dp, hp, 0) == cudaSuccess) {
-                std::memcpy(hp, gguf.tensor_data(*tensor), bytes);
+                std::memcpy(hp, src_ptr, bytes);
                 host = hp;
                 weights = dp;
                 status = cudaSuccess;
@@ -85,9 +97,42 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         }
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
-        if (status == cudaSuccess && host == nullptr)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+        strata::platform::advise_willneed(src_ptr, bytes);
+        static const bool q8p_on = [] {
+            const char* v = std::getenv("STRATA_Q8_PACKED");
+            return v != nullptr && v[0] == '1';
+        }();
+        const bool pack_q8 = host == nullptr && (int) tensor->type == 8 && q8p_on &&
+                             strata::kernels::native_q8_0_packed_eligible((int) n_in, (int) n_out);
+        if (status == cudaSuccess && host == nullptr) {
+            if (pack_q8) {
+                const size_t nb_in = (size_t) n_in / 32;
+                const size_t chunk_rows = 1024;
+                const size_t max_r = std::min<size_t>(chunk_rows, (size_t) n_out);
+                std::vector<uint8_t> qs_buf(max_r * (size_t) n_in);
+                std::vector<uint16_t> d_buf(max_r * nb_in);
+                for (int64_t r0 = 0; r0 < n_out && status == cudaSuccess; r0 += (int64_t) chunk_rows) {
+                    const size_t nr = (size_t) std::min<int64_t>((int64_t) chunk_rows, n_out - r0);
+                    for (size_t r = 0; r < nr; ++r) {
+                        const uint8_t* row_src = src_ptr + ((size_t) r0 + r) * (size_t) row_b;
+                        uint8_t* qs_dst = qs_buf.data() + r * (size_t) n_in;
+                        uint16_t* d_dst = d_buf.data() + r * nb_in;
+                        for (size_t b = 0; b < nb_in; ++b) {
+                            const uint8_t* blk = row_src + b * 34;
+                            std::memcpy(d_dst + b, blk, 2);
+                            std::memcpy(qs_dst + b * 32, blk + 2, 32);
+                        }
+                    }
+                    status = cudaMemcpy((uint8_t*) weights + (size_t) r0 * (size_t) n_in, qs_buf.data(),
+                                        nr * (size_t) n_in, cudaMemcpyHostToDevice);
+                    if (status == cudaSuccess)
+                        status = cudaMemcpy((uint8_t*) weights + (size_t) n_out * (size_t) n_in + (size_t) r0 * nb_in * 2,
+                                            d_buf.data(), nr * nb_in * 2, cudaMemcpyHostToDevice);
+                }
+            } else {
+                status = cudaMemcpy(weights, src_ptr, bytes, cudaMemcpyHostToDevice);
+            }
+        }
         if (status != cudaSuccess) {
             if (host) cudaFreeHost(host);
             weights = host ? nullptr : weights;
@@ -103,10 +148,15 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         bytes_ = bytes;
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
+        n_out_total_ = (int) n_out_total;
+        row0_ = (int) row0;
+        shards_ = shards;
         type_ = (int) tensor->type;
         if (type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
-        if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
+        if (pack_q8)
+            strata::kernels::native_q8_0_packed_register(weights_, weights_, n_in_, n_out_);
+        if (type_ == 8 && !pack_q8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
             strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
         if (strata::core::manifest::enabled()) {   // STRATA_MANIFEST: what the head holds and where
             namespace mf = strata::core::manifest;
@@ -124,8 +174,42 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
     }
 }
 
+bool NativeHead::gather_rows_to_device(const int32_t* ids, int64_t count, void* dst_dev, std::string& err) const {
+    if (!loaded() || shards_.empty() || ids == nullptr || count <= 0 || dst_dev == nullptr) {
+        err = "native head gather_rows: invalid arguments";
+        return false;
+    }
+    try {
+        const strata::GgufModel model(shards_);
+        size_t at = 0;
+        const strata::TensorInfo* tensor = model.find("output.weight", &at);
+        const strata::GgufFile& gguf = model.shard(at);
+        if (!tensor) { err = "native head gather_rows: output.weight missing"; return false; }
+        const size_t rb = row_bytes();
+        const int64_t n_tot = n_out_total();
+        const uint8_t* base = static_cast<const uint8_t*>(gguf.tensor_data(*tensor));
+        std::vector<uint8_t> tmp((size_t) count * rb);
+        for (int64_t i = 0; i < count; ++i) {
+            const int32_t id = ids[i];
+            if (id < 0 || id >= n_tot) {
+                err = "native head gather_rows: vocabulary id out of range";
+                return false;
+            }
+            std::memcpy(tmp.data() + (size_t) i * rb, base + (size_t) id * rb, rb);
+        }
+        if (cudaMemcpy(dst_dev, tmp.data(), tmp.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = std::string("native head gather_rows cudaMemcpy: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        err = std::string("native head gather_rows: ") + e.what();
+        return false;
+    }
+}
+
 bool NativeHead::to_host(std::string& err) {
-    if (weights_ == nullptr || host_ != nullptr || (type_ == 14 && strata::kernels::native_q6_k_packed_enabled()) || (type_ == 8 && std::getenv("STRATA_Q8_SM60") != nullptr)) return false;   // (repacked in place: those stay in VRAM)
+    if (weights_ == nullptr || host_ != nullptr || (type_ == 14 && strata::kernels::native_q6_k_packed_enabled()) || (type_ == 8 && (std::getenv("STRATA_Q8_SM60") != nullptr || ((std::getenv("STRATA_Q8_PACKED") && std::getenv("STRATA_Q8_PACKED")[0] == '1') && strata::kernels::native_q8_0_packed_eligible(n_in_, n_out_))))) return false;   // (repacked in place: those stay in VRAM)
     { int d = 0; cudaDeviceProp pr{}; if (cudaGetDevice(&d) != cudaSuccess || cudaGetDeviceProperties(&pr, d) != cudaSuccess || !strata::spill_allowed(strata::kSpillMetalBuild, pr.integrated != 0)) { (void) cudaGetLastError(); return false; } }   // (Q6_K / Q8_0 may be repacked in place: those stay)
     void* hp = nullptr;
     void* dp = nullptr;

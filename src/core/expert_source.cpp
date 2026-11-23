@@ -4985,7 +4985,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
-    if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
+    if (d.tp2_dev_plan && d.tp_res1 != nullptr && n <= kMaxWindowEntries) {
+        const size_t loff = (size_t) d.layers * (size_t) d.n_expert;
+        const int32_t* __restrict__ r0 = d.host_res + loff;
+        const int32_t* __restrict__ r1 = d.tp_res1 + loff;
+        for (int64_t i = 0; i < n; ++i) {
+            const int32_t e = ids[i];
+            if (e >= 0 && e < d.n_expert) {
+                if (r0[e] >= 0) kind[i] = 0;
+                else if (r1[e] >= 0) kind[i] = 2;
+                else {
+                    kind[i] = -1;
+                    if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
+                }
+            } else {
+                kind[i] = -1;
+            }
+        }
+    } else if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
         // a helper GPU (RemoteExperts) holding the expert computes it in its own VRAM once begin() claims the row: like
@@ -5279,17 +5296,42 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (jobs_buf.size() < (size_t) (n_tok * k)) jobs_buf.resize((size_t) (strata::kernels::kWindowMaxT * k));
     }
     const auto c1 = std::chrono::steady_clock::now();
+    static thread_local std::vector<const float*> pre_x;
+    static thread_local std::vector<void*> pre_dst;
+    strata::kernels::cpu::ExpertPool::SplitPreAct pre_act;
+    static const bool par_actq_on = [] {
+        const char* v = std::getenv("STRATA_PAR_ACTQ");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
     if (any_cpu) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
-        const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
+        const bool ep = (d.remote_count > 0 && d.remote[0]->optimized_decode()) || (d.tp_plan1 != nullptr) || d.tp2_dev_plan;
+        const bool defer_actq = par_actq_on && !async_ok && d.cold_mode == 0 && native &&
+                                !strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type);
+        if (defer_actq) {
+            pre_x.clear();
+            pre_dst.clear();
+        }
         for (int64_t t = 0; t < n_tok; ++t) {
             if (ep && std::all_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v >= 0; })) continue;
             if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
                 act_quant_any(x_f + (size_t) t * H, H, act_buf[(size_t) t]);
-            else if (native)
+            else if (defer_actq) {
+                pre_x.push_back(x_f + (size_t) t * H);
+                pre_dst.push_back(nact_buf.data() + (size_t) t * kNativeActBytes);
+            } else if (native)
                 native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, nact_buf.data() + (size_t) t * kNativeActBytes);
             else
                 act_quant_q8_1(x_f + (size_t) t * H, H, act_buf[(size_t) t]);
+        }
+        if (defer_actq) {
+            if (pre_x.size() >= 2) {
+                pre_act.n_toks = (int) pre_x.size();
+                pre_act.x = pre_x.data();
+                pre_act.dst = pre_dst.data();
+            } else if (pre_x.size() == 1) {
+                native_quant_act(lay.fmt[(size_t) d.layers], pre_x[0], pre_dst[0]);
+            }
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
@@ -5362,7 +5404,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
                 if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
-                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1 || (d.tp_plan1 != nullptr && kind[i] == 2)))))
+                      (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1 || ((d.tp_plan1 != nullptr || d.tp2_dev_plan) && kind[i] == 2)))))
                     std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
             }
@@ -5483,7 +5525,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (njobs > 0 && npend == 0) {
-        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs_buf.data(), njobs, arithmetic);
+        if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs_buf.data(), njobs, arithmetic,
+                                                   pre_act.n_toks > 0 ? &pre_act : nullptr);
         else d.pool->run_split_multi(jobs_buf.data(), njobs);
     }
     if (d.remote_count > 0) {

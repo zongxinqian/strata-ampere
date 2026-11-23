@@ -48,6 +48,6 @@ __device__ __forceinline__ void strata_spin_pause() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
     // sm_6x: the loop spins.  Every call site is a single-thread doorbell wait, so nothing else is delayed.
 #else
-    __nanosleep(100);
+    __nanosleep(25);
 #endif
 }
