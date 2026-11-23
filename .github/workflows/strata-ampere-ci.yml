@@ -1,0 +1,43 @@
+name: strata-ampere CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  sanity:
+    name: Config, Script & Repo Sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate example JSON configs and zero-secret hygiene
+        run: |
+          python3 - <<'PY'
+          import glob, json, pathlib, sys
+
+          files = sorted(glob.glob("examples/*.json"))
+          assert files, "No example JSON files found"
+          for p in files:
+              text = pathlib.Path(p).read_text(encoding="utf-8")
+              data = json.loads(text)
+              assert data.get("api_key") == "CHANGE_ME_API_KEY", f"{p}: api_key must be sanitized placeholder"
+              assert "192.168." not in text and "/root/" not in text, f"{p}: found private IP or host path"
+              print(f"OK: {p} (drafting={data.get('drafting')})")
+          PY
+
+      - name: Check launch script shell syntax
+        run: bash -n examples/start-strata-ampere.sh
+
+      - name: Verify core strata-ampere files exist
+        run: |
+          for f in README.md README.zh-CN.md LICENSE \
+                   include/strata/core/tp_comm.hpp \
+                   src/kernels/cuda/tp_comm.cu \
+                   src/kernels/cuda/q8_sm86_fast.cuh \
+                   src/kernels/cuda/q4_sm86.cuh; do
+            test -s "$f" || { echo "Missing: $f"; exit 1; }
+          done
+          echo "All core strata-ampere files verified."
