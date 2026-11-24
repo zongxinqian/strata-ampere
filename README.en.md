@@ -83,7 +83,7 @@ Every gain comes from systems architecture, CUDA microkernels, scheduling, and h
 1. **Non-P2P `TP=2 + EP=2` & Zero-Sleep Ring AllReduce** (`src/kernels/cuda/tp_comm.cu`): 50/50 full-layer TP + disjoint 50/50 EP; decode uses Mapped Pinned Host Memory ring buffers with zero-sleep atomic GPU spin barriers (`~80–91 us` saved per 96× AR); prefill uses double-buffered 16 MB full-duplex CE DMA BF16 AllReduce.
 2. **Ampere `sm_86` Microkernels**: Tuned `Q8_0`/`Q4_0` kernels (`q8_sm86_fast.cuh`, `q4_sm86.cuh`), re-benchmarked 68-SM `kIlRows_86` table, tree-aware 36-layer GDN Split (`STRATA_GDN_SPLIT=1`), `__ldg` in `S27`, and **`sm_80+` PTX BF16 Tensor Core DFlash2 Attention** (`src/kernels/cuda/dflash2.cu`, `+4.25%` reasoning / `+4.06%` warm 16K ctx).
 3. **14.3× Parallel RAM-Backed PLE & Balanced Multi-Chunk Prefill**: 8-thread `PleTable::gather_batch` skipping redundant `madvise()` on locked/faulted RAM (`src/kernels/ngram.cpp`, `945 ms → 66 ms`, 32K chunk `3,823 → 4,267 tok/s`), async pre-pinned `cpu_x_stream` + `ExpertPool::run_range` (`+8.9%` on 4K–5K), and `STRATA_PREFILL_EQUAL=1` (`+8.46%` on 40K E2E).
-4. **Headless Linux NVML VRAM OC & 240W Pareto Tuning**: Built [scripts/ampere-oc-power.py](scripts/ampere-oc-power.py) to bypass NVIDIA's `-250 MHz` CUDA P2 trap without X11/Coolbits, pushing GDDR6X to `10,151 MHz` at `240 W` (`207.52 tok/s`, `41 °C`, `-93 W` prefill draw, `+19.3%` perf/W).
+4. **Headless Linux NVML OC, PCIe `MaxReadReq=4096B` & `THP defer+madvise`**: Built [scripts/ampere-oc-power.py](scripts/ampere-oc-power.py) to bypass NVIDIA's `-250 MHz` CUDA P2 trap (`10,151 MHz` @ `240 W`, `207.52 tok/s`, `41 °C`, `-93 W`, `+19.3%` perf/W), plus live PCIe `MaxReadRequestSize 512B → 4096B` (`+5.07%` code / `+3.38%` reasoning decode at zero extra watts) and async `THP defrag=defer+madvise`.
 
 ---
 
@@ -98,8 +98,8 @@ cmake --build build86 --target strata -j $(nproc)
 # Launch (pick DFlash2 Q4_0 for code/math/reasoning or MTP-6 for balanced/creative)
 python3 serve/server.py --config examples/strata-2x3080-20g-dflash2.example.json
 
-# Apply Pareto-optimal 240W + GDDR6X 10,151 MHz profile live (no restart needed)
-sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --power-limit 240
+# Apply Pareto 240W + GDDR6X 10,151 MHz + PCIe MaxReadReq=4096B + THP defer+madvise live (no restart needed)
+sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --power-limit 240 --pcie-mrrs 4096 --thp-defrag defer+madvise
 ```
 
 ---

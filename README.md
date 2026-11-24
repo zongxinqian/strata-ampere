@@ -107,10 +107,9 @@
 - **多块均衡切分（`STRATA_PREFILL_EQUAL=1`）**：
   - 解决 40K 长提示词被切成 `32K + 7K` 导致小尾块重复扫 PCIe 冷专家掉速的问题，改为 `20K + 20K` 均衡双块，40K 端到端 Prefill 再涨 **`+8.46%`**（直接追平 31K 单块速度）。
 
-### 3. Linux 无头 NVML 显存超频与 240W 帕累托能耗比调优
-- 发现 NVIDIA 驱动默认 CUDA P2 状态会将 RTX 3080 GDDR6X 降频 `-250 MHz`（`9,501 → 9,251 MHz`）。
-- 编写开源无头调优脚本 [scripts/ampere-oc-power.py](scripts/ampere-oc-power.py)（无需 X11 / Coolbits，直调 R550+ NVML VF 接口），扫频精准锁定 Micron GDDR6X ECC 拐点（`+1800` 为峰顶，`+2200` 触发静默 ECC 重传掉速）。
-- 由于 Decode 为显存带宽受限，将单卡功耗墙从 `320W` 压至 **`240W`** 配合显存 `+1800` / 核心 `+120`，可保留 **98.9% 极限 Decode 速度（`207.52 tok/s`）**，同时 Prefill 功耗直降 **93 W**、满载温度压至 **`41℃`**、每百瓦能效比暴涨 **`+19.3%`**！
+### 3. Linux 底层无头调优：NVML 显存超频、240W 能效与 PCIe `MaxReadReq=4096B`
+- **解除 CUDA P2 显存降频 + 240W 帕累托能效**：发现 NVIDIA 驱动默认 CUDA P2 状态会将 RTX 3080 GDDR6X 降频 `-250 MHz`（`9,501 → 9,251 MHz`）；通过开源脚本 [scripts/ampere-oc-power.py](scripts/ampere-oc-power.py) 锁定 Micron GDDR6X ECC 峰顶（`+1800` 为峰顶，`+2200` 触发静默 ECC 重传掉速），配合单卡 **`240W`** 功耗墙保留 **98.9% 极限 Decode 速度（`207.52 tok/s`）**，Prefill 功耗直降 **93 W**、满载温度仅 **`41℃`**、能效比提升 **`+19.3%`**。
+- **PCIe `MaxReadReq 512B → 4096B` + `THP defrag=defer+madvise`**：绝大多数主板默认将消费级 GPU 的 PCIe `MaxReadRequestSize` 限制在 `512 bytes`，导致每次冷专家 DMA 读取被切碎成 8 倍事务包。热调至 **`4096 bytes`**（`setpci CAP_EXP+0x08.w`）并将内核透明大页整理设为异步 `defer+madvise` 后，**零额外功耗下 `decode_code` 均速再涨 `+5.07%`、`decode_reason` 再涨 `+3.38%`**，所有 Linux 多卡用户均可一键复现！
 
 ---
 
@@ -137,10 +136,10 @@ cmake --build build86 --target strata -j $(nproc)
 python3 serve/server.py --config /path/to/strata-2x3080-20g-dflash2.example.json
 ```
 
-### 3. 一键无头显存超频与 240W 帕累托能效（无需重启引擎）
+### 3. 一键无头显存超频、PCIe `4096B` 与 240W 帕累托能效（无需重启引擎）
 ```bash
-# 应用 240W + GDDR6X 10,151 MHz 帕累托最优档（内置硬件安全上下限钳制与回读校验）
-sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --power-limit 240
+# 一键应用 240W + GDDR6X 10,151 MHz + PCIe MaxReadReq=4096B + THP defer+madvise
+sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --power-limit 240 --pcie-mrrs 4096 --thp-defrag defer+madvise
 
 # 一键恢复出厂默认频率与功耗墙
 sudo python3 scripts/ampere-oc-power.py --reset
