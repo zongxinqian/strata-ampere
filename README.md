@@ -112,6 +112,30 @@ python3 serve/server.py --config /path/to/strata-2x3080-20g.json
 
 ---
 
+## Latest Lossless Updates: 4,267 tok/s Prefill, DFlash2 BF16 TC & Headless VRAM OC
+
+### 1. Strictly Lossless Prefill & DFlash2 BF16 Tensor Core Attention
+- **Async Pre-Pinned CPU Share (`ad89a3b`)**: Dedicated `cpu_x_stream` D2H + `ExpertPool::run_range` parallel quantization + `STRATA_PREFILL_CPU_SHARE_NT=32, MAX=6144` (`+8.9%` on 4K–5K prefill).
+- **14.3× Faster Parallel RAM-Backed PLE (`4fda8ca`)**: 8-thread `PleTable::gather_batch` skipping redundant `madvise()` syscalls when `--ple-io ram` is faulted/locked — slashing GPU PLE wait from **`945 ms -> 66 ms`**, lifting 32K single-chunk prefill from **`3,823 -> 4,267 tok/s` (`+11.6%`)**, 40K E2E from **`3,143 -> 3,468 tok/s` (`+10.3%`)**, and 10K E2E to **`2,843 tok/s` (`+13.7%`)**.
+- **DFlash2 `sm_80+` BF16 Tensor Core Attention (`fe965b1`)**: PTX `mma.sync.aligned.m16n8k16` BF16 attention with exact FP32 online softmax — **`+4.25%` (`+6.3 tok/s`)** on multi-step reasoning decode and **`+4.06%`** on warm 16K-context decode with zero prefill regression.
+
+### 2. Headless Linux NVML VRAM/Core OC & Power-Efficiency Pareto Sweep
+NVIDIA's CUDA P2 state downclocks RTX 3080 GDDR6X from `9,501 MHz` to `9,251 MHz`. Using [scripts/ampere-oc-power.py](scripts/ampere-oc-power.py) (headless R550+ NVML VF offsets, no X11/Coolbits required), we swept GDDR6X clocks and power limits on `2× RTX 3080 20 GB` (`DFlash2 Q4_0`, `decode_code` 384 tok + 16K prefill):
+
+| Profile (per GPU) | Real Mem / Core | `decode_code` | Decode Draw | **Perf / 100W** | `prefill_16k` | Prefill Draw | Peak Temp |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Stock (`+0 / +0 / 320 W`) | `9,251 / 1,995 MHz` | `189.42 tok/s` | `389.2 W` | `48.66` | `3,399.4 tok/s` | `546.7 W` | `46 °C` |
+| **Pareto Optimal (`+1800 / +120 / 240 W`)** | **`10,151 / 2,100 MHz`** | **`207.52 tok/s` (+9.6%)** | **`389.0 W`** | **`53.34` (+9.6% vs stock, +19.3% vs 320W OC)** | **`3,426.5 tok/s`** | **`453.5 W` (-93 W)** | **`41 °C`** |
+| Peak Speed (`+1800 / +120 / 320 W`) | `10,151 / 2,100 MHz` | **`209.80 tok/s` (+10.8%)** | `469.3 W` | `44.71` | **`3,530.6 tok/s`** | `563.3 W` | `48 °C` |
+| Over-Limit (`+2200 / +135 / 320 W`) | `10,351 / 2,115 MHz` | `194.22 tok/s` (ECC drop) | `468.8 W` | `41.43` | `3,545.1 tok/s` | `569.9 W` | `49 °C` |
+
+```bash
+# Apply the Pareto-optimal 240 W + GDDR6X 10,151 MHz profile (no engine restart needed):
+sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --power-limit 240
+```
+
+---
+
 ## Upstream Attribution & License
 
 `strata-ampere` is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) and is distributed under the original **MIT License** — see [LICENSE](LICENSE). All credit for the base Strata engine, pack format, KV streaming, and verification framework belongs to Niko1221 and the Strata contributors.

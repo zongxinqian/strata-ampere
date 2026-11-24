@@ -110,6 +110,30 @@ python3 serve/server.py --config /path/to/strata-2x3080-20g.json
 
 ---
 
+## 最新严格无损进展：4,267 tok/s Prefill、DFlash2 BF16 TC 与无头显存超频能耗比
+
+### 1. 纯软件严格无损提速
+- **异步预锁页 CPU 专家池（`ad89a3b`）**：独立 `cpu_x_stream` 异步 D2H + `ExpertPool::run_range` 多线程并行量化 + `STRATA_PREFILL_CPU_SHARE_NT=32, MAX=6144`（4K～5K Prefill `+8.9%`）。
+- **14.3× 并行内存 PLE 查表（`4fda8ca`）**：8 线程并行 `PleTable::gather_batch` 并在 `--ple-io ram` 已锁页时跳过冗余 `madvise()` 系统调用——GPU PLE 等待从 **`945 ms → 66 ms`**，32K 单块 Prefill 从 **`3,823 → 4,267 tok/s`（`+11.6%`）**，40K 端到端从 **`3,143 → 3,468 tok/s`（`+10.3%`）**，10K 端到端达 **`2,843 tok/s`（`+13.7%`）**。
+- **DFlash2 `sm_80+` BF16 Tensor Core 注意力（`fe965b1`）**：PTX `mma.sync.aligned.m16n8k16` BF16 注意力 + FP32 在线 Softmax，多步推理 Decode **`+4.25%`（`+6.3 tok/s`）**，16K 热缓存 Decode **`+4.06%`**，Prefill 零退化。
+
+### 2. Linux 无头 NVML 显存超频与能耗比帕累托实测
+NVIDIA 驱动默认的 CUDA P2 状态会把 RTX 3080 GDDR6X 从 `9,501 MHz` 压到 `9,251 MHz`。使用本仓库内置的 [scripts/ampere-oc-power.py](scripts/ampere-oc-power.py)（无需 X11 / Coolbits，直接走 R550+ NVML VF 偏移接口），在 `2× RTX 3080 20 GB`（`DFlash2 Q4_0`）上实测帕累托曲线如下：
+
+| 调优挡位（单卡） | 实际显存 / 核心频率 | `decode_code` | Decode 整机双卡功耗 | **每百瓦能效 (`tok/s / 100W`)** | `prefill_16k` | Prefill 双卡功耗 | 最高温度 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 默认 (`+0 / +0 / 320 W`) | `9,251 / 1,995 MHz` | `189.42 tok/s` | `389.2 W` | `48.66` | `3,399.4 tok/s` | `546.7 W` | `46 °C` |
+| **帕累托最优 (`+1800 / +120 / 240 W`)** | **`10,151 / 2,100 MHz`** | **`207.52 tok/s` (+9.6%)** | **`389.0 W`** | **`53.34`（比 320W 超频高 +19.3%）** | **`3,426.5 tok/s`** | **`453.5 W`（省 93 W）** | **`41 °C`** |
+| 极限性能 (`+1800 / +120 / 320 W`) | `10,151 / 2,100 MHz` | **`209.80 tok/s` (+10.8%)** | `469.3 W` | `44.71` | **`3,530.6 tok/s`** | `563.3 W` | `48 °C` |
+| 过超触发 ECC (`+2200 / +135 / 320 W`) | `10,351 / 2,115 MHz` | `194.22 tok/s`（ECC 降速） | `468.8 W` | `41.43` | `3,545.1 tok/s` | `569.9 W` | `49 °C` |
+
+```bash
+# 一键应用帕累托最优 240W + GDDR6X 10,151 MHz 挡位（无需重启推理引擎）：
+sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --power-limit 240
+```
+
+---
+
 ## 上游致谢与开源协议
 
 `strata-ampere` 派生自 [Niko1221/Strata](https://github.com/Niko1221/Strata)，继续遵循原仓库的 **MIT License**（见 [LICENSE](LICENSE)）。基础引擎架构、Pack 格式、KV Streaming 与验证框架均归功于 Niko1221 及 Strata 社区贡献者。
