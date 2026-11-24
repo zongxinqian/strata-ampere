@@ -1106,7 +1106,33 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
 bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, int32_t anchor, std::string& err) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
     if (!context_wait(err)) return false;
-    if (n_new < 1 || n_new > kRows) { err = "dflash2: draft rows out of range"; return false; }
+    if (n_new < 1) { err = "dflash2: draft rows out of range"; return false; }
+    if (n_new > kRows) {
+        // Long suffix-lookup / chained verify window committed > kRows (e.g. 9..16) tokens: ingest all context rows
+        // via chunked context() (which updates the KV ring + ring log bit-exactly), then run the draft block directly.
+        if (!context(taps, n_new, pos0, err)) return false;
+        const OnDevice on_device(device_);
+        const Clock::time_point t0 = Clock::now();
+        const int64_t s = pos0 + n_new;
+        for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + n_new - 1); h_meta_[8 + i] = (int32_t) (s + i); }
+        h_meta_[16] = anchor;
+        h_meta_[18] = epoch_;
+        h_meta_[17] = (int32_t) s;
+        h_meta_[24] = anchor;
+        for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
+        for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (timing_) cudaEventRecord(ev_a_, cs_);
+        kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+        if (!record_block(cs_, err)) return false;
+        if (timing_) cudaEventRecord(ev_b_, cs_);
+        (void) cudaStreamQuery(cs_);
+        launch_t0_ = t0;
+        launch_n_ = n_new;
+        launch_pos0_ = pos0;
+        launched_ = true;
+        return true;
+    }
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
     if (graph_taps_ != nullptr && graph_taps_ != taps) { err = "dflash2: the taps buffer moved after capture"; return false; }

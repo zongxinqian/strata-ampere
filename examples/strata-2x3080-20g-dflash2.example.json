@@ -38,6 +38,10 @@
     "--aux-cpus",
     "23,47",
     "--lookup-max-t",
+    "16",
+    "--lookup-sizes",
+    "8,12,16",
+    "--lookup-chain",
     "6",
     "--draft-costs",
     "/path/to/draft-costs.json",
@@ -114,7 +118,9 @@
     "STRATA_B6_MMVQ_ROWS": "1",
     "STRATA_PREFILL_CPU_SHARE_NT": "32",
     "STRATA_PREFILL_CPU_SHARE_MAX": "6144",
-    "STRATA_PREFILL_EQUAL": "1"
+    "STRATA_PREFILL_EQUAL": "1",
+    "STRATA_DF2_LOOKUP_SKIP": "6",
+    "STRATA_SUFFIX_CACHE": "1"
   },
   "gpu": [
     0,

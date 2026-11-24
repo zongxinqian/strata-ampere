@@ -41,6 +41,7 @@
 | **多步推理 Decode**（开启 DFlash2 BF16 TC） | `148.30 tok/s` | **`154.61 tok/s`** | **`+4.25%`** | 冷启动 + 热缓存 2 轮均值；16K 热缓存同步 `+4.06%` |
 | **代码 Decode**（无头超频 + `240W` 帕累托档） | `189.42 tok/s`（默认 320W） | **`207.52 tok/s`**（2 轮均值） | **`+9.6%`** | **功耗直降 80～93 W，满载仅 `41℃`，能效比 `+19.3%`** |
 | **代码 Decode**（无头超频 + `320W` 满血档） | `189.42 tok/s`（默认 320W） | **`209.80 tok/s`**（2 轮均值） | **`+10.8%`** | 显存实频 `10,151 MHz`（GDDR6X ECC 临界点内） |
+| **代码重构 / Agent JSON / 跨请求**（双级混合草稿 `T=16` + 持久化后缀树） | `185.46 tok/s`（4 场景热态均值） | **`229.98 tok/s`**（3 轮含冷态均值 `206.08`） | **`+24.0%`** | Agent JSON `237.5 → 290.4 tok/s` (`+22.3%`)，Python 重构 `196.0 → 215.9 tok/s` (`+10.1%`)，贪婪 SHA 逐位一致 |
 
 ### 3. Prefill 提示词处理速度（严格无损，Decode 零退化）
 
@@ -95,6 +96,9 @@
   - 36 层 GDN Split 补齐树解码支持（`STRATA_GDN_SPLIT=1`）；`S27` 常驻专家核加入 `__ldg` 只读缓存加载。
 - **DFlash2 `sm_80+` BF16 Tensor Core 注意力**（`src/kernels/cuda/dflash2.cu`）：
   - 移植基于 PTX `mma.sync.aligned.m16n8k16` 的 BF16 Tensor Core 注意力，保留精确 FP32 在线 Softmax，多步推理 Decode 再涨 `+4.25%`、16K 长上下文热缓存再涨 `+4.06%`。
+- **代码/Agent 零算力持久化后缀树 + DFlash2 双级混合草稿（16-Token 长窗口）**（`include/strata/spec/rolling_suffix.hpp`、`src/core/dflash2.cpp`、`src/core/verify.cpp`、`src/program/generate.cpp`）：
+  - 解除 `Dflash2Drafter::draft_launch` 对单轮提交行数 `<= 8` 的硬上限（`n_new > 8` 时自动分块写入 KV 环与 ring log 后直接触发块草稿），并将 `Verifier::prepare(T)` 升级为 TP=2 双卡协同校验，彻底打通双卡 + DFlash2 下的 **`--lookup-max-t 16 --lookup-sizes 8,12,16 --lookup-chain 6`** 与 `STRATA_DF2_LOOKUP_SKIP=6`（强匹配时跳过 DFlash2 神经网络草稿直接走零算力后缀查表）。
+  - 新增跨请求持久化滚动后缀树 `RollingSuffixSource`（`STRATA_SUFFIX_CACHE=1`，默认 256K Token 有界自动压缩，~10 MiB 内存），同时服务主后缀查表与 `--lookup-chain` 接龙。实测 4 场景热态均速 **`185.46 → 229.98 tok/s（+24.0%）`**，Agent JSON 改写达 **`290.40 tok/s（+22.3%）`**、代码重构达 **`215.85 tok/s（+10.1%）`**，全新未见 Prompt 零退化、贪婪解码 SHA 100% 逐位一致。
 - **CPU 专家池 CCX 绑核对齐**：
   - `--pool-workers 15` 跨 Threadripper 8 个 CCX 绑核（`15 worker + 1 host` = 16 活跃线程），吃满四通道 DDR4-3200 带宽且避免跨 CCX 争抢。
 

@@ -95,4 +95,38 @@ int SuffixDrafter::propose_after(const int32_t* extra, int n_extra, int max_k, i
     return k;
 }
 
+int SuffixDrafter::propose_query(const int32_t* query, int n_query, int max_k, int32_t* out) {
+    last_match_ = 0;
+    const size_t n = hist_.size();
+    if (n < 4 || query == nullptr || n_query < 3 || max_k <= 0) return 0;
+    const uint64_t a = (uint32_t) query[n_query - 3];
+    const uint64_t b = (uint32_t) query[n_query - 2];
+    const uint64_t c = (uint32_t) query[n_query - 1];
+    const uint64_t key = mix(a * 0x9E3779B97F4A7C15ull ^ mix(b + 0x632BE59BD9B4E019ull) ^ (c << 1)) | 1ull;
+    const Slot* s = find_slot(key, false);
+    if (s == nullptr) return 0;
+    size_t best_end = 0;
+    int best_len = 0;
+    const int lim_q = std::min(max_match_, n_query);
+    for (int w = 0; w < s->n; ++w) {
+        const size_t p = s->pos[w];
+        if (p + 1 >= n) continue;   // need at least 1 continuation token after match
+        int len = 0;
+        while (len < lim_q && len <= (int) p && hist_[p - (size_t) len] == query[n_query - 1 - len]) ++len;
+        if (len > best_len) { best_len = len; best_end = p; }
+    }
+    if (best_len < min_match_) return 0;
+    last_match_ = best_len;
+    int k = 0;
+    for (size_t q = best_end + 1; q < n && k < max_k; ++q) out[k++] = hist_[q];
+    return k;
+}
+
+void SuffixDrafter::compact_keep_recent(size_t keep_tokens) {
+    if (hist_.size() <= keep_tokens) return;
+    std::vector<int32_t> tail(hist_.end() - (std::ptrdiff_t) keep_tokens, hist_.end());
+    reset();
+    append(tail.data(), tail.size());
+}
+
 }  // namespace strata::spec

@@ -35,6 +35,14 @@ public:
     /// only part of the suffix being matched and may be read back as part of a periodic continuation.
     int propose_after(const int32_t* extra, int n_extra, int max_k, int32_t* out);
 
+    /// Match the trailing suffix of an external `query[0..n_query-1]` against this drafter's history without mutating
+    /// or reallocating `hist_`. Used by persistent cross-request caches (`RollingSuffixSource`).
+    int propose_query(const int32_t* query, int n_query, int max_k, int32_t* out);
+
+    /// Retain only the most recent `keep_tokens` of history and rebuild the trigram index in-place (for bounded
+    /// rolling cross-request caches).
+    void compact_keep_recent(size_t keep_tokens);
+
     /// Length of the match behind the last proposal (0 if none).
     int last_match() const { return last_match_; }
     size_t size() const { return hist_.size(); }

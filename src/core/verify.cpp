@@ -5483,11 +5483,26 @@ bool Verifier::prepare(int T, bool& no_vram, std::string& err) {
     if (next_ != nullptr || lb_ > 0) return true;
     const OnDevice on_device(device_);
     refresh_ar();
-    if ((ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]) != nullptr) return true;
-    capture_oom_ = false;
-    if (capture(T, err)) return true;
-    no_vram = capture_oom_;
-    return false;
+    const bool had_self = (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]) != nullptr;
+    if (!had_self) {
+        capture_oom_ = false;
+        if (!capture(T, err)) {
+            no_vram = capture_oom_;
+            return false;
+        }
+    }
+    if (tp_peer_ != nullptr) {
+        bool peer_no_vram = false;
+        if (!tp_peer_->prepare(T, peer_no_vram, err)) {
+            no_vram = peer_no_vram;
+            if (!had_self) {
+                auto& ex = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
+                if (ex != nullptr) { (void) cudaGraphExecDestroy(ex); ex = nullptr; }
+            }
+            return false;
+        }
+    }
+    return true;
 #endif
 }
 

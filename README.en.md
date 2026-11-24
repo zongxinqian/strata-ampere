@@ -39,6 +39,7 @@ Tested on `Qwen3.8-Flash-Next-UD-Q4_K_XL` (`MTP-6` drafter, 3-run medians):
 | **Reasoning Decode** (`DFlash2 BF16 TC`) | `148.30 tok/s` | **`154.61 tok/s`** | **`+4.25%`** | Cold + warm 2-pass avg; warm 16K ctx `+4.06%` |
 | **Code Decode** (Headless OC + **`240W` Pareto**) | `189.42 tok/s` (stock 320W) | **`207.52 tok/s`** (2-run avg) | **`+9.6%`** | **-80 to -93 W draw, `41 °C` peak, `+19.3%` perf/W** |
 | **Code Decode** (Headless OC + `320W` Peak) | `189.42 tok/s` (stock 320W) | **`209.80 tok/s`** (2-run avg) | **`+10.8%`** | Real GDDR6X `10,151 MHz` (below ECC retry cliff) |
+| **Code Refactor / Agent JSON / Cross-Turn** (Hybrid `T=16` Suffix + DFlash2 Chaining + Rolling Cache) | `185.46 tok/s` (4-task warm mean) | **`229.98 tok/s`** (3-round all-in mean `206.08`) | **`+24.0%`** | Agent JSON `237.5 → 290.4 tok/s` (`+22.3%`), Python refactor `196.0 → 215.9 tok/s` (`+10.1%`), bit-exact greedy SHA |
 
 ### Prefill Throughput (Strictly Lossless, Zero Decode Regression)
 
@@ -84,6 +85,7 @@ Every gain comes from systems architecture, CUDA microkernels, scheduling, and h
 2. **Ampere `sm_86` Microkernels**: Tuned `Q8_0`/`Q4_0` kernels (`q8_sm86_fast.cuh`, `q4_sm86.cuh`), re-benchmarked 68-SM `kIlRows_86` table, tree-aware 36-layer GDN Split (`STRATA_GDN_SPLIT=1`), `__ldg` in `S27`, and **`sm_80+` PTX BF16 Tensor Core DFlash2 Attention** (`src/kernels/cuda/dflash2.cu`, `+4.25%` reasoning / `+4.06%` warm 16K ctx).
 3. **14.3× Parallel RAM-Backed PLE & Balanced Multi-Chunk Prefill**: 8-thread `PleTable::gather_batch` skipping redundant `madvise()` on locked/faulted RAM (`src/kernels/ngram.cpp`, `945 ms → 66 ms`, 32K chunk `3,823 → 4,267 tok/s`), async pre-pinned `cpu_x_stream` + `ExpertPool::run_range` (`+8.9%` on 4K–5K), and `STRATA_PREFILL_EQUAL=1` (`+8.46%` on 40K E2E).
 4. **Headless Linux NVML OC, PCIe `MaxReadReq=4096B` & `THP defer+madvise`**: Built [scripts/ampere-oc-power.py](scripts/ampere-oc-power.py) to bypass NVIDIA's `-250 MHz` CUDA P2 trap (`10,151 MHz` @ `240 W`, `207.52 tok/s`, `41 °C`, `-93 W`, `+19.3%` perf/W), plus live PCIe `MaxReadRequestSize 512B → 4096B` (`+5.07%` code / `+3.38%` reasoning decode at zero extra watts) and async `THP defrag=defer+madvise`.
+5. **Hybrid Dual-Stage Speculative Drafting (`T=16` Suffix Lookup + DFlash2 Chaining + Persistent Rolling Suffix Cache)** (`include/strata/spec/rolling_suffix.hpp`, `src/core/dflash2.cpp`, `src/core/verify.cpp`, `src/program/generate.cpp`): Lifted the `n_new <= 8` cap in `Dflash2Drafter::draft_launch`, made `Verifier::prepare(T)` TP=2-aware, unlocked `--lookup-max-t 16 --lookup-sizes 8,12,16 --lookup-chain 6` + `STRATA_DF2_LOOKUP_SKIP=6`, and added a bounded 256K-token cross-request `RollingSuffixSource` (`STRATA_SUFFIX_CACHE=1`). Delivers **`+24.0%`** warm mean speedup across code refactoring, Agent JSON editing (**`290.40 tok/s`**), and multi-turn coding with bit-exact greedy hashes and zero regression on novel prompts.
 
 ---
 

@@ -10,6 +10,7 @@
 //   continue  history = first half of the prompt; generate its second half (natural continuation)
 //   copy      history = the whole prompt; generate its middle third again (output quoting input: edits)
 // No model runs; this measures the drafter on text, not on the model's own outputs.
+#include "strata/spec/rolling_suffix.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 
 #include <cstdio>
@@ -175,6 +176,28 @@ void unit_tests() {
         }
         check(bad == 0, "randomized proposals are real continuations within bounds");
         check(proposals > 1000, "randomized test exercised proposals");
+    }
+    {   // propose_query & compact_keep_recent & RollingSuffixSource cross-request persistence
+        strata::spec::RollingSuffixSource rc(4, 32, 8192);
+        const std::vector<int32_t> turn1 = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+        rc.commit_turn(turn1.data(), turn1.size());
+        rc.reset();   // intentional no-op across requests
+        check(rc.size() == turn1.size(), "RollingSuffixSource persists across reset()");
+        const int32_t q_hit[] = {20, 30, 40, 50};
+        int32_t out[8] = {};
+        int m = 0;
+        const int k = rc.propose_direct(q_hit, 4, 4, out, &m);
+        check(k == 4 && m == 4 && out[0] == 60 && out[3] == 90, "RollingSuffixSource proposes exact cross-request tail");
+        const int32_t q_short[] = {30, 40, 50};
+        check(rc.propose_direct(q_short, 3, 4, out, &m) == 0, "RollingSuffixSource enforces min_match=4");
+        // compaction keeps recent half without losing recent patterns
+        std::vector<int32_t> big(7500);
+        for (size_t i = 0; i < big.size(); ++i) big[i] = (int32_t) (1000 + i);
+        rc.commit_turn(big.data(), big.size());
+        rc.commit_turn(turn1.data(), turn1.size());   // triggers compaction since size approaches 8192
+        check(rc.size() <= rc.capacity(), "RollingSuffixSource stays bounded after compaction");
+        const int k2 = rc.propose_direct(q_hit, 4, 4, out, &m);
+        check(k2 == 4 && out[0] == 60 && out[3] == 90, "RollingSuffixSource keeps recent turns after compaction");
     }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }

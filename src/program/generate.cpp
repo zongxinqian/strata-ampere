@@ -135,6 +135,7 @@
 #include "strata/spec/draft_vocab.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
+#include "strata/spec/rolling_suffix.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
@@ -16224,6 +16225,40 @@ int main(int argc, char** argv) {
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        // Persistent cross-request rolling suffix cache (zero GPU cost, strictly lossless; STRATA_SUFFIX_CACHE=0 disables).
+        const bool rolling_sfx_on = [&] {
+            const char* e = std::getenv("STRATA_SUFFIX_CACHE");
+            return (e == nullptr || e[0] != '0') && (o.suffix_draft > 0 || o.lookup_chain > 0);
+        }();
+        strata::spec::RollingSuffixSource* rolling_sfx = nullptr;
+        if (rolling_sfx_on) {
+            const char* cap_e = std::getenv("STRATA_SUFFIX_CACHE_CAP");
+            const size_t cap_tok = (cap_e != nullptr && std::atoi(cap_e) > 0) ? (size_t) std::atoi(cap_e) : (size_t) (1u << 18);
+            auto owned = std::make_unique<strata::spec::RollingSuffixSource>(std::max(4, o.suffix_draft), 64, cap_tok);
+            rolling_sfx = owned.get();
+            strata::spec::extra_draft_sources().push_back(std::move(owned));
+            std::fprintf(stderr, "strata serve: persistent rolling suffix cache ON (capacity %zu tokens, min_match %d)\n",
+                         rolling_sfx->capacity(), rolling_sfx->min_match());
+        }
+        auto propose_suffix = [&](int max_k, int32_t* out, int& match_out) -> int {
+            const int k1 = sfx.propose(max_k, out);
+            const int m1 = k1 > 0 ? sfx.last_match() : 0;
+            if (rolling_sfx != nullptr && rolling_sfx->size() >= 4 && sfx.size() >= 4) {
+                const auto& h = sfx.history();
+                const int nq = (int) std::min<size_t>(h.size(), 64);
+                int32_t rbuf[strata::kernels::kVerifyLongT];
+                const int lim = std::min(max_k, strata::kernels::kVerifyLongT);
+                int m2 = 0;
+                const int k2 = rolling_sfx->propose_direct(h.data() + (h.size() - (size_t) nq), nq, lim, rbuf, &m2);
+                if (k2 > 0 && m2 > m1) {
+                    for (int i = 0; i < k2; ++i) out[i] = rbuf[i];
+                    match_out = m2;
+                    return k2;
+                }
+            }
+            match_out = m1;
+            return k1;
+        };
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         strata::spec::DraftPolicy policy_idle(S);   // --draft auto: the other drafter's learned costs; swapped in with it when a request uses the other drafter
         bool policy_is_df2 = use_df2;   // which drafter's costs `policy` holds (the engine's first drafter; swapped with policy_idle when a request uses the other one)
@@ -21487,8 +21522,9 @@ int main(int argc, char** argv) {
             // a long suffix match: the next round's DFlash2 draft is deferred to that round's start (spec/window_rule.hpp skip_draft_for_lookup)
             auto defer_df2 = [&](int a_) -> bool {
                 if (o.suffix_draft <= 0 || df2_skip_min <= 0 || !req_df2) return false;
-                const int ks = sfx.propose(S_look - 1, sbuf.data());
-                if (!strata::spec::skip_draft_for_lookup(true, df2_skip_min, ks, sfx.last_match())) return false;
+                int ms = 0;
+                const int ks = propose_suffix(S_look - 1, sbuf.data(), ms);
+                if (!strata::spec::skip_draft_for_lookup(true, df2_skip_min, ks, ms)) return false;
                 df2_deferred = true; dfr_n = a_ + 1; dfr_pos = p; dfr_anchor = outv[(size_t) a_];
                 return true;
             };
@@ -21532,8 +21568,8 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
                 if (df2_deferred) {   // the draft skipped for a long lookup match: the lookup if the policy takes it, else the draft now (same taps and rows)
                     df2_deferred = false;
-                    const int kd = sfx.propose(S_look - 1, sbuf.data());
-                    const int md = sfx.last_match();
+                    int md = 0;
+                    const int kd = propose_suffix(S_look - 1, sbuf.data(), md);
                     const strata::spec::DraftPolicy::Pick pk = kd > 0 ? policy.choose(S_mtp, kd, md) : strata::spec::DraftPolicy::Pick{};
                     if (kd > 0 && pk.lookup) {
                         dfr_lookup = true; dfr_T = pk.t; dfr_match = md;
@@ -21570,8 +21606,7 @@ int main(int argc, char** argv) {
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                     // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                     if (o.suffix_draft > 0 && !first_window) {
-                        const int k = sfx.propose(S_look - 1, sbuf.data());
-                        sfx_match = sfx.last_match();
+                        const int k = propose_suffix(S_look - 1, sbuf.data(), sfx_match);
                         if (df2_trace != nullptr) {
                             tr_k = std::min(k, 16);
                             tr_match = sfx_match;
@@ -21614,7 +21649,8 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (dfr_lookup) {   // the lookup window chosen before the draft (the draft was skipped)
-                    sfx.propose(S_look - 1, sbuf.data());
+                    int tmp_m = 0;
+                    propose_suffix(S_look - 1, sbuf.data(), tmp_m);
                     T = dfr_T; from_sfx = true; sfx_match = dfr_match;
                     if (o.lookup_max_t > 0) {
                         const int t = graph_fits(T);
@@ -22490,6 +22526,8 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
+            if (rolling_sfx != nullptr && !sfx.history().empty())
+                rolling_sfx->commit_turn(sfx.history().data(), sfx.history().size());
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
