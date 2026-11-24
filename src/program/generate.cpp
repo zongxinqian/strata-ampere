@@ -4935,7 +4935,6 @@ int main(int argc, char** argv) {
     if (tp2_on) {
         o.layer_split.clear();
         o.pipeline_windows = 0;
-        o.conversation_cache_mib = 0;
     }
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
@@ -13792,7 +13791,7 @@ int main(int argc, char** argv) {
 #else
         constexpr bool ckpt_default_build = true;
 #endif
-        const bool ckpt_default_on = ckpt_default_build && ckpt_pool_env_state() == -1 && cache_mib_now > 0 && stages.empty() && park_ckpt_bytes > 0;
+        const bool ckpt_default_on = ckpt_default_build && ckpt_pool_env_state() == -1 && cache_mib_now > 0 && stages.empty() && !tp1 && park_ckpt_bytes > 0;
         if (ckpt_default_on) ckpt_pool_ready_default().store(park_plan.ckpt_ready);
         ckpt_pool.configure(ckpt_pool_env() || slot_ckpt_move_env() || ckpt_default_on, ckpt_pool_cap_env());
         auto segpool_kick = [&] {
@@ -14008,18 +14007,44 @@ int main(int argc, char** argv) {
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
-            const size_t n_st = stages.size();
+            const bool tp1_split = (tp1 != nullptr && stages.empty());
+            const size_t n_st = tp1_split ? 1 : stages.size();
+            auto stage_dev = [&](size_t k) -> int { return tp1_split ? tp1->dev : stages[k]->dev; };
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
             const strata::core::QsaState* draft0 = src.draft0;   // no --mtp: no draft K/V (snapshots accept null)
-            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? src.draft_last : nullptr; };
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return (!tp1_split && k + 1 == n_st) ? src.draft_last : nullptr; };
             std::vector<ConvCheckpoint>& checks = src.checks;
             strata::core::ConversationCheckpointSplit cs;
-            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
+            if (tp1_split) {
+                cs.parts.resize(1);
+                for (ConvCheckpoint& c : checks) {
+                    if (!c.tp1_part) continue;
+                    cs.parts[0].push_back(std::move(*c.tp1_part));
+                    c.tp1_part.reset();
+                    cs.stage0.push_back(std::move(c));
+                }
+                checks.clear();
+            } else if (n_st > 0) {
+                cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
+            }
             struct MergeBack {
-                strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
-                ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
-            } merge_back{cs, checks, n_st > 0};
+                strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on; bool tp1_mode;
+                ~MergeBack() {
+                    if (!on) return;
+                    if (tp1_mode) {
+                        checks.clear();
+                        if (cs.parts.size() == 1 && cs.parts[0].size() == cs.stage0.size()) {
+                            for (size_t i = 0; i < cs.stage0.size(); ++i) {
+                                cs.stage0[i].tp1_part = std::make_shared<ConvCheckpoint>(std::move(cs.parts[0][i]));
+                                checks.push_back(std::move(cs.stage0[i]));
+                            }
+                        }
+                        return;
+                    }
+                    if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                }
+            } merge_back{cs, checks, n_st > 0, tp1_split};
             const strata::core::ConversationView view{src.ids, src.imgs, n_st > 0 ? cs.stage0 : checks, src.cvec};
             const int64_t retained_n = src.with_reuse ? conversations.retained_tokens() : 0;
             // a batch slot's image carries no retained K/V (it describes the main session's conversation), and the
@@ -14036,13 +14061,13 @@ int main(int argc, char** argv) {
             // the later stages' estimates, each with its own retained K/V when it still fits
             size_t stage_estimate = 0, stage_retained = 0;
             for (size_t k = 0; k < n_st; ++k) {
-                auto& st = stages[k];
-                const strata::core::OnDevice on(st->dev);
+                const int dev_k = stage_dev(k);
+                const strata::core::OnDevice on(dev_k);
                 const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
                 size_t b = 0;
                 if (!strata::core::conversation_snapshot_bytes(view_k, *src.stage_sessions[k], g, draft_of(k), b, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
-                                 st->dev, err.c_str());
+                                 dev_k, err.c_str());
                     err.clear();
                     return true;
                 }
@@ -14155,9 +14180,8 @@ int main(int argc, char** argv) {
                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
                 if (!saved) return false;
                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
-                    auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
+                for (size_t k = 0; k < n_st; ++k) {   // the later stages (or TP=2 GPU 1 peer session)
+                    const strata::core::OnDevice on(stage_dev(k));
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
                     const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
                     strata::core::SavedConversation part;
@@ -14200,12 +14224,13 @@ int main(int argc, char** argv) {
             return true;
         };
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || tp1 || !live_ok || live.empty()) return true;
+            if (!conversations.enabled() || !live_ok || live.empty()) return true;
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
                            use_mtp && !mtp_first && n_st > 0 ? &mtp.kv_state() : nullptr, true, ""};
-            for (auto& st : stages) src.stage_sessions.push_back(&st->ss);
+            if (tp1 && stages.empty()) src.stage_sessions.push_back(&tp1->ss);
+            else for (auto& st : stages) src.stage_sessions.push_back(&st->ss);
             return park_source(src, held);
         };
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
@@ -18603,18 +18628,28 @@ int main(int argc, char** argv) {
             // own next turn (ConversationCache::borrows).  Everything else is taken whole, as before.
             // (a layer split restores whole stage images only, so it never borrows; a batch slot that holds a longer
             // start of this prompt wins as before)
-            bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+            const bool tp1_conv_split = (tp1 != nullptr && stages.empty());
+            const size_t n_extra_conv = tp1_conv_split ? 1 : stages.size();
+            bool borrow = stages.empty() && !tp1 && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
-            if (incoming && incoming->stage_images.size() != stages.size()) {
+            if (incoming && incoming->stage_images.size() != n_extra_conv) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard snapshot (stage count)\n");
                 incoming.reset();
             }
-            if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
+            if (incoming && tp1_conv_split) {
+                const strata::core::OnDevice on(tp1->dev);
+                if (!strata::core::conversation_snapshot_validate(incoming->stage_images[0], tp1->ss, g, nullptr, err)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: discard invalid tp1 snapshot (%s)\n",
+                                 err.c_str());
+                    incoming.reset();
+                    err.clear();
+                }
+            } else if (incoming) for (size_t i = 0; i < stages.size(); ++i) {
                 const strata::core::OnDevice on(stages[i]->dev);
                 if (!strata::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
                         use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
@@ -18638,7 +18673,8 @@ int main(int argc, char** argv) {
             // prompt is read again. A card that already has its stream is never refused, however full it is.
             if (incoming) {
                 std::vector<int> restore_devs{-1};
-                for (const auto& stp : stages) restore_devs.push_back(stp->dev);
+                if (tp1_conv_split) restore_devs.push_back(tp1->dev);
+                else for (const auto& stp : stages) restore_devs.push_back(stp->dev);
                 std::vector<uint64_t> restore_free;
                 std::vector<uint8_t> restore_ready;
                 int tight = -1;
@@ -18900,7 +18936,15 @@ int main(int argc, char** argv) {
                     std::printf("ERR restoring parked conversation: %s\n", err.c_str());
                     return 1;
                 }
-                for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+                if (tp1_conv_split) {
+                    const strata::core::OnDevice on(tp1->dev);
+                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[0], tp1->ss, g, nullptr, err) !=
+                        strata::core::ConversationRestore::restored) {
+                        std::printf("ERR restoring parked conversation (TP2 CUDA%d): %s\n", tp1->dev, err.c_str());
+                        return 1;
+                    }
+                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR tp1 restore sync\n"); return 1; }
+                } else for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
                     if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
                             use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
@@ -18927,7 +18971,16 @@ int main(int argc, char** argv) {
                 }
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
-                if (stages.empty()) {
+                if (tp1_conv_split) {
+                    checks = std::move(incoming->checkpoints);
+                    auto& tp1_cks = incoming->stage_images[0].checkpoints;
+                    if (tp1_cks.size() == checks.size()) {
+                        for (size_t i = 0; i < checks.size(); ++i)
+                            checks[i].tp1_part = std::make_shared<ConvCheckpoint>(std::move(tp1_cks[i]));
+                    } else {
+                        checks.clear();
+                    }
+                } else if (stages.empty()) {
                     checks = std::move(incoming->checkpoints);
                 } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
                     strata::core::ConversationCheckpointSplit cs;
@@ -22526,8 +22579,18 @@ int main(int argc, char** argv) {
                         (long long) req_offload, chain_txt, (long long) req_chunk,
                         (long long) (sp.chain_experts_streamed() - streamed0));
             std::fflush(stdout);
-            if (rolling_sfx != nullptr && !sfx.history().empty())
-                rolling_sfx->commit_turn(sfx.history().data(), sfx.history().size());
+            if (rolling_sfx != nullptr && !sfx.history().empty()) {
+                // Skip <|image_pad|> (kImagePad = 248056) runs so multimodal vision prompts never pollute the rolling suffix cache.
+                const auto& h = sfx.history();
+                if (req_imgs.empty()) {
+                    rolling_sfx->commit_turn(h.data(), h.size());
+                } else {
+                    std::vector<int32_t> clean;
+                    clean.reserve(h.size());
+                    for (int32_t tok : h) if ((int64_t) tok != kImagePad) clean.push_back(tok);
+                    if (!clean.empty()) rolling_sfx->commit_turn(clean.data(), clean.size());
+                }
+            }
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;

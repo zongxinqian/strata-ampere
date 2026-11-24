@@ -98,7 +98,10 @@
   - 移植基于 PTX `mma.sync.aligned.m16n8k16` 的 BF16 Tensor Core 注意力，保留精确 FP32 在线 Softmax，多步推理 Decode 再涨 `+4.25%`、16K 长上下文热缓存再涨 `+4.06%`。
 - **代码/Agent 零算力持久化后缀树 + DFlash2 双级混合草稿（16-Token 长窗口）**（`include/strata/spec/rolling_suffix.hpp`、`src/core/dflash2.cpp`、`src/core/verify.cpp`、`src/program/generate.cpp`）：
   - 解除 `Dflash2Drafter::draft_launch` 对单轮提交行数 `<= 8` 的硬上限（`n_new > 8` 时自动分块写入 KV 环与 ring log 后直接触发块草稿），并将 `Verifier::prepare(T)` 升级为 TP=2 双卡协同校验，彻底打通双卡 + DFlash2 下的 **`--lookup-max-t 16 --lookup-sizes 8,12,16 --lookup-chain 6`** 与 `STRATA_DF2_LOOKUP_SKIP=6`（强匹配时跳过 DFlash2 神经网络草稿直接走零算力后缀查表）。
-  - 新增跨请求持久化滚动后缀树 `RollingSuffixSource`（`STRATA_SUFFIX_CACHE=1`，默认 256K Token 有界自动压缩，~10 MiB 内存），同时服务主后缀查表与 `--lookup-chain` 接龙。实测 4 场景热态均速 **`185.46 → 229.98 tok/s（+24.0%）`**，Agent JSON 改写达 **`290.40 tok/s（+22.3%）`**、代码重构达 **`215.85 tok/s（+10.1%）`**，全新未见 Prompt 零退化、贪婪解码 SHA 100% 逐位一致。
+  - 新增跨请求持久化滚动后缀树 `RollingSuffixSource`（`STRATA_SUFFIX_CACHE=1`，默认 256K Token 有界自动压缩，~10 MiB 内存），同时服务主后缀查表与 `--lookup-chain` 接龙，并自动过滤多模态 `<|image_pad|>` 占位符防污染。实测 4 场景热态均速 **`185.46 → 229.98 tok/s（+24.0%）`**，Agent JSON 改写达 **`290.40 tok/s（+22.3%）`**、代码重构达 **`215.85 tok/s（+10.1%）`**，全新未见 Prompt 零退化、贪婪解码 SHA 100% 逐位一致。
+- **TP=2 双卡多对话内存泊车（`ConversationCache`）**（`src/program/generate.cpp`）：
+  - 解除原版 `STRATA_TP2=1` 下硬编码禁用多对话缓存（`o.conversation_cache_mib = 0` 与 `park_current` 跳过 `tp1`）的限制，将 GPU 1（`tp1->ss` 与 `c.tp1_part` 检查点）完整接入 `ConversationCache` 增量泊车与回滚恢复链路。
+  - 在真实双标签页 Coding Agent（Tab A 12.6K ⇄ Tab B 6.8K）切换实测中，切回 Tab A 的缓存复用率从 **`0% → 99.7%`（12,648 tok，仅 `55 ms` 内存恢复）**，TTFT 从 **`4,869.8 ms → 499.3 ms`（9.75× 提速）**，且完整支持泊车对话内的编辑/重算检查点回滚（`57.4 ms` 精确恢复）。
 - **CPU 专家池 CCX 绑核对齐**：
   - `--pool-workers 15` 跨 Threadripper 8 个 CCX 绑核（`15 worker + 1 host` = 16 活跃线程），吃满四通道 DDR4-3200 带宽且避免跨 CCX 争抢。
 
