@@ -145,6 +145,17 @@ sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --pow
 sudo python3 scripts/ampere-oc-power.py --reset
 ```
 
+### 4. 一键采集领域专属 MoE 专家热力图（`scripts/profile-experts.py`）
+针对半显存常驻架构，内置 `coding` / `writing` / `research` / `balanced` 四套语料（亦支持 `--prompts-file` 传入你自己的日志），结合 RRF 贝叶斯先验融合（`--prior-blend 0.45`）将高频领域专家精准晋升进显存（实测 Coding 冷启动显存命中率 `82.13% → 84.00%`，Python/C++ 未见任务冷启动最高 `+13.3%`）：
+```bash
+sudo python3 scripts/profile-experts.py \
+  --config /path/to/strata-config.json \
+  --unit strata@iq3_s \
+  --domain coding \
+  --out /path/to/expert-profile-coding.bin \
+  --activate
+```
+
 ---
 
 ## 五、上游致谢与开源协议

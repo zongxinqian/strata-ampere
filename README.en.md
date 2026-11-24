@@ -100,6 +100,9 @@ python3 serve/server.py --config examples/strata-2x3080-20g-dflash2.example.json
 
 # Apply Pareto 240W + GDDR6X 10,151 MHz + PCIe MaxReadReq=4096B + THP defer+madvise live (no restart needed)
 sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --power-limit 240 --pcie-mrrs 4096 --thp-defrag defer+madvise
+
+# Generate a domain-specialized MoE VRAM residency heatmap (coding / writing / research / balanced, or --prompts-file)
+sudo python3 scripts/profile-experts.py --config /path/to/strata-config.json --unit strata@iq3_s --domain coding --out /path/to/expert-profile-coding.bin --activate
 ```
 
 ---

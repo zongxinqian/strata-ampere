@@ -35,6 +35,7 @@ jobs:
         run: |
           for f in README.md README.en.md LICENSE \
                    scripts/ampere-oc-power.py \
+                   scripts/profile-experts.py \
                    include/strata/core/tp_comm.hpp \
                    src/kernels/cuda/tp_comm.cu \
                    src/kernels/cuda/q8_sm86_fast.cuh \

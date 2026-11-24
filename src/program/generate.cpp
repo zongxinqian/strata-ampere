@@ -15786,11 +15786,17 @@ int main(int argc, char** argv) {
         // A swap still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
         auto save_profile = [&](const char* why) {
             if (heat.empty()) return;
-            std::vector<uint8_t> resident(host_res.size(), 0);
-            for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
-            for (const auto& p : pending) resident[(size_t) p.first] = 1;
-            if (astate == AState::SwapIn)   // --adapt-async: the same for a round past its step 2
-                for (const ASwap& w : aswaps) resident[(size_t) w.layer * g.n_expert + w.in] = 1;
+            const char* ph = std::getenv("STRATA_PROFILE_PURE_HEAT");
+            const bool pure_heat = ph != nullptr && ph[0] == '1';
+            std::vector<uint8_t> resident(pure_heat ? 0 : host_res.size(), 0);
+            if (!pure_heat) {
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    resident[i] = (host_res[i] >= 0) || (tp1 && i < tp1->host_res.size() && tp1->host_res[i] >= 0);
+                for (const auto& p : pending) resident[(size_t) p.first] = 1;
+                if (tp1) for (const auto& p : tp1->adapt_pending) resident[(size_t) p.first] = 1;
+                if (astate == AState::SwapIn)   // --adapt-async: the same for a round past its step 2
+                    for (const ASwap& w : aswaps) resident[(size_t) w.layer * g.n_expert + w.in] = 1;
+            }
             std::string e;
             const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
                                                                    profile_loaded);
