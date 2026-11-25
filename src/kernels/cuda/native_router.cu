@@ -582,11 +582,11 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
     if (!is_last_blk) return;
     __threadfence();
 
-    __shared__ int32_t s_ids[128];
-    if (warp < NT) {
-        const float* l = y + (size_t) warp * ldy;
-        int32_t* id = ids + (size_t) warp * 10;
-        float* wt = weights + (size_t) warp * 10;
+    __shared__ int32_t s_ids[160];
+    for (int tok = warp; tok < NT; tok += 8) {
+        const float* l = y + (size_t) tok * ldy;
+        int32_t* id = ids + (size_t) tok * 10;
+        float* wt = weights + (size_t) tok * 10;
         float values[16];
 #pragma unroll
         for (int i = 0; i < 16; ++i) values[i] = l[lane + i * 32];
@@ -617,7 +617,7 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
         }
         selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
         const float inv = 1.0f / selected_sum;
-        if (lane < 10) { id[lane] = sel_id; s_ids[warp * 10 + lane] = sel_id; wt[lane] = selected * inv; }
+        if (lane < 10) { id[lane] = sel_id; s_ids[tok * 10 + lane] = sel_id; wt[lane] = selected * inv; }
     }
     __syncthreads();
     const int n_ent = NT * 10;
@@ -693,13 +693,13 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
                 }
             }
         } else {
-            __shared__ int32_t p_ids[128], p_excl[128], p_wsum[8], p_excl1[128], p_wsum1[8];
+            __shared__ int32_t p_ids[160], p_excl[160], p_wsum[8], p_excl1[160], p_wsum1[8];
             int32_t eid = -1, slot = -1; bool hit1 = false;
             if (t < n_ent) {
                 eid = s_ids[t];
                 if (eid >= 0 && eid < 512) { slot = res0[eid]; if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true; }
             }
-            if (t < 128) p_ids[t] = (t < n_ent && slot >= 0) ? eid : -1;
+            if (t < 160) p_ids[t] = (t < n_ent && slot >= 0) ? eid : -1;
             __syncthreads();
             int first_j = t, rank_in_group = 0, count_same = 0;
             if (t < n_ent && slot >= 0) {
@@ -717,7 +717,7 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
                 const int up1 = __shfl_up_sync(0xffffffffu, pref1, d);
                 if (lane >= d) { pref += up; pref1 += up1; }
             }
-            if (t < 128) { p_excl[t] = pref - my_pack; p_excl1[t] = pref1 - my_h1; }
+            if (t < 160) { p_excl[t] = pref - my_pack; p_excl1[t] = pref1 - my_h1; }
             if (lane == 31) { p_wsum[warp] = pref; p_wsum1[warp] = pref1; }
             __syncthreads();
             int tot_pack = 0, tot_hit1 = 0;
@@ -772,7 +772,12 @@ void native_router_fused_bf16_bell_plan(
     const int32_t* res_self, const int32_t* res_peer,
     const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
     int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream) {
-    if (!stream || n_tok < 1 || n_tok > 8 || (ldx & 1) != 0 || !x || !w || !done_ctr ||
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+    constexpr int kMegaMaxT = STRATA_VERIFY_MAX_T;
+#else
+    constexpr int kMegaMaxT = 8;
+#endif
+    if (!stream || n_tok < 1 || n_tok > kMegaMaxT || (ldx & 1) != 0 || !x || !w || !done_ctr ||
         !valid(logits, (size_t) n_tok * ldy * 4) || ldy < 512 ||
         !valid(ids, (size_t) n_tok * 10 * 4) || !valid(weights, (size_t) n_tok * 10 * 4) ||
         (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
@@ -780,7 +785,7 @@ void native_router_fused_bf16_bell_plan(
         throw std::invalid_argument("native_router_fused_bf16_bell_plan: bad arguments");
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
     const bool has_aux = (w_aux != nullptr && y_aux != nullptr);
-#define STRATA_MEGA_CASE(NT) case NT: {         constexpr int RPB = (NT == 1) ? 2 : 4;         if (bell) {             if (has_aux) launch_router_mega<RPB, NT, true, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);             else launch_router_mega<RPB, NT, false, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);         } else {             if (has_aux) launch_router_mega<RPB, NT, true, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);             else launch_router_mega<RPB, NT, false, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);         }     } break
+#define STRATA_MEGA_CASE(NT) case NT: {         constexpr int RPB = (NT == 1 || NT > 8) ? 2 : 4;         if (bell) {             if (has_aux) launch_router_mega<RPB, NT, true, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);             else launch_router_mega<RPB, NT, false, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);         } else {             if (has_aux) launch_router_mega<RPB, NT, true, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);             else launch_router_mega<RPB, NT, false, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);         }     } break
     switch (n_tok) {
         STRATA_MEGA_CASE(1);
         STRATA_MEGA_CASE(2);
@@ -790,6 +795,18 @@ void native_router_fused_bf16_bell_plan(
         STRATA_MEGA_CASE(6);
         STRATA_MEGA_CASE(7);
         STRATA_MEGA_CASE(8);
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T >= 12
+        STRATA_MEGA_CASE(9);
+        STRATA_MEGA_CASE(10);
+        STRATA_MEGA_CASE(11);
+        STRATA_MEGA_CASE(12);
+#endif
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T >= 16
+        STRATA_MEGA_CASE(13);
+        STRATA_MEGA_CASE(14);
+        STRATA_MEGA_CASE(15);
+        STRATA_MEGA_CASE(16);
+#endif
     }
 #undef STRATA_MEGA_CASE
     const auto error = cudaGetLastError();

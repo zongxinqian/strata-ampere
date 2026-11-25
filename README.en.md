@@ -46,6 +46,7 @@ Tested on `Qwen3.8-Flash-Next-UD-Q4_K_XL` (`MTP-6` drafter, 3-run medians):
 | **Code Decode** (Headless OC + **`240W` Pareto**) | `189.42 tok/s` (stock 320W) | **`207.52 tok/s`** (2-run avg) | **`+9.6%`** | **-80 to -93 W draw, `41 °C` peak, `+19.3%` perf/W** |
 | **Code Decode** (Headless OC + `320W` Peak) | `189.42 tok/s` (stock 320W) | **`209.80 tok/s`** (2-run avg) | **`+10.8%`** | Real GDDR6X `10,151 MHz` (below ECC retry cliff) |
 | **Code Refactor / Agent JSON / Cross-Turn** (Hybrid `T=16` Suffix + DFlash2 Chaining + Rolling Cache) | `185.46 tok/s` (4-task warm mean) | **`229.98 tok/s`** (3-round all-in mean `206.08`) | **`+24.0%`** | Agent JSON `237.5 → 290.4 tok/s` (`+22.3%`), Python refactor `196.0 → 215.9 tok/s` (`+10.1%`), bit-exact greedy SHA |
+| **Deep Kernel Suite P0–P4** (`W16 G=1` Fusion + Prefill Pre-Warm + Reg-MLP AR + `sm_86` INT8 TC) | `186.72 tok/s` (4-task warm baseline) | **`194.55 tok/s`** (`240W`, 84K delta **`203.5 tok/s`**) | **`+4.2%`** | 84K cold hit rate `70.0% → 79.2%` (`+9.2%`), decode `140.1 → 150.7 tok/s` (`+7.6%`), `cross_req +13.6%`, bit-exact SHA |
 
 ### Prefill Throughput (Strictly Lossless, Zero Decode Regression)
 
@@ -93,6 +94,12 @@ Every gain comes from systems architecture, CUDA microkernels, scheduling, and h
 4. **Headless Linux NVML OC, PCIe `MaxReadReq=4096B` & `THP defer+madvise`**: Built [scripts/ampere-oc-power.py](scripts/ampere-oc-power.py) to bypass NVIDIA's `-250 MHz` CUDA P2 trap (`10,151 MHz` @ `240 W`, `207.52 tok/s`, `41 °C`, `-93 W`, `+19.3%` perf/W), plus live PCIe `MaxReadRequestSize 512B → 4096B` (`+5.07%` code / `+3.38%` reasoning decode at zero extra watts) and async `THP defrag=defer+madvise`.
 5. **Hybrid Dual-Stage Speculative Drafting (`T=16` Suffix Lookup + DFlash2 Chaining + Persistent Rolling Suffix Cache)** (`include/strata/spec/rolling_suffix.hpp`, `src/core/dflash2.cpp`, `src/core/verify.cpp`, `src/program/generate.cpp`): Lifted the `n_new <= 8` cap in `Dflash2Drafter::draft_launch`, made `Verifier::prepare(T)` TP=2-aware, unlocked `--lookup-max-t 16 --lookup-sizes 8,12,16 --lookup-chain 6` + `STRATA_DF2_LOOKUP_SKIP=6`, and added a bounded 256K-token cross-request `RollingSuffixSource` (`STRATA_SUFFIX_CACHE=1`, filtering multimodal `<|image_pad|>` tokens). Delivers **`+24.0%`** warm mean speedup across code refactoring, Agent JSON editing (**`290.40 tok/s`**), and multi-turn coding with bit-exact greedy hashes and zero regression on novel prompts.
 6. **TP=2 Dual-GPU Multi-Conversation RAM Parking (`ConversationCache`)** (`src/program/generate.cpp`): Wired GPU 1 (`tp1->ss` + `tp1_part` checkpoints + incremental `reused_kv_bytes`) into `ConversationCache` instead of hard-disabling parking under `STRATA_TP2=1`. On a 2-tab Coding Agent switch (Tab A 12.6K ⇄ Tab B 6.8K), switching back to Tab A jumps from **`0% → 99.7%` KV reuse (`55.0 ms` restore)**, cutting TTFT **`4,869.8 ms → 499.3 ms` (9.75× faster)** with verified checkpoint rewind (`57.4 ms`).
+7. **Deep Microkernel & Long-Context Suite (P0–P4, 100% Strictly Lossless)**:
+   - **P0 (`-DSTRATA_WINDOW_MAX_T=16` `G=1` Full Fusion & 5-Bucket `DraftPolicy`)**: Lifted `n <= 8` caps in `verify.cpp` and `native_router.cu` (`can_mega_router`, `STRATA_LFUSE`, `hits_in_combine`) to `kVerifyMaxT=16` (halving `T=12/16` AllReduce barriers `192 → 96`) and expanded `DraftPolicy` to 5 context buckets (`<6K / <24K / <64K / <128K / >=128K`).
+   - **P1 (Prefill-Guided Expert Pre-Warm & Dual-GPU VRAM Balance)**: Reuses `Prefill::on_routes` (`STRATA_PREFILL_PREWARM=1`) to promote top missing prompt experts across GPU 0/1 in `~13.5 ms` right before token 1, paired with GPU 0 reserve `1050 → 680 MiB` (`+368 MiB` resident experts) — boosting 84K cold hit rate `70.0% → 79.2%` and decode `140.1 → 150.7 tok/s`.
+   - **P2 (`tp_comm.cu` Register-Cached + MLP-Pipelined BF16 AllReduce)**: `tp_allreduce_bf16_reg_kernel<K>` (`K=1,2,3,5`) keeps `local_buf` in registers across the barrier (zero redundant VRAM reload) and issues all `K` peer `load_cv_u4` PCIe reads concurrently.
+   - **P3 (Multi-Hit PCIe 4096B vs CPU Split A/B)**: Implemented opt-in `STRATA_PCIE_HIT_MIN=N` in `expert_source.cpp`; live A/B proved `--pcie-frac 0.30` regresses `-4.6%` on 4-channel DDR4-3200 (`77.8 GB/s`) due to disabling `can_mega_router` + PCIe host-bridge contention with BF16 AllReduce, so default stays `--pcie-frac 0` (opt-in available for slower memory systems).
+   - **P4 (Ampere `sm_86` INT8 Tensor Core `mma.sync.aligned.m16n8k32`)**: Added `q8_imma_m16n8k32_kernel` in `q8_sm86_fast.cuh` + single-launch `ncols=8..16` dispatch in `native_mmvq.cu` (`STRATA_Q8_TC=1`), hitting an all-time `240W` warm mean of **`194.55 tok/s`** and **`203.50 tok/s`** at 84K delta context with bit-exact greedy SHA256.
 
 ---
 
@@ -101,7 +108,7 @@ Every gain comes from systems architecture, CUDA microkernels, scheduling, and h
 ```bash
 # Build (sm_86, CUDA 12.x/13.1 + Ninja + C++20)
 export PATH=/usr/local/cuda-13.1/bin:$PATH
-cmake -B build86 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -B build86 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_WINDOW_MAX_T=16 -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build86 --target strata -j $(nproc)
 
 # Launch (pick DFlash2 Q4_0 for code/math/reasoning or MTP-6 for balanced/creative)

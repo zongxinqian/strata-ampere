@@ -5079,7 +5079,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         int64_t pcie_i0[64];
         // STRATA_ADAPT_FETCH: the share is the layer's most-routed misses, and the ones the tier would swap in are copied
         // into a slot as they are fetched (ExpertDispatch::fetch_admit)
+        // P3 STRATA_PCIE_HIT_MIN=N (opt-in): route cold misses hit by >= N tokens in the current T=1..16 verify window
+        // over PCIe Gen4 (4096B MRRS) to GPU while keeping 1-token cold misses on the CPU ExpertPool.
+        static const int pcie_hit_min = [] {
+            const char* v = std::getenv("STRATA_PCIE_HIT_MIN");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+        }();
         const bool fetch_on = m > 0 && d.fetch_can(d.layers);
+        const bool hit_split_on = !fetch_on && pcie_hit_min >= 2 && pcie_ok && m > 0;
         const float* use = d.usage.empty() ? nullptr : d.usage.data() + (size_t) d.layers * (size_t) d.n_expert;
         bool pick[kMaxWindowEntries];
         if (fetch_on) {
@@ -5094,6 +5101,24 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     mq[nm++] = q;
             }
             std::stable_sort(mq, mq + nm, [&](int a, int b) { return use[ids[distinct[a]]] > use[ids[distinct[b]]]; });
+            for (int j = 0; j < m && j < nm; ++j) pick[mq[j]] = true;
+        } else if (hit_split_on) {
+            int mq[kMaxWindowEntries], qrows[kMaxWindowEntries], nm = 0;
+            for (int q = 0; q < nd; ++q) {
+                pick[q] = false;
+                qrows[q] = 0;
+                const int64_t i0 = distinct[q];
+                const int32_t e = ids[i0];
+                if (skip_d[q] || e < 0 || e >= d.n_expert) continue;
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                if (d.tp_res1 != nullptr && d.tp_res1[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;
+                if (!d.src->pinned(d.layers, e)) continue;
+                int rows = 0;
+                for (int64_t i = i0; i < n; ++i) rows += (first_of[i] == i0);
+                qrows[q] = rows;
+                if (rows >= pcie_hit_min) mq[nm++] = q;
+            }
+            std::stable_sort(mq, mq + nm, [&](int a, int b) { return qrows[a] > qrows[b]; });
             for (int j = 0; j < m && j < nm; ++j) pick[mq[j]] = true;
         }
         for (int q = 0; q < nd; ++q) {
@@ -5137,7 +5162,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
-                    if ((fetch_on ? pick[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
+                    if (((fetch_on || hit_split_on) ? pick[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;

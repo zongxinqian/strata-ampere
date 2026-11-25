@@ -100,6 +100,105 @@ __global__ void tp_allreduce_kernel(float* __restrict__ local_buf,
     }
 }
 
+// P2: Register-cached + MLP-pipelined BF16 AllReduce (100% bitwise identical to tp_allreduce_bf16_kernel).
+// Eliminates the redundant post-barrier VRAM reload of local_buf AND issues all K peer PCIe reads
+// back-to-back in flight concurrently (hiding PCIe round-trip latency for T=4..16 windows).
+template <int K>
+__global__ void __launch_bounds__(1024, 1)
+tp_allreduce_bf16_reg_kernel(float* __restrict__ local_buf,
+                             float* __restrict__ my_map_base,
+                             const float* __restrict__ peer_map_base,
+                             volatile uint32_t* __restrict__ my_flag,
+                             volatile uint32_t* __restrict__ peer_flag,
+                             int n_elems,
+                             size_t slot_floats,
+                             uint32_t step) {
+    const int tid = threadIdx.x;
+    const size_t slot_off = (size_t) (step & (TpComm::kRingSlots - 1u)) * slot_floats;
+    float* my_map = my_map_base + slot_off;
+    const float* peer_map = peer_map_base + slot_off;
+
+    const int n8 = n_elems >> 3;
+    float4* l4 = reinterpret_cast<float4*>(local_buf);
+    uint4* m4 = reinterpret_cast<uint4*>(my_map);
+    const uint4* p4 = reinterpret_cast<const uint4*>(peer_map);
+
+    float4 ra[K], rb[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = tid + k * 1024;
+        if (i < n8) {
+            const float4 a = l4[2 * i];
+            const float4 b = l4[2 * i + 1];
+            ra[k] = a;
+            rb[k] = b;
+            const __nv_bfloat162 p0 = __floats2bfloat162_rn(a.x, a.y);
+            const __nv_bfloat162 p1 = __floats2bfloat162_rn(a.z, a.w);
+            const __nv_bfloat162 p2 = __floats2bfloat162_rn(b.x, b.y);
+            const __nv_bfloat162 p3 = __floats2bfloat162_rn(b.z, b.w);
+            uint4 v;
+            std::memcpy(&v.x, &p0, 4);
+            std::memcpy(&v.y, &p1, 4);
+            std::memcpy(&v.z, &p2, 4);
+            std::memcpy(&v.w, &p3, 4);
+            store_wt_u4(m4 + i, v);
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+            if (pf >= step) break;
+        }
+#elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        __threadfence_system();
+        asm volatile("st.relaxed.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        do {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+        } while (pf < step);
+#else
+        *my_flag = step;
+        __threadfence_system();
+        while (*peer_flag < step) {
+        }
+        __threadfence_system();
+#endif
+    }
+    __syncthreads();
+    uint4 pv[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = tid + k * 1024;
+        if (i < n8) pv[k] = load_cv_u4(p4 + i);
+    }
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = tid + k * 1024;
+        if (i < n8) {
+            const uint4 v = pv[k];
+            __nv_bfloat162 p0, p1, p2, p3;
+            std::memcpy(&p0, &v.x, 4);
+            std::memcpy(&p1, &v.y, 4);
+            std::memcpy(&p2, &v.z, 4);
+            std::memcpy(&p3, &v.w, 4);
+            const float2 f0 = __bfloat1622float2(p0);
+            const float2 f1 = __bfloat1622float2(p1);
+            const float2 f2 = __bfloat1622float2(p2);
+            const float2 f3 = __bfloat1622float2(p3);
+            float4 a = ra[k];
+            float4 b = rb[k];
+            a.x += f0.x; a.y += f0.y; a.z += f1.x; a.w += f1.y;
+            b.x += f2.x; b.y += f2.y; b.z += f3.x; b.w += f3.y;
+            l4[2 * i] = a;
+            l4[2 * i + 1] = b;
+        }
+    }
+}
+
 __global__ void tp_allreduce_bf16_kernel(float* __restrict__ local_buf,
                                          float* __restrict__ my_map_base,
                                          const float* __restrict__ peer_map_base,
@@ -558,9 +657,28 @@ void TpComm::allreduce_add(float* local_buf, int n_elems, uint32_t step, int ran
                 local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
                 m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
         } else {
-            tp_allreduce_bf16_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
-                local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-                m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+            const int n8 = n_elems >> 3;
+            if (n8 <= 1024) {
+                tp_allreduce_bf16_reg_kernel<1><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
+                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+            } else if (n8 <= 2048) {
+                tp_allreduce_bf16_reg_kernel<2><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
+                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+            } else if (n8 <= 3072) {
+                tp_allreduce_bf16_reg_kernel<3><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
+                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+            } else if (n8 <= 5120) {
+                tp_allreduce_bf16_reg_kernel<5><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
+                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+            } else {
+                tp_allreduce_bf16_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
+                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+            }
         }
         return;
     }

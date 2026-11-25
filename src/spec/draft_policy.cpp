@@ -547,7 +547,7 @@ void DraftPolicy::seed_costs(const double* ms, int n, double weight, int bucket)
 
 void DraftPolicy::set_context(long long pos) {
     if (!robust_) return;
-    const int nb = pos < 6000 ? 0 : pos < 24000 ? 1 : 2;
+    const int nb = pos < 6000 ? 0 : pos < 24000 ? 1 : pos < 64000 ? 2 : pos < 128000 ? 3 : 4;
     if (nb == bk_) return;
     bool has = false;
     for (int t = 1; t <= kMaxT; ++t) has = has || cost_n_[nb][t] > 0;
@@ -575,7 +575,7 @@ std::string DraftPolicy::cost_table_text() const {
         for (int t = 1; t <= kMaxT; ++t) any = any || cost_n_[k][t] > 0;
         if (!any) continue;
         out += (out.empty() ? "" : " | ");
-        out += k == 0 ? "ctx<6K:" : k == 1 ? "ctx<24K:" : "ctx>=24K:";
+        out += k == 0 ? "ctx<6K:" : k == 1 ? "ctx<24K:" : k == 2 ? "ctx<64K:" : k == 3 ? "ctx<128K:" : "ctx>=128K:";
         for (int t = 1; t <= kMaxT; ++t)
             if (cost_n_[k][t] > 0) {
                 std::snprintf(b, sizeof b, " T%d:%.2f(n=%.0f)", t, cost_[k][t], cost_n_[k][t]);
@@ -768,17 +768,18 @@ void DraftPolicy::start_calibration(bool state_effect, const std::array<unsigned
 void DraftPolicy::start_passive(const CostFile& cf, int n) {
     passive_ = true;
     calib_fresh_only_ = true;   // see the header: only the first seconds of a busy run count, no detection of a load-time effect
-    real_ = {};
-    real_[0] = cf.real[0];
-    cal_ = {};
-    cal_[0] = cf.cal[0];
-    real_cost_ = {};
-    real_cost_[0] = cf.real_cost[0];
+    real_ = cf.real;
+    cal_ = cf.cal;
+    real_cost_ = cf.real_cost;
     learned_ = {};
     fixed_n_ = {};
-    fixed_n_[0] = std::clamp(n, 1, kMaxT);
-    for (int t = 1; t <= kMaxT; ++t)   // a mark without a cost (a damaged file) is no mark; a size past the table length is none
-        if ((real_[0] >> (t - 1) & 1u) && (!(real_cost_[0][(size_t) t] > 0.0) || t > fixed_n_[0])) real_[0] &= ~(1u << (t - 1));
+    const int cap = std::clamp(n, 1, kMaxT);
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        fixed_n_[(size_t) k] = cap;
+        for (int t = 1; t <= kMaxT; ++t)   // a mark without a cost (a damaged file) is no mark; a size past the table length is none
+            if ((real_[(size_t) k] >> (t - 1) & 1u) && (!(real_cost_[(size_t) k][(size_t) t] > 0.0) || t > cap))
+                real_[(size_t) k] &= ~(1u << (t - 1));
+    }
     reqs_ = std::max(cf.reqs, 0);
     held_table_ = true;
     fixed_ = false;

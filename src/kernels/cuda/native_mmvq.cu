@@ -2670,16 +2670,22 @@ bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
             validate_pointer(x_q8_1);
             validate_pointer(y);
             validate_stream(stream);
-            bool all = true;
-            for (int j = 0; all && j < ncols; j += q8sm86::MAX_COLS) {
-                const int nj = ncols - j < q8sm86::MAX_COLS ? ncols - j : q8sm86::MAX_COLS;
-                all = q8sm86_fast::launch(found->second.qs, found->second.d,
-                                          static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * std::size_t(n_in / Q8K),
-                                          y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj,
-                                          static_cast<cudaStream_t>(stream)) ||
-                      q8sm86::launch(found->second.qs, found->second.d,
-                                     static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * std::size_t(n_in / Q8K),
-                                     y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj, static_cast<cudaStream_t>(stream));
+            bool all = (ncols >= 8 && ncols <= 16) &&
+                       q8sm86_fast::launch(found->second.qs, found->second.d,
+                                           static_cast<const Q81Block*>(x_q8_1), y, n_in, n_out, ncols,
+                                           static_cast<cudaStream_t>(stream));
+            if (!all) {
+                all = true;
+                for (int j = 0; all && j < ncols; j += q8sm86::MAX_COLS) {
+                    const int nj = ncols - j < q8sm86::MAX_COLS ? ncols - j : q8sm86::MAX_COLS;
+                    all = q8sm86_fast::launch(found->second.qs, found->second.d,
+                                              static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * std::size_t(n_in / Q8K),
+                                              y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj,
+                                              static_cast<cudaStream_t>(stream)) ||
+                          q8sm86::launch(found->second.qs, found->second.d,
+                                         static_cast<const Q81Block*>(x_q8_1) + std::size_t(j) * std::size_t(n_in / Q8K),
+                                         y + std::size_t(j) * std::size_t(n_out), n_in, n_out, nj, static_cast<cudaStream_t>(stream));
+                }
             }
             if (all) {
                 launch_check();

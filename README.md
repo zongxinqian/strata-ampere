@@ -48,6 +48,7 @@
 | **代码 Decode**（无头超频 + `240W` 帕累托档） | `189.42 tok/s`（默认 320W） | **`207.52 tok/s`**（2 轮均值） | **`+9.6%`** | **功耗直降 80～93 W，满载仅 `41℃`，能效比 `+19.3%`** |
 | **代码 Decode**（无头超频 + `320W` 满血档） | `189.42 tok/s`（默认 320W） | **`209.80 tok/s`**（2 轮均值） | **`+10.8%`** | 显存实频 `10,151 MHz`（GDDR6X ECC 临界点内） |
 | **代码重构 / Agent JSON / 跨请求**（双级混合草稿 `T=16` + 持久化后缀树） | `185.46 tok/s`（4 场景热态均值） | **`229.98 tok/s`**（3 轮含冷态均值 `206.08`） | **`+24.0%`** | Agent JSON `237.5 → 290.4 tok/s` (`+22.3%`)，Python 重构 `196.0 → 215.9 tok/s` (`+10.1%`)，贪婪 SHA 逐位一致 |
+| **深度内核 P0–P4 套件**（`W16 G=1` 全融合 + Prefill 预热 + Reg-MLP AR + `sm_86` INT8 TC） | `186.72 tok/s`（4 任务热态基准） | **`194.55 tok/s`**（`240W`，84K 增量 **`203.5 tok/s`**） | **`+4.2%`** | 84K 冷启动命中率 `70.0% → 79.2%`（`+9.2%`）、Decode `140.1 → 150.7 tok/s`（`+7.6%`）；`cross_req +13.6%`，贪心 SHA 逐位一致 |
 
 ### 3. Prefill 提示词处理速度（严格无损，Decode 零退化）
 
@@ -108,6 +109,12 @@
 - **TP=2 双卡多对话内存泊车（`ConversationCache`）**（`src/program/generate.cpp`）：
   - 解除原版 `STRATA_TP2=1` 下硬编码禁用多对话缓存（`o.conversation_cache_mib = 0` 与 `park_current` 跳过 `tp1`）的限制，将 GPU 1（`tp1->ss` 与 `c.tp1_part` 检查点）完整接入 `ConversationCache` 增量泊车与回滚恢复链路。
   - 在真实双标签页 Coding Agent（Tab A 12.6K ⇄ Tab B 6.8K）切换实测中，切回 Tab A 的缓存复用率从 **`0% → 99.7%`（12,648 tok，仅 `55 ms` 内存恢复）**，TTFT 从 **`4,869.8 ms → 499.3 ms`（9.75× 提速）**，且完整支持泊车对话内的编辑/重算检查点回滚（`57.4 ms` 精确恢复）。
+- **深度微核与长上下文架构升级（P0–P4，100% 严格无损）**：
+  - **P0（`T=16` 单组全融合 + 5 桶长上下文成本模型）**：启用 `-DSTRATA_WINDOW_MAX_T=16`，并解除 `verify.cpp` 与 `native_router.cu` 中 `can_mega_router` / `STRATA_LFUSE` / `hits_in_combine` 的 `n <= 8` 硬上限，使 `T=12/16` 混合窗口跑在单组 `G=1`（AllReduce 栅栏由 192 次砍半至 96 次）；同时将 `DraftPolicy` 扩展至 5 个上下文分桶（`<6K / <24K / <64K / <128K / >=128K`）。
+  - **P1（Prefill 引导热专家抢跑预热 + 双卡显存配平）**：复用 `Prefill::on_routes` 零开销统计 Prompt 真实路由热力图，Prefill 结束瞬间仅用 `~13.5 ms` 提前把 Top-K 缺失热专家异步拉进双卡显存（`STRATA_PREFILL_PREWARM=1`），配合 GPU 0 预留由 `1050 → 680 MiB` 释放 `+368 MiB` 显存多常驻专家，84K 冷启动命中率直涨 `70.0% → 79.2%`、Decode `140.1 → 150.7 tok/s`。
+  - **P2（`tp_comm.cu` 寄存器缓存去重读 + `K` 路并发 PCIe MLP 流水线）**：新增模板核 `tp_allreduce_bf16_reg_kernel<K>`（`K=1,2,3,5`），跨栅栏将 `local_buf` 保存在寄存器中彻底消除二次显存重读，并连续并发发射全部 `K` 路 `load_cv_u4` PCIe 读隐藏往返延迟。
+  - **P3（按批内命中次数阈值动态分流 A/B 验证）**：在 `expert_source.cpp` 实现可选 `STRATA_PCIE_HIT_MIN=N`，但在本机四通道 DDR4-3200（`77.8 GB/s`）+ 非 P2P 双卡上实测 `--pcie-frac 0.30` 反降 `-4.6%`（因关闭片上 `can_mega_router` 且 PCIe 搬冷专家与 AllReduce 争抢主桥带宽），按严格无回退原则默认关闭（`--pcie-frac 0`），保留为慢速双通道内存平台可选开关。
+  - **P4（Ampere `sm_86` INT8 Tensor Core `mma.sync.aligned.m16n8k32`）**：在 `q8_sm86_fast.cuh` 与 `native_mmvq.cu` 中为 `T = 8..16` 的 `Q8_0 × Q8_1` 稠密投影与 LM Head 引入 PTX `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`（`STRATA_Q8_TC=1`），单次加载 16×32 权重瓦片共享给最多 16 列，240W 下 4 任务热态均速刷新至 **`194.55 tok/s`**、84K 增量 Decode 突破 **`203.50 tok/s`**，贪心 SHA 100% 逐位一致。
 - **CPU 专家池 CCX 绑核对齐**：
   - `--pool-workers 15` 跨 Threadripper 8 个 CCX 绑核（`15 worker + 1 host` = 16 活跃线程），吃满四通道 DDR4-3200 带宽且避免跨 CCX 争抢。
 
@@ -135,6 +142,8 @@
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 cmake -B build86 -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON \
+  -DSTRATA_WINDOW_MAX_T=16 \
   -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build86 --target strata -j $(nproc)
 ```

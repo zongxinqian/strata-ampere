@@ -1611,7 +1611,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     // S26 STRATA_LFUSE=1 (+ partial residency with STRATA_FUSE_HITS=1 or TP1 zeroed parts_): gate/scale fusion
     auto lfuse_on = [&](int n) {
-        if (!(g_lfuse() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
+        if (!(g_lfuse() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= strata::kernels::kVerifyMaxT &&
               shared_expert_native_bf16_enabled()))
             return false;
         if (ar_on() || (tp_ != nullptr && tp_rank_ == 1)) return true;
@@ -2549,11 +2549,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             false;
 #else
             mega_router_env && !prof_on_ && use_tp2_dev_plan_early && router_ctr_ != nullptr &&
-            dec_batch && n >= 1 && n <= 8 && w_router != nullptr && native_router_enabled() && N == 2560 && NE == 512 && K == 10 &&
+            dec_batch && n >= 1 && n <= strata::kernels::kVerifyMaxT && w_router != nullptr && native_router_enabled() && N == 2560 && NE == 512 && K == 10 &&
             route_prior <= 0.0f && route_resident_cfg().margin <= 0.0f && !rs_on_ &&
             (reinterpret_cast<uintptr_t>(mixed_ + tb * N) & 7u) == 0 &&
             ((tp_ != nullptr && tp_rank_ == 1) ||
-             (fuse_router_bell && (((uintptr_t) xm | (uintptr_t) (m_x_ + tb * N)) & 15u) == 0));
+             (!ar_on() && !device_plan_ && !remote_opt_ && !always_publish_ &&
+              m_x_ != nullptr && m_ids_ != nullptr && m_seq_ != nullptr &&
+              (((uintptr_t) xm | (uintptr_t) (m_x_ + tb * N)) & 15u) == 0));
 #endif
         if (dec_batch && n >= 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
@@ -2918,7 +2920,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
             hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && dec_batch && n >= 1 &&
-                              native_moe_combine_enabled() && n <= 8 &&
+                              native_moe_combine_enabled() && n <= strata::kernels::kVerifyMaxT &&
                               native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n) &&
                               ((uintptr_t) hit_out & 15u) == 0;
             strata::dispatch::notef("experts layer: cpu rows via %ld (1 = fused wait+copy, 0 = wait then copy), hits in combine=%ld", (long) (fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr), (long) hits_in_combine);

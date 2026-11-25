@@ -15905,17 +15905,38 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP) && defined(__linux__)
         kfdq_exit::g_stop.store(&stop_req);   // EXIT (kfd_quiet.hpp): a signal ends the running request like STOP (nothing without the handler)
 #endif
-        // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
-        // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
-        // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
-        if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) {
-            ram_adapt2.seed.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        // 149-prefetch STRATA_RAM_ADAPT2 + P1 STRATA_PREFILL_PREWARM:
+        // Capture prompt routing frequencies on rank 0 during prefill; optionally pre-warm GPU 0/1 ExpertCache
+        // right after prefill completes (before token 1 of decode) so cold tasks start warm immediately.
+        static const bool pf_prewarm_on = [] {
+            const char* e = std::getenv("STRATA_PREFILL_PREWARM");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        static const int pf_prewarm_swaps = [] {
+            const char* e = std::getenv("STRATA_PREFILL_PREWARM_SWAPS");
+            return e != nullptr ? std::max(0, std::atoi(e)) : 28;
+        }();
+        std::vector<float> pf_gpu_heat;
+        int64_t pf_gpu_toks = 0;
+        if ((ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) || (pf_prewarm_on && pf_prewarm_swaps > 0)) {
+            if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f)
+                ram_adapt2.seed.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            if (pf_prewarm_on && pf_prewarm_swaps > 0)
+                pf_gpu_heat.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
             sp.on_routes = [&](int64_t l, const int32_t* ids, int64_t n) {
                 if (l < 0 || l >= g.n_layers || n <= 0) return;
-                const float per = ram_adapt2.prompt_w * 20.0f * (float) g.n_expert_used / (float) n;   // = w x 20 / tokens
-                float* sd = ram_adapt2.seed.data() + l * g.n_expert;
-                for (int64_t i = 0; i < n; ++i)
-                    if (ids[i] >= 0 && ids[i] < g.n_expert) sd[ids[i]] += per;
+                if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f && !ram_adapt2.seed.empty()) {
+                    const float per = ram_adapt2.prompt_w * 20.0f * (float) g.n_expert_used / (float) n;   // = w x 20 / tokens
+                    float* sd = ram_adapt2.seed.data() + l * g.n_expert;
+                    for (int64_t i = 0; i < n; ++i)
+                        if (ids[i] >= 0 && ids[i] < g.n_expert) sd[ids[i]] += per;
+                }
+                if (pf_prewarm_on && !pf_gpu_heat.empty()) {
+                    float* gh = pf_gpu_heat.data() + l * g.n_expert;
+                    for (int64_t i = 0; i < n; ++i)
+                        if (ids[i] >= 0 && ids[i] < g.n_expert) gh[ids[i]] += 1.0f;
+                    if (l == 0) pf_gpu_toks += n / std::max<int64_t>(1, g.n_expert_used);
+                }
             };
         }
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
@@ -20502,6 +20523,10 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+            if (!pf_gpu_heat.empty()) {
+                std::fill(pf_gpu_heat.begin(), pf_gpu_heat.end(), 0.0f);
+                pf_gpu_toks = 0;
+            }
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
@@ -20582,6 +20607,26 @@ int main(int argc, char** argv) {
             }
             if (mtp_room_open && room_close("prompt done") != 0) return 1;
             if (head_restore() != 0) return 1;
+            if (!cancelled && pf_prewarm_on && pf_prewarm_swaps > 0 && pf_gpu_toks >= 64 &&
+                o.adapt_swaps > 0 && !drive.d.usage.empty() && !pf_gpu_heat.empty() && !all_experts_resident) {
+                const auto t_pw0 = Clock::now();
+                apply_pending(true);
+                const float scale = 18.0f / (float) pf_gpu_toks;
+                const size_t n_u = std::min(drive.d.usage.size(), pf_gpu_heat.size());
+                for (size_t i = 0; i < n_u; ++i)
+                    drive.d.usage[i] = drive.d.usage[i] * 0.72f + pf_gpu_heat[i] * scale;
+                const int saved_swaps = o.adapt_swaps;
+                const int64_t sw0 = adapt_nswaps;
+                o.adapt_swaps = std::max(o.adapt_swaps, pf_prewarm_swaps);
+                const bool pw_ok = adapt();
+                o.adapt_swaps = saved_swaps;
+                if (pw_ok) apply_pending(true);
+                const int64_t promoted = adapt_nswaps - sw0;
+                const double pw_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_pw0).count();
+                if (promoted > 0)
+                    std::fprintf(stderr, "strata serve: prefill pre-warm: %lld prompt tok -> %lld hot experts promoted in %.1f ms\n",
+                                 (long long) pf_gpu_toks, (long long) promoted, pw_ms);
+            }
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "

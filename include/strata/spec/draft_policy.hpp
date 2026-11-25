@@ -47,7 +47,7 @@ namespace strata::spec {
 class CostLearner {
 public:
     static constexpr int kMaxT = 16;
-    static constexpr int kCtxBuckets = 3;
+    static constexpr int kCtxBuckets = 5;   // <6K, <24K, <64K, <128K, >=128K
     static constexpr int kKeep = 4096;
     static constexpr double kFreshS = 6.0;    ///< a round is fresh when the engine has been busy for at most this long (M5 Max: flat to 7.5 s, +3 % at 7.5-10 s)
     static constexpr double kIdleS = 0.5;     ///< a pause of this length (no request running) starts a new busy run; the caller measures it (M5 Max: 0.5 s restores the fast state)
@@ -151,7 +151,7 @@ class DraftPolicy {
 public:
     static constexpr int kMaxT = 16;
     static constexpr int kBuckets = 4;
-    static constexpr int kCtxBuckets = 3;   // STRATA_SPEC_COST: row costs per context length (< 6K, < 24K, longer)
+    static constexpr int kCtxBuckets = 5;   // STRATA_SPEC_COST: row costs per context length (< 6K, < 24K, < 64K, < 128K, >= 128K)
 
     explicit DraftPolicy(int max_t, double margin = 0.03);
 

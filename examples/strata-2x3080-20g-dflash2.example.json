@@ -24,7 +24,7 @@
     "--prompt-cache",
     "6",
     "--vram-reserve-mib",
-    "1050",
+    "680",
     "--vram-reserve-later-mib",
     "544",
     "--pool-workers",
@@ -120,7 +120,9 @@
     "STRATA_PREFILL_CPU_SHARE_MAX": "6144",
     "STRATA_PREFILL_EQUAL": "1",
     "STRATA_DF2_LOOKUP_SKIP": "6",
-    "STRATA_SUFFIX_CACHE": "1"
+    "STRATA_SUFFIX_CACHE": "1",
+    "STRATA_PREFILL_PREWARM": "1",
+    "STRATA_Q8_TC": "1"
   },
   "gpu": [
     0,
