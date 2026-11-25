@@ -1,7 +1,7 @@
 # strata-ampere
 
 <p align="center">
-  <b>面向消费级双卡 Ampere（<code>sm_86</code> RTX 3080 20G · 解锁 50.86 GB/s 原生 256 MiB BAR1 直接 PCIe 4.0 P2P）与 Turing（<code>sm_75</code> RTX 2080 Ti 22G + NVLink）MoE 大模型推理的 <a href="https://github.com/Niko1221/Strata">Strata</a> 严格无损高吞吐 TP=2 + EP=2 优化分支</b>
+  <b>面向消费级双卡 Ampere（<code>sm_86</code> 魔改 RTX 3080 20G · 解锁 50.86 GB/s 原生 256 MiB BAR1 直接 PCIe 4.0 P2P）MoE 大模型推理的 <a href="https://github.com/Niko1221/Strata">Strata</a> 严格无损高吞吐 TP=2 + EP=2 优化分支</b>
 </p>
 
 <p align="center">
@@ -18,9 +18,8 @@
   <sub><b>内置 8080 端口实时监控仪表盘实拍</b>：双魔改 RTX 3080 20GB 7×24 稳定运行，现已解锁 <b>50.86 GB/s 直接 PCIe 4.0 P2P + 72×1 GiB 静态大页</b>，热态均速首次突破 <code>201.40 tok/s</code>（单任务 <code>252.01 tok/s</code>）、84K Prefill <code>3,870 tok/s</code>、满载 <code>41℃ / 36℃</code>、<code>0 Xid · 0 AER · 0 DMAR</code></sub>
 </p>
 
-`strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度全栈工程重构，现已全面支持两套高性价比魔改双卡平台，在 **100% 严格无损精度** 下榨干每一分硬件极限：
-- **双魔改 RTX 3080 20 GB（Ampere `sm_86`，40 GB 总显存）**：**无需改写 PCIe 寄存器扩 BAR1（原生 `256 MiB BAR1`）**，通过自研 **VMM 选择性 BAR1 映射 + 1-Hop Push-Write + VRAM Flag 屏障** 配合版本精确匹配的开源动态 BAR1 P2P 内核驱动（[patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)）与 **`72 × 1 GiB` 静态大页 + `iommu=pt`**，实测打通 **`50.86 GB/s` 全双工卡对卡直连**，热态均速首次突破 **`201.40 tok/s`**！
-- **双魔改 RTX 2080 Ti 22 GB（Turing `sm_75`，44 GB 总显存）**：原生支持物理 **NVLink P2P（`65.8 GB/s`）+ 硬件 FP16 AllReduce + `sm_75` INT8 Tensor Core（`mma.sync.m8n8k16`）**。
+`strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度全栈工程重构，专为 **双魔改 RTX 3080 20 GB（Ampere `sm_86`，40 GB 总显存）** 打造，在 **100% 严格无损精度** 下榨干每一分硬件极限：
+- **无需改写 PCIe 寄存器扩 BAR1（原生 `256 MiB BAR1`）**：通过自研 **VMM 选择性 BAR1 映射 + 1-Hop Push-Write + VRAM Flag 屏障** 配合版本精确匹配的开源动态 BAR1 P2P 内核驱动（[patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)）与 **`72 × 1 GiB` 静态大页 + `iommu=pt`**，实测打通 **`50.86 GB/s` 全双工卡对卡直连**，热态均速首次突破 **`201.40 tok/s`**！
 
 > **口径承诺（100% 严格无损铁律）**：本文所有核心速度均采用**多轮均速或中位数**，所有实验均在 `temperature=0`、零降量化（原始 `UD-Q4_K_XL`）、`STRATA_ROUTE_TAIL_SKIP=0`（绝不丢弃冷门专家）、`BF16` 全精度跨卡 AllReduce 的条件下实测复现，并强制校验 Greedy SHA256（`code_refactor = 79e43b1e6dee`、`agent_json_edit = 6d0b72b248bc`）逐位一致。
 
@@ -69,17 +68,6 @@
 | **32K 单块引擎内部吞吐**（`32,768 tok`） | `3,823 tok/s` (`8,570 ms`) | **`4,267 tok/s`** (`7,680 ms`) | **`+11.6%`** | PLE 耗时由 `945 ms → 66 ms`（**14.3× 提速**） |
 | **40K 端到端 HTTP TTFT**（`39,551 tok`） | `3,142.9 tok/s` | **`3,690.9 tok/s`** | **`+17.4%`** | 并行 PLE + `STRATA_PREFILL_EQUAL=1` 均衡分块 |
 | **84K 长文冷启动 Prefill**（`83,656 tok`） | `3,780.0 tok/s` (`22,131 ms`) | **`3,870.0 tok/s`** (`21,616 ms`) | **新纪录 (`-515 ms`)** | 1 GiB 静态大页 + `iommu=pt` + 50.75 GB/s P2P Push-Pack |
-
-### 4. 双卡 RTX 2080 Ti 22 GB（Turing `sm_75` + 物理 NVLink）实机验证
-
-在 6 核工作站主机（`Xeon W-2135 6C/12T` + 四通道 DDR4-2666 + PCIe Gen3 x16，2× RTX 2080 Ti 22G + `NV2` NVLink）实测：
-
-| 实测维度（2× RTX 2080 Ti 22G） | 优化前（PCIe BF16 / `W8`） | **优化后（NVLink HW FP16 + `sm_75` INT8 TC + P0–P4 `W16`）** | 效果 |
-|---|---:|---:|---|
-| **GPU Verify 窗口基耗时**（`W2 / W3 / W4`） | `55 / 68 / 78 ms` | **`36 / 41 / 46 ms`** | **`-41.0%`**（NVLink `65.8 GB/s` + FP16 Reg-MLP） |
-| **16K–25K 冷启动长代码库** | `1,361 tok/s` / `74.6 tok/s` | **`1,474.9 tok/s` / `87.7 tok/s`** | Prefill **`+8.4%`**，预热命中 **`85.7%`** |
-| **16K–25K 多轮重构（`W16` 后缀）** | `~122` / `101 tok/s` | **增量 `150.2` / `107.7 ~ 109.2 tok/s`** | 命中率 **`91.3%`** |
-| **74K–154K 超长上下文连续生成** | >32K `mtp.cpp` 必崩 / `63.7 tok/s` | **110K Prefill `1,570.3`，Decode `91.0 ~ 103.6 tok/s`** | **彻底根治 >32K 崩溃**，Decode **`+55.9%`** |
 
 ---
 
@@ -288,8 +276,6 @@ cmake -B build86 -G Ninja \
   -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build86 --target strata -j $(nproc)
 
-# （如为双 RTX 2080 Ti 22G，将 -DCMAKE_CUDA_ARCHITECTURES=75 即可，原生启用 m8n8k16 INT8 TC + NVLink FP16）
-
 # 2. 应用 240W 帕累托超频 + PCIe MRRS=4096B + THP defer+madvise
 sudo python3 scripts/ampere-oc-power.py \
   --mem-offset 1800 --gpc-offset 120 --power-limit 240 \
@@ -322,7 +308,7 @@ strata serve: STRATA_TP2=1 ready: CUDA0 (4666 experts) + CUDA1 (5098 experts) = 
    - 仅将 `TpComm` 所需的 **36 MiB 连续通信块**（2 MiB Decode 环 + 2×16 MiB Prefill 双缓冲 + 64B VRAM 同步 Flag）通过 CUDA Driver VMM API（`dlopen("libcuda.so.1")` 零链接依赖，内置 bad-VA-hole 检测重试与双向硬件写入自检）映射进对端 256 MiB BAR1；
    - **全部采用单向 Push-Write（`st.global.wt`）+ 本地 760 GB/s VRAM 读取**，彻底规避比写入慢 3× 的 PCIe P2P 远端读；同步 Flag 位于同一对端 BAR1 窗口，依赖 PCIe Base Spec Posted-Write 严格保序规则确保零数据竞态且自旋等待零 PCIe 流量。
 2. **`72 × 1 GiB` 静态 HugePages 专家竞技场**（`src/core/pinned.cu`、`src/core/expert_source.cpp`）：优先分配 `MAP_HUGETLB | MAP_HUGE_1GB`（回退 `MAP_HUGE_2MB` / THP），71.73 GiB 专家池仅占 72 条 TLB 表项（100% 装入 Zen 2 2048 项 L2 dTLB），彻底消除 Swap 与 `khugepaged` 整理卡顿。
-3. **深度微核与长上下文套件（P0–P4）**：`T=16` 单组 `G=1` 全融合（AllReduce 次数 `192 → 96`）+ 5 桶长上下文 `DraftPolicy`（P0）、Prefill 路由引导 `13.5 ms` 热专家抢跑预热（P1）、寄存器缓存去重读 + `K` 路并发 PCIe/NVLink MLP AllReduce（P2）、Ampere `sm_86` (`m16n8k32`) & Turing `sm_75` (`4× m8n8k16`) INT8 Tensor Core（P4）。
+3. **深度微核与长上下文套件（P0–P4）**：`T=16` 单组 `G=1` 全融合（AllReduce 次数 `192 → 96`）+ 5 桶长上下文 `DraftPolicy`（P0）、Prefill 路由引导 `13.5 ms` 热专家抢跑预热（P1）、寄存器缓存去重读 + `K` 路并发 PCIe MLP AllReduce（P2）、Ampere `sm_86` (`m16n8k32`) INT8 Tensor Core（P4）。
 4. **双级混合草稿（`T=16` 256K 持久化后缀树 + DFlash2 BF16 TC）与 TP=2 多对话 RAM 泊车**：双标签页 Coding Agent 切换 TTFT 提速 `9.75×`（`99.7%` 复用）。
 5. **14.3× 并行内存 PLE（`945 ms → 66 ms`）+ `STRATA_PREFILL_EQUAL=1` 均衡切分 + 无头 `240W` 超频 / `MRRS 4096B`**：零掉精度，全面压榨每一瓦算力。
 

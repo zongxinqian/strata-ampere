@@ -1,7 +1,7 @@
 # strata-ampere
 
 <p align="center">
-  <b>Strictly lossless, high-throughput TP=2 + EP=2 fork of <a href="https://github.com/Niko1221/Strata">Strata</a> for dual modded Ampere (<code>sm_86</code> RTX 3080 20G · 50.86 GB/s Direct PCIe 4.0 P2P on native 256 MiB BAR1) &amp; Turing (<code>sm_75</code> RTX 2080 Ti 22G + NVLink).</b>
+  <b>Strictly lossless, high-throughput TP=2 + EP=2 fork of <a href="https://github.com/Niko1221/Strata">Strata</a> for dual modded Ampere (<code>sm_86</code> RTX 3080 20G · 50.86 GB/s Direct PCIe 4.0 P2P on native 256 MiB BAR1).</b>
 </p>
 
 <p align="center">
@@ -18,9 +18,8 @@
   <sub><b>Built-in Port 8080 Live Telemetry Dashboard</b>: 2× Modded RTX 3080 20GB now unlocked with <b>50.86 GB/s direct PCIe 4.0 x16 P2P + 72×1 GiB Static HugePages</b> — breaking <code>201.40 tok/s</code> warm mean (<code>252.01 tok/s</code> peak), <code>3,870 tok/s</code> 84K prefill, <code>41 °C / 36 °C</code> load, <code>0 Xid · 0 AER · 0 DMAR</code></sub>
 </p>
 
-`strata-ampere` is a systems-engineered fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) delivering **100% strictly lossless** MoE **Decode & Prefill** performance on two high-value modded dual-GPU rigs:
-- **2× Modded RTX 3080 20 GB (`sm_86`, 40 GB total VRAM)**: Unlocks **50.86 GB/s full-duplex card-to-card PCIe 4.0 x16 P2P** on the card's **native `256 MiB BAR1` (ZERO BAR1 resize / ZERO PCI `0x610` hacking!)** by combining our version-matched dynamic BAR1 open-gpu kernel patch ([patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)) with CUDA Driver VMM selective peer mapping (`39 / 256 MiB` BAR1 used), 1-hop Push-Write + VRAM-Flag AllReduce, and `72 × 1 GiB` Static HugePages + `iommu=pt`.
-- **2× Modded RTX 2080 Ti 22 GB (`sm_75`, 44 GB total VRAM)**: Native physical NVLink P2P (`65.8 GB/s`) + hardware FP16 AllReduce + Turing `sm_75` INT8 Tensor Core (`mma.sync.m8n8k16`).
+`strata-ampere` is a systems-engineered fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) built specifically for **2× Modded RTX 3080 20 GB (`sm_86`, 40 GB total VRAM)** to deliver **100% strictly lossless** MoE **Decode & Prefill** performance:
+- **50.86 GB/s full-duplex card-to-card PCIe 4.0 x16 P2P on the card's native `256 MiB BAR1` (ZERO BAR1 resize / ZERO PCI `0x610` hacking!)** by combining our version-matched dynamic BAR1 open-gpu kernel patch ([patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)) with CUDA Driver VMM selective peer mapping (`39 / 256 MiB` BAR1 used), 1-hop Push-Write + VRAM-Flag AllReduce, and `72 × 1 GiB` Static HugePages + `iommu=pt`.
 
 > **Strict Losslessness Guarantee**: Every headline number below is a multi-run average or median under `temperature=0`, original `UD-Q4_K_XL` quantization, `STRATA_ROUTE_TAIL_SKIP=0` (zero dropped experts), full `BF16` AllReduce, and bit-exact greedy SHA256 verification (`code_refactor = 79e43b1e6dee`, `agent_json_edit = 6d0b72b248bc`).
 
@@ -57,10 +56,6 @@
 | TP=2 Multi-Tab RAM Parking (`ConversationCache`) | `4,869.8 ms` (`0%`) | **`499.3 ms` (`99.7%`)** | **`9.75×` TTFT** | GPU 1 integrated into RAM parking (`55 ms` restore) |
 | Deep Kernel Suite P0–P4 (`W16 G=1`, P1, P2, P4 INT8 TC) | `186.72 tok/s` | **`194.55 tok/s`** | **`+4.2%`** | Halved AR barriers, 84K cold hit `+9.2%`, `m16n8k32` INT8 TC |
 | **1G HugePages + `iommu=pt` + 50.86 GB/s VMM Push-P2P** | `187.28` / `3,780` | **`192.26` (`201.4` warm) / `3,870`** | **Breaks 200 tok/s** | 72×1 GiB dTLB fit + native 256 MiB BAR1 direct P2P |
-
-### Dual RTX 2080 Ti 22 GB (Turing `sm_75` + NVLink) Verified Results
-
-Verified on 2× RTX 2080 Ti 22G (`NV2` NVLink `65.8 GB/s`) + 6-core `Xeon W-2135`: GPU verify latency **`-41.0%`** (`55/68/78 → 36/41/46 ms`), 16K–25K cold codebase **`1,474.9 / 87.7 tok/s`** (`85.7%` hit), multi-turn refactor **`150.2` delta / `109.2 tok/s`**, 110K prefill **`1,570.3 tok/s`**, 74K–154K decode **`91.0–103.6 tok/s`** (`+55.9%`, >32K OOB crash fixed).
 
 ---
 
