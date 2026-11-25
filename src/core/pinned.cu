@@ -46,6 +46,9 @@
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
 #endif
+#ifndef MAP_HUGE_1GB
+#define MAP_HUGE_1GB (30 << 26)
+#endif
 #endif
 
 namespace strata::core {
@@ -439,25 +442,51 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
     if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
         note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
     } else {
-        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+        // S5: Prefer 1 GiB static HugePages first (72 entries vs 36,727 x 2 MiB: 100% L2 dTLB fit on Zen2/3/4/5 +
+        // zero page-table walks + kernel-pinned anti-eviction). STRATA_NO_1GB_HUGEPAGES=1 skips 1 GiB for A/B testing.
+        constexpr uint64_t kHuge1G = 1ull << 30;
+        const uint64_t bytes_1g = (bytes + kHuge1G - 1) & ~(kHuge1G - 1);
+        if (std::getenv("STRATA_NO_1GB_HUGEPAGES") == nullptr) {
+            void* p1g = mmap(nullptr, (size_t) bytes_1g, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB, -1, 0);
+            if (p1g != MAP_FAILED) {
+                mapping_base = p1g;
+                mapping_bytes = bytes_1g;
+                got = PageBacking::LargePages;
+                note = "hugetlb 1 GB pages (" + std::to_string((unsigned long long) (bytes_1g >> 30)) + " x 1 GiB)";
+                return p1g;
+            }
+        }
+        constexpr uint64_t kHuge2M = 2ull << 20;
+        const uint64_t bytes_2m = (bytes + kHuge2M - 1) & ~(kHuge2M - 1);
+        void* p = mmap(nullptr, (size_t) bytes_2m, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
         if (p != MAP_FAILED) {
+            mapping_base = p;
+            mapping_bytes = bytes_2m;
             got = PageBacking::LargePages;
-            note = "hugetlb 2 MB pages";
+            note = "hugetlb 2 MB pages (" + std::to_string((unsigned long long) (bytes_2m >> 21)) + " x 2 MiB)";
             return p;
         }
         // MAP_HUGETLB is all-or-nothing: a pool smaller than the mapping fails exactly like an absent
         // one, and the old message guessed "no hugetlb pool configured" either way. Name the shortfall:
-        // how many 2 MiB pages the mapping needs against what vm.nr_hugepages actually holds.
-        const unsigned long long need = ((unsigned long long) bytes + (1ull << 21) - 1) / (1ull << 21);
-        unsigned long long pool = 0;
-        bool have_pool = false;
+        // how many 1 GiB / 2 MiB pages the mapping needs against what sysfs / vm.nr_hugepages actually holds.
+        const unsigned long long need = (unsigned long long) (bytes_2m >> 21);
+        const unsigned long long need_1g = (unsigned long long) (bytes_1g >> 30);
+        unsigned long long pool = 0, pool_1g = 0;
+        bool have_pool = false, have_1g = false;
         if (std::FILE* f = std::fopen("/proc/sys/vm/nr_hugepages", "r")) {
             have_pool = std::fscanf(f, "%llu", &pool) == 1;
             std::fclose(f);
         }
-        note = "MAP_HUGETLB unavailable (needed " + std::to_string(need) + " 2 MiB pages, vm.nr_hugepages=" +
-               (have_pool ? std::to_string(pool) : std::string("?")) + "); using 4 KB pages";
+        if (std::FILE* f = std::fopen("/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages", "r")) {
+            have_1g = std::fscanf(f, "%llu", &pool_1g) == 1;
+            std::fclose(f);
+        }
+        note = "MAP_HUGETLB unavailable (needed " + std::to_string(need_1g) + " 1 GiB [pool=" +
+               (have_1g ? std::to_string(pool_1g) : std::string("?")) + "] or " + std::to_string(need) +
+               " 2 MiB pages [vm.nr_hugepages=" + (have_pool ? std::to_string(pool) : std::string("?")) +
+               "]); using 4 KB pages";
     }
     // No hugetlb mapping: a 2 MiB-aligned anonymous mapping with MADV_HUGEPAGE, so transparent huge pages back
     // it where THP is "madvise" (the common distro default). The CPU expert pool streams whole experts out of

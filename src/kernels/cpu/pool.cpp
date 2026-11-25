@@ -3,6 +3,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/numa_pool.hpp"
 #include "strata/kernels/cpu/cgroup_cpu.hpp"
 
@@ -1023,6 +1024,20 @@ void ExpertPool::worker(int id) {
             drain_fused_multi(tid, nt_total, seen, false);
             continue;
         }
+        if (mode_ == 9) {
+            const int nw = (int) threads_.size();
+            const int nt_total = nw + (host_works_ ? 1 : 0);
+            const int tid = host_works_ ? id + 1 : id;
+            drain_prewarm_l3(tid, nt_total, seen, false);
+            continue;
+        }
+        if (mode_ == 10) {
+            const int nw = (int) threads_.size();
+            const int nt_total = nw + (host_works_ ? 1 : 0);
+            const int tid = host_works_ ? id + 1 : id;
+            drain_prewarm_blobs(tid, nt_total, false);
+            continue;
+        }
         parked_of(id).fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
 
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
@@ -1621,6 +1636,281 @@ void ExpertPool::drain_fused_multi(int tid, int nt_total, uint32_t epoch, bool i
     } else {
         fused_p6_done_.fetch_add(1, std::memory_order_release);
     }
+}
+
+void ExpertPool::drain_prewarm_l3(int tid, int nt_total, uint32_t epoch, bool is_host) {
+    const PrewarmSpec& sp = *prewarm_spec_;
+    const int ne = sp.n_expert;
+    const int embd = sp.n_embd;
+    const int S = prewarm_s_;
+    const int e0 = (tid * ne) / nt_total;
+    const int e1 = ((tid + 1) * ne) / nt_total;
+    const int rows = e1 - e0;
+
+    // Phase 9A: parallel AVX2 BF16 router dot for slice [e0, e1) across S sampled tokens (~6-10 us).
+    if (rows > 0 && !(sp.seq != nullptr && *sp.seq >= sp.next_want)) {
+        float local_out[8 * 64]; // rows <= 64 for NE=512, nt>=8; dynamic fallback below
+        std::vector<float> heap_out;
+        float* dst = local_out;
+        if (S * rows > 8 * 64) {
+            heap_out.resize((size_t) (S * rows));
+            dst = heap_out.data();
+        }
+        bf16_rows_dot_multi(sp.router_bf16 + (size_t) e0 * (size_t) embd, rows, embd, prewarm_x_.data(), S, dst);
+        for (int s = 0; s < S; ++s) {
+            std::memcpy(prewarm_logits_.data() + (size_t) s * (size_t) ne + (size_t) e0,
+                        dst + (size_t) s * (size_t) rows, (size_t) rows * sizeof(float));
+        }
+    }
+
+    if (is_host) {
+        while (fused_p5_done_.load(std::memory_order_acquire) != (uint32_t) threads_.size()) strata_cpu_pause();
+        fused_p5_done_.store(0, std::memory_order_relaxed);
+        int n_blobs = 0;
+        if (sp.seq != nullptr && *sp.seq >= sp.next_want) {
+            prewarm_aborted_.store(1, std::memory_order_relaxed);
+        } else {
+            // Vote-rank non-resident experts across S sampled tokens' top-K predictions
+            const int topk = std::min(std::max(sp.top_per_tok, 1), std::min(ne, 24));
+            const int max_m = std::min(std::max(sp.max_k, 1), 32);
+            int votes[1024];
+            const int ne_cap = std::min(ne, 1024);
+            std::memset(votes, 0, (size_t) ne_cap * sizeof(int));
+            int top_idx[24];
+            float top_val[24];
+            for (int s = 0; s < S; ++s) {
+                const float* lt = prewarm_logits_.data() + (size_t) s * (size_t) ne;
+                int nt_cur = 0;
+                for (int e = 0; e < ne_cap; ++e) {
+                    const float v = lt[e];
+                    if (nt_cur < topk) {
+                        int p = nt_cur++;
+                        while (p > 0 && v > top_val[p - 1]) {
+                            top_val[p] = top_val[p - 1];
+                            top_idx[p] = top_idx[p - 1];
+                            --p;
+                        }
+                        top_val[p] = v;
+                        top_idx[p] = e;
+                    } else if (v > top_val[topk - 1]) {
+                        int p = topk - 1;
+                        while (p > 0 && v > top_val[p - 1]) {
+                            top_val[p] = top_val[p - 1];
+                            top_idx[p] = top_idx[p - 1];
+                            --p;
+                        }
+                        top_val[p] = v;
+                        top_idx[p] = e;
+                    }
+                }
+                for (int j = 0; j < nt_cur; ++j) {
+                    const int e = top_idx[j];
+                    if ((sp.res0 != nullptr && sp.res0[e] >= 0) || (sp.res1 != nullptr && sp.res1[e] >= 0)) continue;
+                    votes[e] += (topk + 4 - j);
+                }
+            }
+            int pick_e[32];
+            int pick_v[32];
+            int np = 0;
+            for (int e = 0; e < ne_cap; ++e) {
+                const int v = votes[e];
+                if (v <= 0) continue;
+                if (np < max_m) {
+                    int p = np++;
+                    while (p > 0 && v > pick_v[p - 1]) {
+                        pick_v[p] = pick_v[p - 1];
+                        pick_e[p] = pick_e[p - 1];
+                        --p;
+                    }
+                    pick_v[p] = v;
+                    pick_e[p] = e;
+                } else if (v > pick_v[max_m - 1]) {
+                    int p = max_m - 1;
+                    while (p > 0 && v > pick_v[p - 1]) {
+                        pick_v[p] = pick_v[p - 1];
+                        pick_e[p] = pick_e[p - 1];
+                        --p;
+                    }
+                    pick_v[p] = v;
+                    pick_e[p] = e;
+                }
+            }
+            for (int i = 0; i < np; ++i) {
+                const uint8_t* b = sp.get_blob != nullptr ? sp.get_blob(sp.get_blob_ctx, pick_e[i]) : nullptr;
+                if (b != nullptr) {
+                    if (sp.out_picked != nullptr) sp.out_picked[n_blobs] = pick_e[i];
+                    prewarm_blobs_[n_blobs++] = b;
+                }
+            }
+        }
+        prewarm_n_blobs_ = n_blobs;
+        if (sp.out_n_picked != nullptr) *sp.out_n_picked = n_blobs;
+        fused_p5_go_.store(epoch, std::memory_order_release);
+    } else {
+        fused_p5_done_.fetch_add(1, std::memory_order_release);
+        while (fused_p5_go_.load(std::memory_order_acquire) != epoch) strata_cpu_pause();
+    }
+
+    // Phase 9B: abortable CCX-spread L3 cache pre-streaming (stride 64B cache lines, check doorbell every 4 KiB)
+    const int M = prewarm_n_blobs_;
+    if (M > 0 && sp.blob_bytes >= 64) {
+        const uint64_t bb = sp.blob_bytes;
+        const uint64_t total = (uint64_t) M * bb;
+        const uint64_t b0 = ((uint64_t) tid * total) / (uint64_t) nt_total;
+        const uint64_t b1 = ((uint64_t) (tid + 1) * total) / (uint64_t) nt_total;
+        uint64_t acc = 0;
+        uint64_t touched = 0;
+        bool aborted = false;
+        for (uint64_t pos = b0 & ~63ull; pos < b1; ) {
+            if (sp.seq != nullptr && *sp.seq >= sp.next_want) {
+                aborted = true;
+                break;
+            }
+            const int m = (int) (pos / bb);
+            const uint64_t off = pos - (uint64_t) m * bb;
+            const uint64_t blob_rem = bb - off;
+            const uint64_t slice_rem = b1 - pos;
+            uint64_t chunk = blob_rem < slice_rem ? blob_rem : slice_rem;
+            if (chunk > 4096ull) chunk = 4096ull;
+            const uint8_t* p = prewarm_blobs_[m] + off;
+            for (uint64_t k = 0; k + 64ull <= chunk; k += 64ull) {
+                uint64_t v;
+                std::memcpy(&v, p + k, sizeof v);
+                acc ^= v;
+            }
+            touched += chunk;
+            pos += chunk;
+        }
+        static volatile uint64_t g_prewarm_sink = 0;
+        if (acc == 0xdeadbeefcafebabeULL) g_prewarm_sink = acc; // prevents dead-code elimination without cache-line ping-pong
+        if (aborted) prewarm_aborted_.store(1, std::memory_order_relaxed);
+        if (sp.out_bytes_touched != nullptr) prewarm_touched_.fetch_add(touched, std::memory_order_relaxed);
+    }
+
+    if (is_host) {
+        while (fused_p6_done_.load(std::memory_order_acquire) != (uint32_t) threads_.size()) strata_cpu_pause();
+    } else {
+        fused_p6_done_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void ExpertPool::prewarm_l3_next_layer(const PrewarmSpec& spec) {
+    if (!host_works_ || spec.router_bf16 == nullptr || spec.x_f == nullptr || spec.n_expert <= 0 || spec.n_embd <= 0 ||
+        spec.n_tok <= 0 || spec.blob_bytes == 0 || spec.get_blob == nullptr || threads_.empty() || numa_n_ != 0)
+        return;
+    if (spec.seq != nullptr && *spec.seq >= spec.next_want) {
+        if (spec.out_n_picked) *spec.out_n_picked = 0;
+        if (spec.out_aborted) *spec.out_aborted = 1;
+        return;
+    }
+    const int S = std::min(std::max(spec.max_sample_toks, 1), std::min(spec.n_tok, 8));
+    if (prewarm_x_.size() < (size_t) (S * spec.n_embd)) prewarm_x_.resize((size_t) (S * spec.n_embd));
+    if (prewarm_logits_.size() < (size_t) (S * spec.n_expert)) prewarm_logits_.resize((size_t) (S * spec.n_expert));
+    for (int s = 0; s < S; ++s) {
+        const int tok = S == 1 ? 0 : (s * (spec.n_tok - 1)) / (S - 1);
+        std::memcpy(prewarm_x_.data() + (size_t) s * (size_t) spec.n_embd,
+                    spec.x_f + (size_t) tok * (size_t) spec.n_embd,
+                    (size_t) spec.n_embd * sizeof(float));
+    }
+    wait_parked("before prewarm l3");
+    const int nw = (int) threads_.size();
+    const int nt_total = nw + (host_works_ ? 1 : 0);
+    prewarm_spec_ = &spec;
+    prewarm_s_ = S;
+    prewarm_n_blobs_ = 0;
+    prewarm_aborted_.store(0, std::memory_order_relaxed);
+    prewarm_touched_.store(0, std::memory_order_relaxed);
+    fused_p5_done_.store(0, std::memory_order_relaxed);
+    fused_p6_done_.store(0, std::memory_order_relaxed);
+    mode_ = 9;
+    const uint32_t ep = epoch_.load(std::memory_order_relaxed) + 1;
+    publish();
+    if (host_works_) {
+        drain_prewarm_l3(0, nt_total, ep, true);
+    } else {
+        while (fused_p5_done_.load(std::memory_order_acquire) != (uint32_t) nw) strata_cpu_pause();
+        fused_p5_done_.store(0, std::memory_order_relaxed);
+        fused_p5_go_.store(ep, std::memory_order_release);
+        while (fused_p6_done_.load(std::memory_order_acquire) != (uint32_t) nw) strata_cpu_pause();
+    }
+    mode_ = 0;
+    if (spec.out_aborted != nullptr) *spec.out_aborted = (int) prewarm_aborted_.load(std::memory_order_relaxed);
+    if (spec.out_bytes_touched != nullptr) *spec.out_bytes_touched = prewarm_touched_.load(std::memory_order_relaxed);
+    prewarm_spec_ = nullptr;
+}
+
+void ExpertPool::drain_prewarm_blobs(int tid, int nt_total, bool is_host) {
+    const int M = prewarm_n_blobs_;
+    const uint64_t bb = prewarm_blob_bytes_;
+    const volatile uint32_t* seq = prewarm_seq_;
+    const uint32_t next_want = prewarm_next_want_;
+    if (M > 0 && bb >= 64) {
+        const uint64_t total = (uint64_t) M * bb;
+        const uint64_t b0 = ((uint64_t) tid * total) / (uint64_t) nt_total;
+        const uint64_t b1 = ((uint64_t) (tid + 1) * total) / (uint64_t) nt_total;
+        uint64_t acc = 0;
+        uint64_t touched = 0;
+        bool aborted = false;
+        for (uint64_t pos = b0 & ~63ull; pos < b1; ) {
+            if (seq != nullptr && *seq >= next_want) {
+                aborted = true;
+                break;
+            }
+            const int m = (int) (pos / bb);
+            const uint64_t off = pos - (uint64_t) m * bb;
+            const uint64_t blob_rem = bb - off;
+            const uint64_t slice_rem = b1 - pos;
+            uint64_t chunk = blob_rem < slice_rem ? blob_rem : slice_rem;
+            if (chunk > 2048ull) chunk = 2048ull;
+            const uint8_t* p = prewarm_blobs_[m] + off;
+            for (uint64_t k = 0; k + 64ull <= chunk; k += 64ull) {
+                uint64_t v;
+                std::memcpy(&v, p + k, sizeof v);
+                acc ^= v;
+            }
+            touched += chunk;
+            pos += chunk;
+        }
+        static volatile uint64_t g_prewarm_sink2 = 0;
+        if (acc == 0xdeadbeefcafebabeULL) g_prewarm_sink2 = acc;
+        if (aborted) prewarm_aborted_.store(1, std::memory_order_relaxed);
+        if (prewarm_want_bytes_) prewarm_touched_.fetch_add(touched, std::memory_order_relaxed);
+    }
+    if (is_host) {
+        while (fused_p6_done_.load(std::memory_order_acquire) != (uint32_t) threads_.size()) strata_cpu_pause();
+    } else {
+        fused_p6_done_.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void ExpertPool::prewarm_l3_blobs(const uint8_t* const* blobs, int n_blobs, uint64_t blob_bytes,
+                                  const volatile uint32_t* seq, uint32_t next_want,
+                                  int* out_aborted, uint64_t* out_bytes_touched) {
+    if (!host_works_ || blobs == nullptr || n_blobs <= 0 || blob_bytes < 64 || threads_.empty() || numa_n_ != 0)
+        return;
+    if (seq != nullptr && *seq >= next_want) {
+        if (out_aborted) *out_aborted = 1;
+        if (out_bytes_touched) *out_bytes_touched = 0;
+        return;
+    }
+    const int M = std::min(n_blobs, 32);
+    wait_parked("before prewarm blobs");
+    for (int i = 0; i < M; ++i) prewarm_blobs_[i] = blobs[i];
+    prewarm_n_blobs_ = M;
+    prewarm_blob_bytes_ = blob_bytes;
+    prewarm_seq_ = seq;
+    prewarm_next_want_ = next_want;
+    prewarm_want_bytes_ = (out_bytes_touched != nullptr);
+    prewarm_aborted_.store(0, std::memory_order_relaxed);
+    prewarm_touched_.store(0, std::memory_order_relaxed);
+    fused_p6_done_.store(0, std::memory_order_relaxed);
+    mode_ = 10;
+    const int nt_total = (int) threads_.size() + 1;
+    publish();
+    drain_prewarm_blobs(0, nt_total, true);
+    mode_ = 0;
+    if (out_aborted != nullptr) *out_aborted = (int) prewarm_aborted_.load(std::memory_order_relaxed);
+    if (out_bytes_touched != nullptr) *out_bytes_touched = prewarm_touched_.load(std::memory_order_relaxed);
 }
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic, const SplitPreAct* pre_act) {

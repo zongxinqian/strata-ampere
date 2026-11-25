@@ -244,6 +244,15 @@ public:
     bool set_tp_head_peer(strata::kernels::ArgHalf* h_arg, uint32_t* h_flag);
     strata::kernels::ArgHalf* h_head_arg() const { return h_head_arg_; }
     uint32_t* h_head_flag() const { return h_head_flag_; }
+    /// #2-B: optional abortable L->L+1 CPU L3 cache pre-warming hook called right after `*flag = want`
+    /// while GPUs run layer L combine/allreduce and layer L+1 attention/GDN/router.
+    using IdlePrewarmFn = void (*)(void* user, const float* x_f, const int32_t* ids, int n_tok, int k,
+                                   int64_t cur_layer, int64_t next_layer, const volatile uint32_t* seq,
+                                   uint32_t next_want);
+    void set_idle_prewarm(IdlePrewarmFn fn, void* user) {
+        idle_prewarm_ = fn;
+        idle_prewarm_user_ = user;
+    }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
@@ -876,6 +885,8 @@ private:
     void stop_tp1_launcher();
     void start_tp1_launch(cudaGraphExec_t exec, cudaStream_t cs);
     bool wait_tp1_launch(std::string& err);
+    IdlePrewarmFn idle_prewarm_ = nullptr;
+    void* idle_prewarm_user_ = nullptr;
 };
 
 }  // namespace strata::core

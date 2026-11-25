@@ -200,6 +200,12 @@ tp_allreduce_bf16_reg_kernel(float* __restrict__ local_buf,
     }
 }
 
+__global__ void tp_p2p_selftest_write_kernel(uint32_t* __restrict__ remote_dst, uint32_t magic, int n) {
+    const int tid = threadIdx.x;
+    if (tid < n) remote_dst[tid] = magic ^ (uint32_t) (tid * 2654435761u);
+    if (tid == 0) __threadfence_system();
+}
+
 __global__ void tp_allreduce_bf16_kernel(float* __restrict__ local_buf,
                                          float* __restrict__ my_map_base,
                                          const float* __restrict__ peer_map_base,
@@ -805,6 +811,27 @@ bool TpComm::init(int dev0, int dev1, size_t max_floats, std::string& err) {
                             alloc_ok = false;
                             break;
                         }
+                    }
+                }
+                if (alloc_ok) {
+                    // Self-verify bidirectional direct BAR1/NVLink kernel stores (#2666 guard against broken host bridges/ACS)
+                    constexpr int kTestN = 64;
+                    uint32_t verify[kTestN];
+                    for (int r = 0; r < 2 && alloc_ok; ++r) {
+                        const uint32_t magic = r == 0 ? 0x5A3C96F1u : 0xA5C3690Eu;
+                        cudaSetDevice(dev_[r]);
+                        tp_p2p_selftest_write_kernel<<<1, kTestN>>>(reinterpret_cast<uint32_t*>(d_dec_buf_[1 - r]), magic, kTestN);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { alloc_ok = false; break; }
+                        cudaSetDevice(dev_[1 - r]);
+                        std::memset(verify, 0, sizeof verify);
+                        if (cudaMemcpy(verify, d_dec_buf_[1 - r], sizeof verify, cudaMemcpyDeviceToHost) != cudaSuccess) { alloc_ok = false; break; }
+                        for (int i = 0; i < kTestN; ++i) {
+                            if (verify[i] != (magic ^ (uint32_t) (i * 2654435761u))) { alloc_ok = false; break; }
+                        }
+                        if (alloc_ok) (void) cudaMemset(d_dec_buf_[1 - r], 0, sizeof verify);
+                    }
+                    if (!alloc_ok) {
+                        std::fprintf(stderr, "strata tp_comm: P2P reported available but direct BAR1 store self-test failed; falling back to host route\n");
                     }
                 }
                 if (alloc_ok) {

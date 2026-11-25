@@ -6177,6 +6177,50 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             return false;
         }
         if (hm.available < need) {
+#if defined(__linux__)
+            // S5: Check pre-reserved 1 GiB / 2 MiB static HugePage pools before waiting 20s for RAM:
+            // Linux MemAvailable excludes static hugetlbfs pools, so a host that reserved 72 x 1 GiB
+            // (or 36,728 x 2 MiB) pages specifically for the expert arena already has the full arena
+            // ready in hugetlb and must not stall 20s or fall back to --mmap-experts.
+            auto read_sysfs_u64 = [](const char* p) -> uint64_t {
+                uint64_t v = 0;
+                if (std::FILE* f = std::fopen(p, "r")) {
+                    unsigned long long tmp = 0;
+                    if (std::fscanf(f, "%llu", &tmp) == 1) v = (uint64_t) tmp;
+                    std::fclose(f);
+                }
+                return v;
+            };
+            auto static_hugetlb_ready_bytes = [&](uint64_t map_bytes) -> uint64_t {
+                if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr || !shared_arena_file.empty() || arena_mmap) return 0;
+                if (std::getenv("STRATA_NO_1GB_HUGEPAGES") == nullptr) {
+                    const uint64_t f1g = read_sysfs_u64("/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages");
+                    const uint64_t r1g = read_sysfs_u64("/sys/kernel/mm/hugepages/hugepages-1048576kB/resv_hugepages");
+                    const uint64_t avail_1g = f1g > r1g ? f1g - r1g : 0;
+                    const uint64_t need_1g = (map_bytes + (1ull << 30) - 1) >> 30;
+                    if (avail_1g >= need_1g) return avail_1g << 30;
+                }
+                const uint64_t f2m = read_sysfs_u64("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages");
+                const uint64_t r2m = read_sysfs_u64("/sys/kernel/mm/hugepages/hugepages-2048kB/resv_hugepages");
+                const uint64_t avail_2m = f2m > r2m ? f2m - r2m : 0;
+                const uint64_t need_2m = (map_bytes + (2ull << 20) - 1) >> 21;
+                if (avail_2m >= need_2m) return avail_2m << 21;
+                return 0;
+            };
+            uint64_t map_bytes_est = want + (uint64_t) blob;
+            if (pin_by_need_ && !pin_pairs_.empty() && !arena_mmap && shared_arena_file.empty()) {
+                uint64_t at = 0;
+                for (int64_t l = 0; l < n_layers; ++l)
+                    at += ((lay.blob_bytes(l) + 4095) & ~(uint64_t) 4095) * (uint64_t) n_expert;
+                map_bytes_est = at + (uint64_t) blob;
+            }
+            const uint64_t hugetlb_b = static_hugetlb_ready_bytes(map_bytes_est);
+            if (hugetlb_b >= map_bytes_est) {
+                hm.available = hm.available > UINT64_MAX - hugetlb_b ? UINT64_MAX : hm.available + hugetlb_b;
+            }
+        }
+        if (hm.available < need) {
+#endif
             // #4051: the shortfall is often an engine that was still exiting (the code's own example), a few seconds
             // from giving its RAM back: wait for it, not for ever, and say so.  STRATA_ARENA_RAM_WAIT_S changes the
             // seconds (0 loads at once, as before this wait).  Still short after it (and after the give-back below): the caller's

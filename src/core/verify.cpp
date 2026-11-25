@@ -4337,6 +4337,10 @@ bool Verifier::run_common(int T, int fork, int parent, const int32_t* tokens, in
             ms_host += ms_since(tp);
         }
         if (!(test_stall && k + 1 == steps)) *flag = want;
+        if (idle_prewarm_ != nullptr && G == 1 && k + 1 < steps) {
+            idle_prewarm_(idle_prewarm_user_, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k,
+                          n, (int) ss.k, l, l + 1, seq, want + 1);
+        }
         if (h_bal_ != nullptr) bal_p_[(size_t) ((k / G) * 2 + grp)] = ms_since(b);
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);

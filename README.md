@@ -51,6 +51,7 @@
 | **代码 Decode**（无头超频 + `320W` 满血档） | `189.42 tok/s`（默认 320W） | **`209.80 tok/s`**（2 轮均值） | **`+10.8%`** | 显存实频 `10,151 MHz`（GDDR6X ECC 临界点内） |
 | **代码重构 / Agent JSON / 跨请求**（双级混合草稿 `T=16` + 持久化后缀树） | `185.46 tok/s`（4 场景热态均值） | **`229.98 tok/s`**（3 轮含冷态均值 `206.08`） | **`+24.0%`** | Agent JSON `237.5 → 290.4 tok/s` (`+22.3%`)，Python 重构 `196.0 → 215.9 tok/s` (`+10.1%`)，贪婪 SHA 逐位一致 |
 | **深度内核 P0–P4 套件**（`W16 G=1` 全融合 + Prefill 预热 + Reg-MLP AR + `sm_86` INT8 TC） | `186.72 tok/s`（4 任务热态基准） | **`194.55 tok/s`**（`240W`，84K 增量 **`203.5 tok/s`**） | **`+4.2%`** | 84K 冷启动命中率 `70.0% → 79.2%`（`+9.2%`）、Decode `140.1 → 150.7 tok/s`（`+7.6%`）；`cross_req +13.6%`，贪心 SHA 逐位一致 |
+| **1 GiB / 2 MiB 静态 HugePages 专家竞技场**（`MAP_HUGE_1GB` 优先 + 2 MiB 内核锁定防驱逐） | `187.28 tok/s`（2 轮均速） / `203.50`（84K 增量） | **`187.76 tok/s`**（2 轮均速） / **`207.90 tok/s`**（84K 增量） | **防驱逐 + 84K `+2.2%`** | 全量 `71.73 GiB` 专家池永久锁入内核 `Hugetlb`（零 Swap / 零 `khugepaged` 整理卡顿）；重启加 `hugepagesz=1G hugepages=72` 自动切 72 页 1 GiB 大页（100% 装入 Zen 2 L2 dTLB） |
 
 ### 3. Prefill 提示词处理速度（严格无损，Decode 零退化）
 
@@ -133,8 +134,11 @@
   - **P3（按批内命中次数阈值动态分流 A/B 验证）**：在 `expert_source.cpp` 实现可选 `STRATA_PCIE_HIT_MIN=N`，但在本机四通道 DDR4-3200（`77.8 GB/s`）+ 非 P2P 双卡上实测 `--pcie-frac 0.30` 反降 `-4.6%`（因关闭片上 `can_mega_router` 且 PCIe 搬冷专家与 AllReduce 争抢主桥带宽），按严格无回退原则默认关闭（`--pcie-frac 0`），保留为慢速双通道内存平台可选开关。
   - **P4（Ampere `sm_86` + Turing `sm_75` INT8 Tensor Core）**：在 `q8_sm86_fast.cuh` 与 `native_mmvq.cu` 中为 `T = 8..16` 的 `Q8_0 × Q8_1` 稠密投影与 LM Head 引入 PTX 张量核（`STRATA_Q8_TC=1`）——Ampere `sm_80+` 走 `mma.sync.aligned.m16n8k32`，Turing `sm_75`（RTX 2080 Ti）自动走 4 条 `mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32` 拼出完全按位等价的 `16×8×32` `int32` 点积（2080 Ti 独立校验 `0/4096` 误差），单次加载 16×32 权重瓦片共享给最多 16 列。3080 240W 4 任务热态均速刷新至 **`194.55 tok/s`**、84K 增量突破 **`203.50 tok/s`**。
   - **Turing `sm_75` + NVLink 专项增强与 >32K 稳定性修复**：
-    - `tp_comm.hpp` / `tp_comm.cu` 新增 **NVLink P2P 直连显存通路（`STRATA_TP_AR_P2P=1`）**、`tp_allreduce_fp16_reg_kernel<K>`（硬件 FP16 寄存器缓存 + `K` 路并发）与 Prefill 硬件 FP16 打包/解包核（`STRATA_TP_AR_MODE=fp16` / `STRATA_TP_AR_DECODE=fp16`），实测双 2080 Ti NVLink 双向聚合 **`65.8 GB/s`**；
+    - `tp_comm.hpp` / `tp_comm.cu` 新增 **NVLink P2P 直连显存通路（`STRATA_TP_AR_P2P=1` + 双向 BAR1 硬件写入自检防坏主桥 `#2666`）**、`tp_allreduce_fp16_reg_kernel<K>`（硬件 FP16 寄存器缓存 + `K` 路并发）与 Prefill 硬件 FP16 打包/解包核（`STRATA_TP_AR_MODE=fp16` / `STRATA_TP_AR_DECODE=fp16`），实测双 2080 Ti NVLink 双向聚合 **`65.8 GB/s`**；
     - 修复 `src/core/mtp.cpp` 在上下文 **`> 32,768` tokens** 时 `window_ids` 覆写共享 `ident_` 数组导致 `iq_embed_rows` 越界访问崩溃（`illegal memory access`）的底层 Bug，并补充 CUDA 12.x / 13.x `cudaGraphAddNode` 兼容宏。
+- **底层内存与跨层预取架构升级（1 GiB / 2 MiB 静态 HugePages + 可选 L3 预取）**：
+  - **1 GiB / 2 MiB 静态 HugePages 专家竞技场**（`src/core/pinned.cu`、`src/core/expert_source.cpp`）：升级 `PinnedArena::reserve()` 优先尝试 `MAP_HUGETLB | MAP_HUGE_1GB`（`72` 页覆盖 `71.73 GiB`，512× 压缩页表并 100% 装入 Zen 2 2048 项 L2 dTLB），自动回退 `MAP_HUGE_2MB`（`36,727` 页）并直接读取 `sysfs` 1G/2M 大页空闲池（消除 20s 误判等待）。本机在线实测 `36,727 × 2 MiB` 静态 `Hugetlb` + `cudaHostRegister PORTABLE ok`，240W 2 轮均速刷新至 **`187.76 tok/s`**、84K 增量 Decode 达 **`207.90 tok/s`**，且 71.73 GiB 专家池永久锁定零 Swap 抖动（持久化于 `/etc/sysctl.d/99-strata-hugepages.conf`；若需升至 1 GiB 静态大页，移除该 sysctl 并在 GRUB 加 `hugepagesz=1G hugepages=72` 重启即可自动接管）。
+  - **跨层 `L → L+1` 可中断 CPU L3 缓存预取（可选 `STRATA_L3_PREWARM=1|2`）**（`src/kernels/cpu/pool.cpp`、`src/core/verify.cpp`、`src/program/generate.cpp`）：实现路由前瞻（`=1`）与零路由器权重时序高频冷专家（`=2`）两种可 `<0.5 us` 即时中止的 L3 预取，但在 2×3080 40 GB（9,750 专家已常驻显存，剩余冷专家长尾精确率仅 `36–38%`）实测会与 GPU PCIe AllReduce 争抢 DDR4 控制器导致负优化，按严格无回退铁律默认关闭（`=0`），保留为小显存单卡场景可选实验开关。
 - **CPU 专家池 CCX 绑核对齐**：
   - `--pool-workers 15` 跨 Threadripper 8 个 CCX 绑核（`15 worker + 1 host` = 16 活跃线程），吃满四通道 DDR4-3200 带宽且避免跨 CCX 争抢。
 

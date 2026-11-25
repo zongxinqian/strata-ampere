@@ -279,6 +279,38 @@ public:
     /// Run `n_tasks` independent callbacks `fn(ctx, task_id)` across all spinning pool workers (and host when host_works_).
     void run_range(int n_tasks, void (*fn)(void*, int), void* ctx);
 
+    /// #2-B (100% lossless): Speculatively predict layer L+1's non-resident cold experts from layer L's
+    /// activation x_f using all spinning pool cores, and pre-stream their blobs from DDR4 into CPU L3 cache
+    /// while GPUs run layer L Combine/AllReduce + layer L+1 Attention/GDN. Aborts in <1 us as soon as
+    /// `*seq >= next_want`. Zero writes to any model tensor; mathematically 100% bit-exact.
+    struct PrewarmSpec {
+        const uint16_t* router_bf16 = nullptr;
+        int n_expert = 0;
+        int n_embd = 0;
+        const float* x_f = nullptr;
+        int n_tok = 0;
+        int max_sample_toks = 4;
+        const int32_t* res0 = nullptr;
+        const int32_t* res1 = nullptr;
+        uint64_t blob_bytes = 0;
+        const uint8_t* (*get_blob)(void*, int) = nullptr;
+        void* get_blob_ctx = nullptr;
+        const volatile uint32_t* seq = nullptr;
+        uint32_t next_want = 0;
+        int max_k = 12;
+        int top_per_tok = 12;
+        int* out_picked = nullptr;
+        int* out_n_picked = nullptr;
+        int* out_aborted = nullptr;
+        uint64_t* out_bytes_touched = nullptr;
+    };
+    void prewarm_l3_next_layer(const PrewarmSpec& spec);
+    /// #2-B v2: Zero-router-weight abortable L3 cache pre-streaming of pre-selected cold expert blobs.
+    /// Zero router memory pollution, single fused barrier, <0.5 us doorbell abort latency.
+    void prewarm_l3_blobs(const uint8_t* const* blobs, int n_blobs, uint64_t blob_bytes,
+                          const volatile uint32_t* seq, uint32_t next_want,
+                          int* out_aborted = nullptr, uint64_t* out_bytes_touched = nullptr);
+
     /// **WHERE `run()` SPENDS ITS TIME, in milliseconds accumulated over its lifetime.**  Three phases per
     /// layer - wait for every worker to be parked, wait for the drain, wait for them to re-park - and until now
     /// all three were reported as one number.  Without the split there is no way to tell a pool that is slow at
@@ -410,6 +442,21 @@ private:
     alignas(64) std::atomic<uint32_t> fused_p5_go_{0};
     alignas(64) std::atomic<uint32_t> fused_p6_done_{0};
     void drain_fused_multi(int tid, int nt_total, uint32_t epoch, bool is_host);
+    // Mode 9 (#2-B): abortable L->L+1 L3 cache pre-warming state (reuses spinning workers + fused barriers)
+    const PrewarmSpec* prewarm_spec_ = nullptr;
+    int prewarm_s_ = 0;
+    int prewarm_n_blobs_ = 0;
+    std::vector<float> prewarm_x_;
+    std::vector<float> prewarm_logits_;
+    const uint8_t* prewarm_blobs_[32] = {};
+    alignas(64) std::atomic<uint32_t> prewarm_aborted_{0};
+    alignas(64) std::atomic<uint64_t> prewarm_touched_{0};
+    uint64_t prewarm_blob_bytes_ = 0;
+    const volatile uint32_t* prewarm_seq_ = nullptr;
+    uint32_t prewarm_next_want_ = 0;
+    bool prewarm_want_bytes_ = false;
+    void drain_prewarm_l3(int tid, int nt_total, uint32_t epoch, bool is_host);
+    void drain_prewarm_blobs(int tid, int nt_total, bool is_host);
     std::vector<SplitBufMulti> split_multi_;
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the

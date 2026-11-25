@@ -13382,6 +13382,217 @@ int main(int argc, char** argv) {
                          (long long) xcache.slots(), tp1->dev, (long long) tp1->cache.slots(),
                          (long long) (xcache.slots() + tp1->cache.slots()));
         }
+        // #2-B: Cross-Layer L -> L+1 speculative CPU cold-expert L3 cache pre-warming (100% bit-exact lossless).
+        // Mode 1 (STRATA_L3_PREWARM=1): next-layer BF16 router lookahead.
+        // Mode 2 (STRATA_L3_PREWARM=2): zero-router-weight temporal high-confidence cold-miss pre-streaming (0 MiB router L3 pollution).
+        struct L3PrewarmCtx {
+            strata::core::ExpertDispatch* d = nullptr;
+            std::vector<std::vector<uint16_t>> routers;
+            std::vector<uint64_t> blob_bytes;
+            std::vector<uint8_t> cold_streak; // [n_layers * n_expert], saturating streak of consecutive windows missed
+            std::vector<uint8_t> cold_hits;   // [n_layers * n_expert], last-window token hits for tie-breaking
+            int mode = 0;
+            int n_layers = 0;
+            int n_expert = 0;
+            int n_embd = 0;
+            int max_k = 3;
+            int min_streak = 2;
+            int sample_toks = 4;
+            int top_per_tok = 12;
+            bool stats_on = false;
+            int64_t last_pred_layer = -1;
+            int last_picked[32] = {};
+            int last_n_picked = 0;
+            uint64_t st_layers = 0, st_aborts = 0, st_pred = 0, st_actual = 0, st_hits = 0, st_bytes = 0;
+            struct BlobCtx { strata::core::ExpertSource* src; int64_t layer; };
+            static const uint8_t* fetch_blob(void* p, int e) {
+                const auto* bc = static_cast<const BlobCtx*>(p);
+                return bc->src->blob(bc->layer, e);
+            }
+            static void run(void* user, const float* x_f, const int32_t* ids, int n_tok, int k,
+                            int64_t cur_layer, int64_t next_layer, const volatile uint32_t* seq, uint32_t next_want) {
+                auto* c = static_cast<L3PrewarmCtx*>(user);
+                if (c->d == nullptr || c->d->pool == nullptr || c->d->src == nullptr) return;
+                const int ne = c->n_expert;
+                const int ne_cap = std::min(ne, 1024);
+                // Update temporal cold-miss table + optional stats for cur_layer
+                if (ids != nullptr && cur_layer >= 0 && cur_layer < c->n_layers) {
+                    const int32_t* r0 = c->d->host_res != nullptr ? (c->d->host_res + (size_t) cur_layer * (size_t) ne) : nullptr;
+                    const int32_t* r1 = c->d->tp_res1 != nullptr ? (c->d->tp_res1 + (size_t) cur_layer * (size_t) ne) : nullptr;
+                    uint8_t cur_cnt[1024] = {};
+                    for (int i = 0; i < n_tok * k; ++i) {
+                        const int e = ids[i];
+                        if (e < 0 || e >= ne_cap) continue;
+                        if ((r0 != nullptr && r0[e] >= 0) || (r1 != nullptr && r1[e] >= 0)) continue;
+                        if (cur_cnt[e] < 255) ++cur_cnt[e];
+                    }
+                    if (c->stats_on && c->last_pred_layer == cur_layer) {
+                        for (int e = 0; e < ne_cap; ++e) {
+                            if (cur_cnt[e] == 0) continue;
+                            ++c->st_actual;
+                            for (int j = 0; j < c->last_n_picked; ++j)
+                                if (c->last_picked[j] == e) { ++c->st_hits; break; }
+                        }
+                        c->st_pred += (uint64_t) c->last_n_picked;
+                        if ((++c->st_layers % 480) == 0) {
+                            std::fprintf(stderr, "strata l3-prewarm(m%d) stats: %llu layers, recall=%.1f%% (%llu/%llu misses), prec=%.1f%% (%.2f pred/layer), abort=%.1f%%, avg=%.2f MiB/layer\n",
+                                         c->mode, (unsigned long long) c->st_layers,
+                                         c->st_actual ? 100.0 * (double) c->st_hits / (double) c->st_actual : 0.0,
+                                         (unsigned long long) c->st_hits, (unsigned long long) c->st_actual,
+                                         c->st_pred ? 100.0 * (double) c->st_hits / (double) c->st_pred : 0.0,
+                                         (double) c->st_pred / (double) c->st_layers,
+                                         100.0 * (double) c->st_aborts / (double) c->st_layers,
+                                         (double) c->st_bytes / (double) c->st_layers / (1024.0 * 1024.0));
+                        }
+                    }
+                    if (c->mode == 2) {
+                        uint8_t* st = c->cold_streak.data() + (size_t) cur_layer * (size_t) ne;
+                        uint8_t* ht = c->cold_hits.data() + (size_t) cur_layer * (size_t) ne;
+                        for (int e = 0; e < ne_cap; ++e) {
+                            if (cur_cnt[e] > 0) {
+                                st[e] = st[e] < 15 ? (uint8_t) (st[e] + 1) : 15;
+                                ht[e] = cur_cnt[e];
+                            } else if (st[e] > 0) {
+                                st[e] = (uint8_t) (st[e] >> 1);
+                                ht[e] = 0;
+                            }
+                        }
+                    }
+                }
+                c->last_pred_layer = -1;
+                c->last_n_picked = 0;
+                if (next_layer < 0 || next_layer >= c->n_layers) return;
+                if (seq != nullptr && *seq >= next_want) {
+                    if (c->stats_on) { c->last_pred_layer = next_layer; ++c->st_aborts; }
+                    return;
+                }
+                if (c->mode == 2) {
+                    const int32_t* r0 = c->d->host_res != nullptr ? (c->d->host_res + (size_t) next_layer * (size_t) ne) : nullptr;
+                    const int32_t* r1 = c->d->tp_res1 != nullptr ? (c->d->tp_res1 + (size_t) next_layer * (size_t) ne) : nullptr;
+                    const uint8_t* st = c->cold_streak.data() + (size_t) next_layer * (size_t) ne;
+                    const uint8_t* ht = c->cold_hits.data() + (size_t) next_layer * (size_t) ne;
+                    const int max_m = std::min(std::max(c->max_k, 1), 16);
+                    int pick_e[16], pick_sc[16], np = 0;
+                    for (int e = 0; e < ne_cap; ++e) {
+                        if ((int) st[e] < c->min_streak) continue;
+                        if ((r0 != nullptr && r0[e] >= 0) || (r1 != nullptr && r1[e] >= 0)) continue;
+                        const int sc = ((int) st[e] << 8) + (int) ht[e];
+                        if (np < max_m) {
+                            int p = np++;
+                            while (p > 0 && sc > pick_sc[p - 1]) { pick_sc[p] = pick_sc[p - 1]; pick_e[p] = pick_e[p - 1]; --p; }
+                            pick_sc[p] = sc; pick_e[p] = e;
+                        } else if (sc > pick_sc[max_m - 1]) {
+                            int p = max_m - 1;
+                            while (p > 0 && sc > pick_sc[p - 1]) { pick_sc[p] = pick_sc[p - 1]; pick_e[p] = pick_e[p - 1]; --p; }
+                            pick_sc[p] = sc; pick_e[p] = e;
+                        }
+                    }
+                    const uint8_t* blobs[16];
+                    int nb = 0;
+                    for (int i = 0; i < np; ++i) {
+                        const uint8_t* b = c->d->src->blob(next_layer, pick_e[i]);
+                        if (b != nullptr) {
+                            if (c->stats_on) c->last_picked[nb] = pick_e[i];
+                            blobs[nb++] = b;
+                        }
+                    }
+                    int aborted = 0;
+                    uint64_t touched = 0;
+                    if (nb > 0) {
+                        c->d->pool->prewarm_l3_blobs(blobs, nb, c->blob_bytes[(size_t) next_layer], seq, next_want,
+                                                     c->stats_on ? &aborted : nullptr, c->stats_on ? &touched : nullptr);
+                    }
+                    if (c->stats_on) {
+                        c->last_pred_layer = next_layer;
+                        c->last_n_picked = nb;
+                        c->st_aborts += (uint64_t) (aborted != 0 ? 1 : 0);
+                        c->st_bytes += touched;
+                    }
+                    return;
+                }
+                if (next_layer >= (int64_t) c->routers.size() || c->routers[(size_t) next_layer].empty()) return;
+                BlobCtx bc{c->d->src, next_layer};
+                strata::kernels::cpu::ExpertPool::PrewarmSpec sp;
+                sp.router_bf16 = c->routers[(size_t) next_layer].data();
+                sp.n_expert = c->n_expert;
+                sp.n_embd = c->n_embd;
+                sp.x_f = x_f;
+                sp.n_tok = n_tok;
+                sp.max_sample_toks = c->sample_toks;
+                sp.res0 = c->d->host_res != nullptr ? (c->d->host_res + (size_t) next_layer * (size_t) c->n_expert) : nullptr;
+                sp.res1 = c->d->tp_res1 != nullptr ? (c->d->tp_res1 + (size_t) next_layer * (size_t) c->n_expert) : nullptr;
+                sp.blob_bytes = c->blob_bytes[(size_t) next_layer];
+                sp.get_blob = &fetch_blob;
+                sp.get_blob_ctx = &bc;
+                sp.seq = seq;
+                sp.next_want = next_want;
+                sp.max_k = c->max_k;
+                sp.top_per_tok = c->top_per_tok;
+                int aborted = 0;
+                uint64_t touched = 0;
+                if (c->stats_on) {
+                    sp.out_picked = c->last_picked;
+                    sp.out_n_picked = &c->last_n_picked;
+                    sp.out_aborted = &aborted;
+                    sp.out_bytes_touched = &touched;
+                }
+                c->d->pool->prewarm_l3_next_layer(sp);
+                if (c->stats_on) {
+                    c->last_pred_layer = next_layer;
+                    c->st_aborts += (uint64_t) (aborted != 0 ? 1 : 0);
+                    c->st_bytes += touched;
+                }
+            }
+        } l3_prewarm;
+        {
+            const char* pw_env = std::getenv("STRATA_L3_PREWARM");
+            const int pw_mode = pw_env != nullptr ? std::atoi(pw_env) : 0;
+            if (pw_mode > 0 && srcp != nullptr && !host_res.empty() && n_stages == 1 && (g.n_embd % 8) == 0) {
+                l3_prewarm.d = &drive.d;
+                l3_prewarm.mode = pw_mode;
+                l3_prewarm.n_layers = (int) g.n_layers;
+                l3_prewarm.n_expert = (int) g.n_expert;
+                l3_prewarm.n_embd = (int) g.n_embd;
+                l3_prewarm.max_k = pw_mode == 2 ? 3 : 12;
+                if (const char* v = std::getenv("STRATA_L3_PREWARM_K"); v != nullptr && std::atoi(v) > 0)
+                    l3_prewarm.max_k = std::min(32, std::atoi(v));
+                if (const char* v = std::getenv("STRATA_L3_PREWARM_STREAK"); v != nullptr && std::atoi(v) > 0)
+                    l3_prewarm.min_streak = std::min(15, std::atoi(v));
+                if (const char* v = std::getenv("STRATA_L3_PREWARM_TOKS"); v != nullptr && std::atoi(v) > 0)
+                    l3_prewarm.sample_toks = std::min(8, std::atoi(v));
+                if (const char* v = std::getenv("STRATA_L3_PREWARM_TOP"); v != nullptr && std::atoi(v) > 0)
+                    l3_prewarm.top_per_tok = std::min(24, std::atoi(v));
+                if (const char* v = std::getenv("STRATA_L3_PREWARM_STATS"); v != nullptr && std::atoi(v) != 0)
+                    l3_prewarm.stats_on = true;
+                l3_prewarm.blob_bytes.resize((size_t) g.n_layers, 0);
+                const auto& lay = strata::kernels::cpu::expert_layout();
+                for (int64_t l = 0; l < g.n_layers; ++l) l3_prewarm.blob_bytes[(size_t) l] = lay.blob_bytes(l);
+                bool ok_r = true;
+                if (pw_mode == 2) {
+                    l3_prewarm.cold_streak.assign((size_t) (g.n_layers * g.n_expert), 0);
+                    l3_prewarm.cold_hits.assign((size_t) (g.n_layers * g.n_expert), 0);
+                } else {
+                    l3_prewarm.routers.resize((size_t) g.n_layers);
+                    const strata::core::OnDevice on0(0);
+                    for (int64_t l = 0; l < g.n_layers && ok_r; ++l) {
+                        const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+                        ok_r = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
+                               w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+                        if (!ok_r) break;
+                        l3_prewarm.routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
+                        ok_r = cudaMemcpy(l3_prewarm.routers[(size_t) l].data(), w->data, (size_t) w->bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+                    }
+                }
+                if (ok_r) {
+                    ver.set_idle_prewarm(&L3PrewarmCtx::run, &l3_prewarm);
+                    std::fprintf(stderr, "strata serve: L->L+1 CPU L3 prewarm ON (mode=%d, max_k=%d, min_streak=%d, stats=%d)\n",
+                                 l3_prewarm.mode, l3_prewarm.max_k, l3_prewarm.min_streak, (int) l3_prewarm.stats_on);
+                } else {
+                    (void) cudaGetLastError();
+                    l3_prewarm.routers.clear();
+                }
+            }
+        }
 #if defined(STRATA_HAVE_DFLASH2)
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2 prompt taps on a layer split.  Every stage's prompt path taps the requested layers it runs into its own staging and hands them to its
