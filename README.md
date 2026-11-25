@@ -9,6 +9,12 @@
   <a href="README.en.md"><img src="https://img.shields.io/badge/Language-English-00b894.svg" alt="English"></a>
 </p>
 
+<p align="center">
+  <img src="docs/assets/dashboard-8080-live.jpg" alt="strata-ampere Port 8080 Live Telemetry Dashboard" width="100%">
+  <br>
+  <sub><b>内置 8080 端口实时监控仪表盘实拍</b>：双卡 RTX 3080 20GB 连续运行 12H+，180K 超长上下文 100% 缓存复用、峰值 <code>193.5 tok/s</code>、满载 <code>39–45℃</code>、<code>0 Xid · 0 AER · 0 OOM</code></sub>
+</p>
+
 `strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度工程优化，目标是在**无 NVLink、无 PCIe P2P** 的消费级双卡 Ampere（`2× 魔改 RTX 3080 20 GB`）+ 四通道 DDR4 混合推理平台上，以 **100% 严格无损精度** 全面压榨 MoE 大模型的 **Decode 与 Prefill 吞吐**。
 
 > **口径承诺**：本文所有核心速度均采用**多轮中位数或均速**（绝不拿单次偶发峰值做主指标），所有实验均在 `temperature=0`、零降量化、`STRATA_ROUTE_TAIL_SKIP=0`（不丢弃任何冷门专家）、`BF16` 跨卡 AllReduce 的严格无损条件下实测复现。
@@ -162,6 +168,12 @@ sudo python3 scripts/profile-experts.py \
   --out /path/to/expert-profile-coding.bin \
   --activate
 ```
+
+### 5. 8080 端口内置实时监控仪表盘（零依赖，开箱即用）
+启动 `serve/server.py` 后，直接用浏览器访问原服务端口（如 `http://<server-ip>:8080/`）即可打开上图所示的实时遥测面板（支持 **中文 / English** 一键切换），**无需额外端口或第三方监控栈**：
+- **OpenAI API 100% 兼容不变**：`/v1/*` 全部推理接口原样保留，Cline / Cursor / Claude Code / OpenWebUI 无缝直连；
+- **全链路核心指标一屏可见**：Decode 实时吞吐与趋势折线、MoE 显存专家命中率、DFlash2 / `T=16` 混合草稿接受率、TP=2 多对话 RAM 泊车恢复延迟、双卡温度/功耗/频率/显存与 PCIe `MRRS 4096B` 状态；
+- **硬件健康自动巡检与零隐私暴露**：后端 [serve/ampere_metrics.py](serve/ampere_metrics.py) 提供只读纯数值接口 `GET /api/ampere/metrics`，定时巡检 `dmesg`（`0 Xid / 0 AER / 0 OOM`），不记录也不输出任何 API Key 或对话原文。
 
 ---
 

@@ -9,6 +9,12 @@
   <a href="README.md"><img src="https://img.shields.io/badge/语言-简体中文-00b894.svg" alt="简体中文"></a>
 </p>
 
+<p align="center">
+  <img src="docs/assets/dashboard-8080-live.jpg" alt="strata-ampere Port 8080 Live Telemetry Dashboard" width="100%">
+  <br>
+  <sub><b>Built-in Port 8080 Live Telemetry Dashboard</b>: 2× RTX 3080 20GB running 12H+ uptime, 180K context with 100% cache reuse, <code>193.5 tok/s</code> peak, <code>39–45 °C</code> load, <code>0 Xid · 0 AER · 0 OOM</code></sub>
+</p>
+
 `strata-ampere` is a systems-engineered fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) built to maximize **100% strictly lossless** MoE **Decode & Prefill** throughput on **non-NVLink, non-P2P** dual consumer Ampere GPUs (`2× modded RTX 3080 20 GB`) paired with a 4-channel DDR4 host CPU expert pool.
 
 > **Benchmark Honesty**: Every headline metric below is a **multi-run median or average** (never cherry-picked single-run peaks), verified under `temperature=0`, zero quantization downgrade, `STRATA_ROUTE_TAIL_SKIP=0` (zero dropped cold experts), and full `BF16` cross-GPU AllReduce.
@@ -107,6 +113,9 @@ sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --pow
 # Generate a domain-specialized MoE VRAM residency heatmap (coding / writing / research / balanced, or --prompts-file)
 sudo python3 scripts/profile-experts.py --config /path/to/strata-config.json --unit strata@iq3_s --domain coding --out /path/to/expert-profile-coding.bin --activate
 ```
+
+### Built-in Port `8080` Live Telemetry Dashboard (Zero Dependencies)
+After starting `serve/server.py`, open `http://<server-ip>:8080/` directly in your browser for the bilingual (`EN / 中文`) live dashboard shown above while keeping all OpenAI `/v1/*` endpoints 100% intact. The read-only numeric endpoint `GET /api/ampere/metrics` ([serve/ampere_metrics.py](serve/ampere_metrics.py)) surfaces dual-GPU thermals/power/clocks/MRRS, MoE VRAM residency, hybrid `T=16` draft acceptance, TP=2 `ConversationCache` parking, and `dmesg` Xid/AER/OOM health checks with zero prompt text or API key exposure.
 
 ---
 
