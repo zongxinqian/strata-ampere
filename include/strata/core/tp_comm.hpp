@@ -41,6 +41,12 @@ private:
     // NVLink / P2P device buffers (allocated upfront in init() across both GPUs)
     float* d_dec_buf_[2] = {nullptr, nullptr};
     void* d_p2p_tx_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
+    uint32_t* d_p2p_flag_[2] = {nullptr, nullptr};
+    // Optional VMM backing (selective peer BAR1 mapping without process-wide cudaDeviceEnablePeerAccess)
+    void* vmm_base_[2] = {nullptr, nullptr};
+    uint64_t vmm_handle_[2] = {0, 0};
+    size_t vmm_bytes_[2] = {0, 0};
+    bool p2p_vmm_ = false;
 
     void* d_tx_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
     void* d_rx_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
