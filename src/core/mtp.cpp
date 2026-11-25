@@ -603,7 +603,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(R2 * 4); pos_ = b.take<int32_t>(R2 * NH); row_ = b.take<int32_t>(4);
         emb_raw_d_ = emb_raw_cap_ > 0 ? b.take<float>(emb_raw_cap_ / 4 + 4) : nullptr;
-        ident_ = b.take<int32_t>(T * (uint64_t) cap_);
+        ident_ = b.take<int32_t>(T * (uint64_t) cap_ + T);
         Rin_ = b.take<float>(T * HC * N); R_ = b.take<float>(T * HC * N);
         emb_ = b.take<float>(T * N); en_ = b.take<float>(T * N); e2_ = b.take<float>(T * N);
         hn_ = b.take<float>(T * HC * N); h2_ = b.take<float>(T * HC * N);
@@ -651,9 +651,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     carve(real);
     vram_ += count.used;
     {
-        std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
+        std::vector<int32_t> id((size_t) (T * (uint64_t) cap_ + T));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
+        for (uint64_t t = 0; t < T; ++t) id[(size_t) (T * (uint64_t) cap_ + t)] = (int32_t) t;
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     // --pipeline-windows 2 (the forcing graphs): the chain shares its card with stage 1's windows and the next launch
@@ -1392,7 +1393,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
             if (host_emb && emb_raw_d_ != nullptr && ident_ != nullptr && cap_ >= T && ne->host() != nullptr &&
                 ne->row_bytes() == emb_row_bytes_) {
-                iq_embed_rows(ne->type(), emb_raw_d_, ne->row_bytes(), ident_, T, (int) N, emb_, cs);
+                iq_embed_rows(ne->type(), emb_raw_d_, ne->row_bytes(), ident_ + (size_t) max_t_ * (size_t) cap_, T, (int) N, emb_, cs);
             } else {
                 ne->gather_dev(tok_, T, emb_, cs);
             }
@@ -1955,7 +1956,11 @@ bool MtpDrafter::capture_tp2_peer_cond(int max_steps, std::string& err) {
         std::vector<cudaGraphNode_t> leaves;
         for (size_t i = 0; i < n; ++i) {
             size_t nd = 0;
+#if CUDART_VERSION >= 13000
             if (cudaGraphNodeGetDependentNodes(all[i], nullptr, nullptr, &nd) == cudaSuccess && nd == 0)
+#else
+            if (cudaGraphNodeGetDependentNodes(all[i], nullptr, &nd) == cudaSuccess && nd == 0)
+#endif
                 leaves.push_back(all[i]);
         }
         return leaves;
@@ -1981,7 +1986,11 @@ bool MtpDrafter::capture_tp2_peer_cond(int max_steps, std::string& err) {
         np.conditional.type = cudaGraphCondTypeIf;
         np.conditional.size = 1;
         cudaGraphNode_t cnode = nullptr;
+#if CUDART_VERSION >= 13000
         if (cudaGraphAddNode(&cnode, root1, deps.empty() ? nullptr : deps.data(), nullptr, deps.size(), &np) != cudaSuccess)
+#else
+        if (cudaGraphAddNode(&cnode, root1, deps.empty() ? nullptr : deps.data(), deps.size(), &np) != cudaSuccess)
+#endif
             return abort_c1(root1);
         cudaGraph_t body = np.conditional.phGraph_out[0];
         if (cudaStreamBeginCaptureToGraph(cs1_, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
@@ -2073,7 +2082,11 @@ bool MtpDrafter::capture_round_cond(int T, int max_steps, bool use_chain, std::s
         std::vector<cudaGraphNode_t> leaves;
         for (size_t i = 0; i < n; ++i) {
             size_t nd = 0;
+#if CUDART_VERSION >= 13000
             if (cudaGraphNodeGetDependentNodes(all[i], nullptr, nullptr, &nd) == cudaSuccess && nd == 0)
+#else
+            if (cudaGraphNodeGetDependentNodes(all[i], nullptr, &nd) == cudaSuccess && nd == 0)
+#endif
                 leaves.push_back(all[i]);
         }
         return leaves;
@@ -2098,7 +2111,11 @@ bool MtpDrafter::capture_round_cond(int T, int max_steps, bool use_chain, std::s
         np.conditional.type = cudaGraphCondTypeIf;
         np.conditional.size = 1;
         cudaGraphNode_t cnode = nullptr;
+#if CUDART_VERSION >= 13000
         if (cudaGraphAddNode(&cnode, root, deps.empty() ? nullptr : deps.data(), nullptr, deps.size(), &np) != cudaSuccess)
+#else
+        if (cudaGraphAddNode(&cnode, root, deps.empty() ? nullptr : deps.data(), deps.size(), &np) != cudaSuccess)
+#endif
             return abort_cond(root);
         cudaGraph_t body = np.conditional.phGraph_out[0];
         if (cudaStreamBeginCaptureToGraph(cs_, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
@@ -2404,6 +2421,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     std::fill(top2_prob_.begin(), top2_prob_.end(), 0.0f);
     for (int j = 0; j < max_steps; ++j) {
         ((volatile int32_t*) h_out_)[j] = -1;
+        ((volatile float*) h_prob_)[j] = 0.0f;
         ((volatile int32_t*) h_out_)[max_t_ + j] = -1;
         ((volatile float*) h_prob_)[max_t_ + j] = 0.0f;
     }

@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -275,6 +276,96 @@ __global__ void tp_allreduce_bf16_kernel(float* __restrict__ local_buf,
     }
 }
 
+// P2-FP16: Register-cached + MLP-pipelined FP16 AllReduce (hardware __half2 on Turing sm_75 & Ampere+ sm_80+).
+// Eliminates redundant post-barrier VRAM reload of local_buf AND pipelines K concurrent peer reads (NVLink or PCIe).
+template <int K>
+__global__ void __launch_bounds__(1024, 1)
+tp_allreduce_fp16_reg_kernel(float* __restrict__ local_buf,
+                             float* __restrict__ my_map_base,
+                             const float* __restrict__ peer_map_base,
+                             volatile uint32_t* __restrict__ my_flag,
+                             volatile uint32_t* __restrict__ peer_flag,
+                             int n_elems,
+                             size_t slot_floats,
+                             uint32_t step) {
+    const int tid = threadIdx.x;
+    const size_t slot_off = (size_t) (step & (TpComm::kRingSlots - 1u)) * slot_floats;
+    float* my_map = my_map_base + slot_off;
+    const float* peer_map = peer_map_base + slot_off;
+
+    const int n8 = n_elems >> 3;
+    float4* l4 = reinterpret_cast<float4*>(local_buf);
+    uint4* m4 = reinterpret_cast<uint4*>(my_map);
+    const uint4* p4 = reinterpret_cast<const uint4*>(peer_map);
+
+    float4 ra[K], rb[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = tid + k * 1024;
+        if (i < n8) {
+            const float4 a = l4[2 * i];
+            const float4 b = l4[2 * i + 1];
+            ra[k] = a;
+            rb[k] = b;
+            const __half2 p0 = __floats2half2_rn(a.x, a.y);
+            const __half2 p1 = __floats2half2_rn(a.z, a.w);
+            const __half2 p2 = __floats2half2_rn(b.x, b.y);
+            const __half2 p3 = __floats2half2_rn(b.z, b.w);
+            uint4 v;
+            std::memcpy(&v.x, &p0, 4);
+            std::memcpy(&v.y, &p1, 4);
+            std::memcpy(&v.z, &p2, 4);
+            std::memcpy(&v.w, &p3, 4);
+            store_wt_u4(m4 + i, v);
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+            if (pf >= step) break;
+        }
+#else
+        *my_flag = step;
+        __threadfence_system();
+        while (*peer_flag < step) {}
+        __threadfence_system();
+#endif
+    }
+    __syncthreads();
+    uint4 pv[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = tid + k * 1024;
+        if (i < n8) pv[k] = load_cv_u4(p4 + i);
+    }
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = tid + k * 1024;
+        if (i < n8) {
+            const uint4 v = pv[k];
+            __half2 p0, p1, p2, p3;
+            std::memcpy(&p0, &v.x, 4);
+            std::memcpy(&p1, &v.y, 4);
+            std::memcpy(&p2, &v.z, 4);
+            std::memcpy(&p3, &v.w, 4);
+            const float2 f0 = __half22float2(p0);
+            const float2 f1 = __half22float2(p1);
+            const float2 f2 = __half22float2(p2);
+            const float2 f3 = __half22float2(p3);
+            float4 a = ra[k];
+            float4 b = rb[k];
+            a.x += f0.x; a.y += f0.y; a.z += f1.x; a.w += f1.y;
+            b.x += f2.x; b.y += f2.y; b.z += f3.x; b.w += f3.y;
+            l4[2 * i] = a;
+            l4[2 * i + 1] = b;
+        }
+    }
+}
+
 __global__ void tp_allreduce_fp16_kernel(float* __restrict__ local_buf,
                                          float* __restrict__ my_map_base,
                                          const float* __restrict__ peer_map_base,
@@ -371,15 +462,21 @@ __global__ void tp_push_kernel(const float* __restrict__ local_buf,
 __global__ void tp_barrier_kernel(volatile uint32_t* __restrict__ my_flag,
                                   volatile uint32_t* __restrict__ peer_flag,
                                   uint32_t step) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(step) : "memory");
+    uint32_t pf = 0;
+    for (;;) {
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+        if (pf >= step) break;
+        __nanosleep(20);
+    }
+#else
     __threadfence_system();
     *my_flag = step;
     __threadfence_system();
-    while (*peer_flag < step) {
-#if __CUDA_ARCH__ >= 700
-        __nanosleep(20);
-#endif
-    }
+    while (*peer_flag < step) {}
     __threadfence_system();
+#endif
 }
 
 __global__ void tp_pull_kernel(float* __restrict__ local_buf,
@@ -438,7 +535,7 @@ __global__ void tp_unpack_add_bf16_kernel(float* __restrict__ dst,
     for (int64_t i = tid; i < n8; i += stride) {
         float4 a = l4[2 * i];
         float4 b = l4[2 * i + 1];
-        const uint4 v = p4[i];
+        const uint4 v = load_cv_u4(p4 + i);
         __nv_bfloat162 p0, p1, p2, p3;
         std::memcpy(&p0, &v.x, 4);
         std::memcpy(&p1, &v.y, 4);
@@ -454,7 +551,71 @@ __global__ void tp_unpack_add_bf16_kernel(float* __restrict__ dst,
         l4[2 * i + 1] = b;
     }
     for (int64_t i = (n8 << 3) + tid; i < n_elems; i += stride) {
-        dst[i] += __bfloat162float(peer_dev[i]);
+        uint16_t raw = *(const volatile uint16_t*) (reinterpret_cast<const uint16_t*>(peer_dev) + i);
+        __nv_bfloat16 bf;
+        std::memcpy(&bf, &raw, 2);
+        dst[i] += __bfloat162float(bf);
+    }
+}
+
+__global__ void tp_pack_fp16_kernel(const float* __restrict__ src,
+                                    __half* __restrict__ dst,
+                                    int64_t n_elems) {
+    const int64_t tid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    const int64_t n8 = n_elems >> 3;
+    const float4* l4 = reinterpret_cast<const float4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    for (int64_t i = tid; i < n8; i += stride) {
+        const float4 a = l4[2 * i];
+        const float4 b = l4[2 * i + 1];
+        const __half2 p0 = __floats2half2_rn(a.x, a.y);
+        const __half2 p1 = __floats2half2_rn(a.z, a.w);
+        const __half2 p2 = __floats2half2_rn(b.x, b.y);
+        const __half2 p3 = __floats2half2_rn(b.z, b.w);
+        uint4 v;
+        std::memcpy(&v.x, &p0, 4);
+        std::memcpy(&v.y, &p1, 4);
+        std::memcpy(&v.z, &p2, 4);
+        std::memcpy(&v.w, &p3, 4);
+        d4[i] = v;
+    }
+    for (int64_t i = (n8 << 3) + tid; i < n_elems; i += stride) {
+        dst[i] = __float2half(src[i]);
+    }
+}
+
+__global__ void tp_unpack_add_fp16_kernel(float* __restrict__ dst,
+                                          const __half* __restrict__ peer_dev,
+                                          int64_t n_elems) {
+    const int64_t tid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    const int64_t n8 = n_elems >> 3;
+    float4* l4 = reinterpret_cast<float4*>(dst);
+    const uint4* p4 = reinterpret_cast<const uint4*>(peer_dev);
+    for (int64_t i = tid; i < n8; i += stride) {
+        float4 a = l4[2 * i];
+        float4 b = l4[2 * i + 1];
+        const uint4 v = load_cv_u4(p4 + i);
+        __half2 p0, p1, p2, p3;
+        std::memcpy(&p0, &v.x, 4);
+        std::memcpy(&p1, &v.y, 4);
+        std::memcpy(&p2, &v.z, 4);
+        std::memcpy(&p3, &v.w, 4);
+        const float2 f0 = __half22float2(p0);
+        const float2 f1 = __half22float2(p1);
+        const float2 f2 = __half22float2(p2);
+        const float2 f3 = __half22float2(p3);
+        a.x += f0.x; a.y += f0.y; a.z += f1.x; a.w += f1.y;
+        b.x += f2.x; b.y += f2.y; b.z += f3.x; b.w += f3.y;
+        l4[2 * i] = a;
+        l4[2 * i + 1] = b;
+    }
+    for (int64_t i = (n8 << 3) + tid; i < n_elems; i += stride) {
+        uint16_t raw = *(const volatile uint16_t*) (reinterpret_cast<const uint16_t*>(peer_dev) + i);
+        __half hf;
+        std::memcpy(&hf, &raw, 2);
+        dst[i] += __half2float(hf);
     }
 }
 
@@ -513,7 +674,7 @@ void TpComm::release_pipe() {
     int prev_dev = 0;
     cudaGetDevice(&prev_dev);
     for (int r = 0; r < 2; ++r) {
-        if (!pipe_init_[r] && !s_rx_[r] && !d_tx_[r][0] && !d_rx_[r][0]) continue;
+        if (!pipe_init_[r] && !s_rx_[r] && !d_tx_[r][0] && !d_rx_[r][0] && !d_dec_buf_[r] && !d_p2p_tx_[r][0]) continue;
         cudaSetDevice(dev_[r]);
         if (s_rx_[r] != nullptr) {
             cudaStreamDestroy((cudaStream_t) s_rx_[r]);
@@ -527,7 +688,12 @@ void TpComm::release_pipe() {
             cudaEventDestroy((cudaEvent_t) ev_done_[r]);
             ev_done_[r] = nullptr;
         }
+        if (d_dec_buf_[r] != nullptr) {
+            cudaFree(d_dec_buf_[r]);
+            d_dec_buf_[r] = nullptr;
+        }
         for (int b = 0; b < 2; ++b) {
+            if (d_p2p_tx_[r][b] != nullptr) { cudaFree(d_p2p_tx_[r][b]); d_p2p_tx_[r][b] = nullptr; }
             if (d_tx_[r][b] != nullptr) { cudaFree(d_tx_[r][b]); d_tx_[r][b] = nullptr; }
             if (d_rx_[r][b] != nullptr) { cudaFree(d_rx_[r][b]); d_rx_[r][b] = nullptr; }
             if (ev_rx_[r][b] != nullptr) { cudaEventDestroy((cudaEvent_t) ev_rx_[r][b]); ev_rx_[r][b] = nullptr; }
@@ -594,6 +760,8 @@ void TpComm::release() {
             m_flag_[r][j] = nullptr;
         }
     }
+    p2p_ = false;
+    p2p_dec_ = false;
     max_floats_ = 0;
     slot_floats_ = 0;
 }
@@ -606,17 +774,73 @@ bool TpComm::init(int dev0, int dev1, size_t max_floats, std::string& err) {
     max_floats_ = slot_floats_ * kRingSlots;
     int prev_dev = 0;
     cudaGetDevice(&prev_dev);
+    {
+        const char* pe = std::getenv("STRATA_TP_AR_P2P");
+        const bool want = pe == nullptr || std::atoi(pe) != 0;
+        int can01 = 0, can10 = 0;
+        if (want) {
+            cudaDeviceCanAccessPeer(&can01, dev_[0], dev_[1]);
+            cudaDeviceCanAccessPeer(&can10, dev_[1], dev_[0]);
+        }
+        if (want && can01 != 0 && can10 != 0) {
+            cudaSetDevice(dev_[0]);
+            cudaError_t e0 = cudaDeviceEnablePeerAccess(dev_[1], 0);
+            if (e0 == cudaErrorPeerAccessAlreadyEnabled) { (void) cudaGetLastError(); e0 = cudaSuccess; }
+            cudaSetDevice(dev_[1]);
+            cudaError_t e1 = cudaDeviceEnablePeerAccess(dev_[0], 0);
+            if (e1 == cudaErrorPeerAccessAlreadyEnabled) { (void) cudaGetLastError(); e1 = cudaSuccess; }
+            if (e0 == cudaSuccess && e1 == cudaSuccess) {
+                bool alloc_ok = true;
+                const size_t dec_bytes = kRingSlots * kP2pDecSlotFloats * sizeof(float);
+                const size_t pipe_tx_bytes = (size_t) kP2pPipeElems * sizeof(uint16_t);
+                for (int r = 0; r < 2 && alloc_ok; ++r) {
+                    cudaSetDevice(dev_[r]);
+                    if (cudaMalloc((void**) &d_dec_buf_[r], dec_bytes) != cudaSuccess) {
+                        alloc_ok = false;
+                        break;
+                    }
+                    cudaMemset(d_dec_buf_[r], 0, dec_bytes);
+                    for (int b = 0; b < 2; ++b) {
+                        if (cudaMalloc(&d_p2p_tx_[r][b], pipe_tx_bytes) != cudaSuccess) {
+                            alloc_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (alloc_ok) {
+                    p2p_ = true;
+                    const char* pdec = std::getenv("STRATA_TP_AR_P2P_DECODE");
+                    p2p_dec_ = (pdec == nullptr || std::atoi(pdec) != 0);
+                } else {
+                    (void) cudaGetLastError();
+                    for (int r = 0; r < 2; ++r) {
+                        cudaSetDevice(dev_[r]);
+                        if (d_dec_buf_[r]) { cudaFree(d_dec_buf_[r]); d_dec_buf_[r] = nullptr; }
+                        for (int b = 0; b < 2; ++b) {
+                            if (d_p2p_tx_[r][b]) { cudaFree(d_p2p_tx_[r][b]); d_p2p_tx_[r][b] = nullptr; }
+                        }
+                    }
+                }
+            }
+            std::fprintf(stderr, "strata tp_comm: NVLink/P2P %s (decode=%s, CUDA%d <-> CUDA%d)\n",
+                         p2p_ ? "enabled" : "off (host route)",
+                         p2p_dec_ ? "p2p" : "host",
+                         dev_[0], dev_[1]);
+        }
+        cudaSetDevice(prev_dev);
+    }
     const unsigned int flags = cudaHostAllocMapped | cudaHostAllocPortable;
+    const size_t host_floats = p2p_ ? (kRingSlots * kP2pDecSlotFloats) : max_floats_;
     for (int r = 0; r < 2; ++r) {
         cudaSetDevice(dev_[r]);
-        if (cudaHostAlloc((void**) &h_buf_[r], max_floats_ * sizeof(float), flags) != cudaSuccess ||
+        if (cudaHostAlloc((void**) &h_buf_[r], host_floats * sizeof(float), flags) != cudaSuccess ||
             cudaHostAlloc((void**) &h_flag_[r], 64, flags) != cudaSuccess) {
             err = "TpComm: cudaHostAlloc failed";
             cudaSetDevice(prev_dev);
             release();
             return false;
         }
-        std::memset(h_buf_[r], 0, max_floats_ * sizeof(float));
+        std::memset(h_buf_[r], 0, host_floats * sizeof(float));
         std::memset(h_flag_[r], 0, 64);
     }
     for (int r = 0; r < 2; ++r) {
@@ -651,62 +875,101 @@ void TpComm::allreduce_add(float* local_buf, int n_elems, uint32_t step, int ran
         if (std::strcmp(v, "fp16") == 0 || std::strcmp(v, "half") == 0) return 2;
         return 1;
     }();
-    if (dec_mode >= 1 && (n_elems & 7) == 0 && (size_t) n_elems * 2u <= slot_floats_ * sizeof(float)) {
+    const bool use_p2p = p2p_dec_ && (size_t) n_elems <= kP2pDecSlotFloats;
+    float* my_base = use_p2p ? d_dec_buf_[rank] : m_buf_[rank][rank];
+    const float* peer_base = use_p2p ? d_dec_buf_[1 - rank] : m_buf_[rank][1 - rank];
+    const size_t s_floats = use_p2p ? kP2pDecSlotFloats : (p2p_ ? kP2pDecSlotFloats : slot_floats_);
+
+    if (dec_mode >= 1 && (n_elems & 7) == 0 && (size_t) n_elems * 2u <= s_floats * sizeof(float)) {
+        const int n8 = n_elems >> 3;
         if (dec_mode == 2) {
-            tp_allreduce_fp16_kernel<<<1, 512, 0, (cudaStream_t) stream>>>(
-                local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-                m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+            if (n8 <= 1024) {
+                tp_allreduce_fp16_reg_kernel<1><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
+            } else if (n8 <= 2048) {
+                tp_allreduce_fp16_reg_kernel<2><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
+            } else if (n8 <= 3072) {
+                tp_allreduce_fp16_reg_kernel<3><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
+            } else if (n8 <= 5120) {
+                tp_allreduce_fp16_reg_kernel<5><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
+            } else {
+                tp_allreduce_fp16_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
+            }
         } else {
-            const int n8 = n_elems >> 3;
             if (n8 <= 1024) {
                 tp_allreduce_bf16_reg_kernel<1><<<1, 1024, 0, (cudaStream_t) stream>>>(
-                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
             } else if (n8 <= 2048) {
                 tp_allreduce_bf16_reg_kernel<2><<<1, 1024, 0, (cudaStream_t) stream>>>(
-                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
             } else if (n8 <= 3072) {
                 tp_allreduce_bf16_reg_kernel<3><<<1, 1024, 0, (cudaStream_t) stream>>>(
-                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
             } else if (n8 <= 5120) {
                 tp_allreduce_bf16_reg_kernel<5><<<1, 1024, 0, (cudaStream_t) stream>>>(
-                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
             } else {
                 tp_allreduce_bf16_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
-                    local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-                    m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+                    local_buf, my_base, peer_base, m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
             }
         }
         return;
     }
     const int threads = n_elems > 32768 ? 1024 : 512;
     tp_allreduce_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(
-        local_buf, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-        m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, slot_floats_, step);
+        local_buf, my_base, peer_base,
+        m_flag_[rank][rank], m_flag_[rank][1 - rank], n_elems, s_floats, step);
 }
 
 void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream) {
     if (n_elems <= 0 || slot_floats_ == 0) return;
-    // Mode: "bf16" (default, duplex CE DMA), "q8" (block-32 int8 + duplex CE DMA), "fp32" (exact FP32)
+    // Mode: "bf16" (1), "q8" (2), "fp16"/"half" (3, hardware on sm_75+), "fp32" (0)
     static const int ar_mode = [] {
         const char* v = std::getenv("STRATA_TP_AR_MODE");
-        if (v == nullptr) return 1; // 1 = bf16 duplex DMA
+        if (v == nullptr) return 1;
         if (std::strcmp(v, "fp32") == 0 || std::strcmp(v, "0") == 0) return 0;
         if (std::strcmp(v, "q8") == 0 || std::strcmp(v, "2") == 0) return 2;
+        if (std::strcmp(v, "fp16") == 0 || std::strcmp(v, "half") == 0 || std::strcmp(v, "3") == 0) return 3;
         return 1;
     }();
     const cudaStream_t cs = (cudaStream_t) stream;
     int eff_mode = ar_mode;
     if (eff_mode == 2 && (n_elems & 31) != 0) eff_mode = 1;
 
-    if (eff_mode >= 1 && ensure_pipe(rank)) {
+    if (p2p_ && (eff_mode == 1 || eff_mode == 3) && d_p2p_tx_[0][0] != nullptr && d_p2p_tx_[1][0] != nullptr) {
+        const int64_t cap = kP2pPipeElems;
+        for (int64_t off = 0; off < n_elems; off += cap) {
+            const int64_t chunk = (n_elems - off) < cap ? (n_elems - off) : cap;
+            const uint32_t cur_step = ++step;
+            const int b = (int) (cur_step & 1u);
+            const int64_t n8 = (chunk + 7) >> 3;
+            const int blocks = (int) ((n8 + 255) / 256 < 512 ? (n8 + 255) / 256 : 512);
+            if (eff_mode == 3) {
+                tp_pack_fp16_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(
+                    local_buf + off, reinterpret_cast<__half*>(d_p2p_tx_[rank][b]), chunk);
+                tp_barrier_kernel<<<1, 1, 0, cs>>>(m_flag_[rank][rank], m_flag_[rank][1 - rank], cur_step);
+                tp_unpack_add_fp16_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(
+                    local_buf + off, reinterpret_cast<const __half*>(d_p2p_tx_[1 - rank][b]), chunk);
+            } else {
+                tp_pack_bf16_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(
+                    local_buf + off, reinterpret_cast<__nv_bfloat16*>(d_p2p_tx_[rank][b]), chunk);
+                tp_barrier_kernel<<<1, 1, 0, cs>>>(m_flag_[rank][rank], m_flag_[rank][1 - rank], cur_step);
+                tp_unpack_add_bf16_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(
+                    local_buf + off, reinterpret_cast<const __nv_bfloat16*>(d_p2p_tx_[1 - rank][b]), chunk);
+            }
+        }
+        return;
+    }
+
+    if (!p2p_ && eff_mode >= 1 && ensure_pipe(rank)) {
         const size_t slot_bytes = slot_floats_ * sizeof(float);
         const int64_t max_q8 = ((int64_t) (slot_bytes * 32u / 34u)) & ~int64_t(255);
         const int64_t max_bf16 = ((int64_t) (slot_floats_ * 2u)) & ~int64_t(255);
-        // Pipelined chunks keep GPU-host bridge fed full-duplex: cap chunk at 8M elements (~16 MB bf16 / ~8.5 MB q8)
+        // Pipelined chunks keep GPU-host bridge fed full-duplex: cap chunk at 8M elements (~16 MB bf16/fp16 / ~8.5 MB q8)
         const int64_t raw_cap = eff_mode == 2 ? max_q8 : max_bf16;
         const int64_t cap = raw_cap < (8LL << 20) ? raw_cap : (8LL << 20);
         const cudaStream_t srx = (cudaStream_t) s_rx_[rank];
@@ -729,6 +992,12 @@ void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& st
                 half* qs = reinterpret_cast<half*>(reinterpret_cast<uint8_t*>(d_tx_[rank][b]) + (size_t) chunk);
                 tp_pack_q8_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(local_buf + off, qd, qs, chunk);
                 tx_bytes = (size_t) chunk + (size_t) nblk * sizeof(half);
+            } else if (eff_mode == 3) {
+                const int64_t n8 = (chunk + 7) >> 3;
+                const int blocks = (int) ((n8 + 255) / 256 < 256 ? (n8 + 255) / 256 : 256);
+                tp_pack_fp16_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(
+                    local_buf + off, reinterpret_cast<__half*>(d_tx_[rank][b]), chunk);
+                tx_bytes = (size_t) chunk * 2u;
             } else {
                 const int64_t n8 = (chunk + 7) >> 3;
                 const int blocks = (int) ((n8 + 255) / 256 < 256 ? (n8 + 255) / 256 : 256);
@@ -748,6 +1017,11 @@ void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& st
                 const int8_t* qd = reinterpret_cast<const int8_t*>(d_rx_[rank][b]);
                 const half* qs = reinterpret_cast<const half*>(reinterpret_cast<const uint8_t*>(d_rx_[rank][b]) + (size_t) chunk);
                 tp_unpack_add_q8_kernel<<<blocks > 0 ? blocks : 1, 256, 0, srx>>>(local_buf + off, qd, qs, chunk);
+            } else if (eff_mode == 3) {
+                const int64_t n8 = (chunk + 7) >> 3;
+                const int blocks = (int) ((n8 + 255) / 256 < 256 ? (n8 + 255) / 256 : 256);
+                tp_unpack_add_fp16_kernel<<<blocks > 0 ? blocks : 1, 256, 0, srx>>>(
+                    local_buf + off, reinterpret_cast<const __half*>(d_rx_[rank][b]), chunk);
             } else {
                 const int64_t n8 = (chunk + 7) >> 3;
                 const int blocks = (int) ((n8 + 255) / 256 < 256 ? (n8 + 255) / 256 : 256);
@@ -762,16 +1036,17 @@ void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& st
         return;
     }
 
+    const size_t host_slot_floats = p2p_ ? kP2pDecSlotFloats : slot_floats_;
     for (int64_t off = 0; off < n_elems; ) {
         const int64_t rem = n_elems - off;
-        const int64_t chunk = rem < (int64_t) slot_floats_ ? rem : (int64_t) slot_floats_;
+        const int64_t chunk = rem < (int64_t) host_slot_floats ? rem : (int64_t) host_slot_floats;
         const uint32_t cur_step = ++step;
         if (chunk <= 32768) {
             tp_allreduce_kernel<<<1, 256, 0, cs>>>(
                 local_buf + off, m_buf_[rank][rank], m_buf_[rank][1 - rank],
-                m_flag_[rank][rank], m_flag_[rank][1 - rank], (int) chunk, slot_floats_, cur_step);
+                m_flag_[rank][rank], m_flag_[rank][1 - rank], (int) chunk, host_slot_floats, cur_step);
         } else {
-            const size_t slot_off = (size_t) (cur_step & (TpComm::kRingSlots - 1u)) * slot_floats_;
+            const size_t slot_off = (size_t) (cur_step & (TpComm::kRingSlots - 1u)) * host_slot_floats;
             const int64_t n4 = (chunk + 3) >> 2;
             const int blocks = (int) ((n4 + 255) / 256 < 256 ? (n4 + 255) / 256 : 256);
             tp_push_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(

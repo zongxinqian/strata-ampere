@@ -1,7 +1,7 @@
 # strata-ampere
 
 <p align="center">
-  <b>Strictly lossless, high-throughput TP=2 + EP=2 fork of <a href="https://github.com/Niko1221/Strata">Strata</a> engineered for dual consumer Ampere (<code>sm_86</code>) MoE inference.</b>
+  <b>Strictly lossless, high-throughput TP=2 + EP=2 fork of <a href="https://github.com/Niko1221/Strata">Strata</a> engineered for dual consumer Ampere (<code>sm_86</code> RTX 3080 20G) & Turing (<code>sm_75</code> RTX 2080 Ti 22G + NVLink) MoE inference.</b>
 </p>
 
 <p align="center">
@@ -15,7 +15,9 @@
   <sub><b>Built-in Port 8080 Live Telemetry Dashboard</b>: 2× RTX 3080 20GB running 12H+ uptime, 180K context with 100% cache reuse, <code>193.5 tok/s</code> peak, <code>39–45 °C</code> load, <code>0 Xid · 0 AER · 0 OOM</code></sub>
 </p>
 
-`strata-ampere` is a systems-engineered fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) built to maximize **100% strictly lossless** MoE **Decode & Prefill** throughput on **non-NVLink, non-P2P** dual consumer Ampere GPUs (`2× modded RTX 3080 20 GB`) paired with a 4-channel DDR4 host CPU expert pool.
+`strata-ampere` is a systems-engineered fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) built to maximize **100% strictly lossless** MoE **Decode & Prefill** throughput on two popular high-value modded dual-GPU platforms:
+- **2× Modded RTX 3080 20 GB** (Ampere `sm_86`, 40 GB total VRAM, non-NVLink / non-P2P)
+- **2× Modded RTX 2080 Ti 22 GB** (Turing `sm_75`, 44 GB total VRAM, native NVLink P2P + hardware FP16 + `sm_75` INT8 Tensor Core)
 
 > **Benchmark Honesty**: Every headline metric below is a **multi-run median or average** (never cherry-picked single-run peaks), verified under `temperature=0`, zero quantization downgrade, `STRATA_ROUTE_TAIL_SKIP=0` (zero dropped cold experts), and full `BF16` cross-GPU AllReduce.
 
@@ -58,6 +60,20 @@ Tested on `Qwen3.8-Flash-Next-UD-Q4_K_XL` (`MTP-6` drafter, 3-run medians):
 | **40K E2E HTTP TTFT** (`39,551 tok`) | `3,142.9 tok/s` | **`3,690.9 tok/s`** | **`+17.4%`** | Parallel PLE (`+10.3%`) + `STRATA_PREFILL_EQUAL=1` (`+8.46%`) |
 | **32K Chunk Internal** (`32,768 tok`) | `3,823 tok/s` (`8,570 ms`) | **`4,267 tok/s`** (`7,680 ms`) | **`+11.6%`** | PLE wait slashed `945 ms → 66 ms` (**14.3× faster**) |
 
+### Dual RTX 2080 Ti 22 GB (Turing `sm_75` + NVLink) Verified Results
+
+`strata-ampere` now natively supports **2× Modded RTX 2080 Ti 22 GB (44 GB total VRAM + NVLink `NV2`)** with Turing `sm_75` INT8 Tensor Core (`mma.sync.aligned.m8n8k16`), hardware FP16 NVLink P2P Reg-MLP AllReduce, and the full P0–P4 `W16` stack. Verified on a workstation with a 6-core `Xeon W-2135` + 4-channel DDR4-2666 + PCIe Gen3 x16 running `Qwen3.8-Flash-Next-UD-Q4_K_XL` (256K ctx):
+
+| Metric (2× RTX 2080 Ti 22G + Xeon W-2135 6C) | Before (PCIe BF16 / `W8`) | **After (NVLink HW FP16 + `sm_75` INT8 TC + P0–P4 `W16`)** | Gain / Notes |
+|---|---:|---:|---|
+| **GPU Verify Window Latency** (`W2 / W3 / W4`) | `55 / 68 / 78 ms` | **`36 / 41 / 46 ms`** | **`-41.0%`** (`65.8 GB/s` NVLink P2P + FP16 Reg-MLP) |
+| **Short Code Prompt** (`67 → 200 tok`) | Prefill `1,124 ms` / `68.7 tok/s` | **Prefill `695 ms` / `72.8 tok/s`** | TTFT **`+61.6%`**, P1 pre-warm hit rate `69.7% → 81.0%` |
+| **16K–25K Cold Codebase** | `1,361 tok/s` / `74.6 tok/s` | **`1,474.9 tok/s` / `87.7 tok/s`** | Prefill **`+8.4%`**, 320 hot experts pre-warmed in `41.7 ms` (`85.7%` hit) |
+| **16K–25K Multi-Turn Refactor (`W16` Suffix)** | Delta `~122 tok/s` / `101 tok/s` | **Delta `150.2 tok/s` / `107.7 ~ 109.2 tok/s`** | **`91.3%`** cache hit (`MTP-6` `107.7` / `DFlash2` `109.2 tok/s`) |
+| **74K–154K Ultra-Long Context** | >32K `mtp.cpp` OOB crash / `63.7 tok/s` | **110K Prefill `1,570.3 tok/s`, 74K–154K Decode `91.0 ~ 103.6 tok/s`** | **Eliminates >32K OOB crash**, Decode **`+55.9%`** |
+
+> **Drafter & CPU note for 2080 Ti 22G rigs**: In a strict 5-workload `T=0` A/B on the 6-core host, **`MTP-6` (`92.68 tok/s` mean)** outperformed **`DFlash2` (`87.32 tok/s`) by `+6.1%`** (especially creative writing `88.8 vs 70.5 tok/s` and cold 16K `80.7 vs 74.2 tok/s`) because Turing lacks `sm_80+` BF16 attention Tensor Cores and a 6-core CPU pool penalizes wider speculative windows, while `DFlash2` slightly led pure code refactoring (`109.2 vs 107.7 tok/s`). Pairing dual 2080 Ti 22G with a 14+-core CPU (e.g., `Xeon W-2170B / W-2275`) saturates quad-channel DDR4 and unlocks another `+15% ~ +20%` decode headroom.
+
 ---
 
 ## 2. Full Hardware & Software Testbed (Transparent & Reproducible)
@@ -99,20 +115,27 @@ Every gain comes from systems architecture, CUDA microkernels, scheduling, and h
    - **P1 (Prefill-Guided Expert Pre-Warm & Dual-GPU VRAM Balance)**: Reuses `Prefill::on_routes` (`STRATA_PREFILL_PREWARM=1`) to promote top missing prompt experts across GPU 0/1 in `~13.5 ms` right before token 1, paired with GPU 0 reserve `1050 → 680 MiB` (`+368 MiB` resident experts) — boosting 84K cold hit rate `70.0% → 79.2%` and decode `140.1 → 150.7 tok/s`.
    - **P2 (`tp_comm.cu` Register-Cached + MLP-Pipelined BF16 AllReduce)**: `tp_allreduce_bf16_reg_kernel<K>` (`K=1,2,3,5`) keeps `local_buf` in registers across the barrier (zero redundant VRAM reload) and issues all `K` peer `load_cv_u4` PCIe reads concurrently.
    - **P3 (Multi-Hit PCIe 4096B vs CPU Split A/B)**: Implemented opt-in `STRATA_PCIE_HIT_MIN=N` in `expert_source.cpp`; live A/B proved `--pcie-frac 0.30` regresses `-4.6%` on 4-channel DDR4-3200 (`77.8 GB/s`) due to disabling `can_mega_router` + PCIe host-bridge contention with BF16 AllReduce, so default stays `--pcie-frac 0` (opt-in available for slower memory systems).
-   - **P4 (Ampere `sm_86` INT8 Tensor Core `mma.sync.aligned.m16n8k32`)**: Added `q8_imma_m16n8k32_kernel` in `q8_sm86_fast.cuh` + single-launch `ncols=8..16` dispatch in `native_mmvq.cu` (`STRATA_Q8_TC=1`), hitting an all-time `240W` warm mean of **`194.55 tok/s`** and **`203.50 tok/s`** at 84K delta context with bit-exact greedy SHA256.
+   - **P4 (Ampere `sm_86` + Turing `sm_75` INT8 Tensor Core)**: Added `q8_imma_m16n8k32_kernel` in `q8_sm86_fast.cuh` + single-launch `ncols=8..16` dispatch in `native_mmvq.cu` (`STRATA_Q8_TC=1`) — using `mma.sync.aligned.m16n8k32` on `sm_80+` and 4× `mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32` on Turing `sm_75` (`0/4096` exact int32 parity verified on RTX 2080 Ti). Hits `194.55 tok/s` warm mean (`203.50 tok/s` at 84K delta) on 2× 3080 20G @ 240W.
+   - **Turing `sm_75` + NVLink P2P & >32K Stability Fix**: Added NVLink P2P direct VRAM path (`STRATA_TP_AR_P2P=1`, `65.8 GB/s` bidirectional), `tp_allreduce_fp16_reg_kernel<K>`, and hardware FP16 prefill pack/unpack kernels (`STRATA_TP_AR_MODE=fp16` / `STRATA_TP_AR_DECODE=fp16`) in `tp_comm.hpp`/`.cu`; fixed the >32K `mtp.cpp` `ident_` OOB crash (`window_ids` overwriting the iota array read by `iq_embed_rows`) with CUDA 12.x/13.x `cudaGraphAddNode` compatibility.
 
 ---
 
 ## 4. Build, Quick Start & Headless OC Tool
 
 ```bash
-# Build (sm_86, CUDA 12.x/13.1 + Ninja + C++20)
+# Build for 2× RTX 3080 20G (Ampere sm_86, CUDA 12.x/13.1 + Ninja + C++20)
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 cmake -B build86 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_WINDOW_MAX_T=16 -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build86 --target strata -j $(nproc)
 
-# Launch (pick DFlash2 Q4_0 for code/math/reasoning or MTP-6 for balanced/creative)
+# Build for 2× RTX 2080 Ti 22G (Turing sm_75, enables m8n8k16 INT8 Tensor Core + NVLink HW FP16)
+export PATH=/usr/local/cuda-12.8/bin:$PATH
+cmake -B build75 -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_WINDOW_MAX_T=16 -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build75 --target strata -j $(nproc)
+
+# Launch (3080 20G DFlash2 / MTP-6, or 2080 Ti 22G NVLink FP16)
 python3 serve/server.py --config examples/strata-2x3080-20g-dflash2.example.json
+python3 serve/server.py --config examples/strata-2x2080ti-22g.example.json
 
 # Apply Pareto 240W + GDDR6X 10,151 MHz + PCIe MaxReadReq=4096B + THP defer+madvise live (no restart needed)
 sudo python3 scripts/ampere-oc-power.py --mem-offset 1800 --gpc-offset 120 --power-limit 240 --pcie-mrrs 4096 --thp-defrag defer+madvise

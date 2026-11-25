@@ -1,7 +1,7 @@
 # strata-ampere
 
 <p align="center">
-  <b>面向消费级双卡 Ampere（<code>sm_86</code>）MoE 大模型推理的 <a href="https://github.com/Niko1221/Strata">Strata</a> 严格无损高吞吐 TP=2 + EP=2 优化分支</b>
+  <b>面向消费级双卡 Ampere（<code>sm_86</code> RTX 3080 20G）与 Turing（<code>sm_75</code> RTX 2080 Ti 22G + NVLink）MoE 大模型推理的 <a href="https://github.com/Niko1221/Strata">Strata</a> 严格无损高吞吐 TP=2 + EP=2 优化分支</b>
 </p>
 
 <p align="center">
@@ -15,7 +15,9 @@
   <sub><b>内置 8080 端口实时监控仪表盘实拍</b>：双卡 RTX 3080 20GB 连续运行 12H+，180K 超长上下文 100% 缓存复用、峰值 <code>193.5 tok/s</code>、满载 <code>39–45℃</code>、<code>0 Xid · 0 AER · 0 OOM</code></sub>
 </p>
 
-`strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度工程优化，目标是在**无 NVLink、无 PCIe P2P** 的消费级双卡 Ampere（`2× 魔改 RTX 3080 20 GB`）+ 四通道 DDR4 混合推理平台上，以 **100% 严格无损精度** 全面压榨 MoE 大模型的 **Decode 与 Prefill 吞吐**。
+`strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度工程优化，现已全面支持两套高性价比魔改双卡平台，以 **100% 严格无损精度** 全面压榨 MoE 大模型的 **Decode 与 Prefill 吞吐**：
+- **双魔改 RTX 3080 20 GB（Ampere `sm_86`，40 GB 总显存，无 NVLink / 无 PCIe P2P）**
+- **双魔改 RTX 2080 Ti 22 GB（Turing `sm_75`，44 GB 总显存，原生支持物理 NVLink P2P + 硬件 FP16 + `sm_75` INT8 Tensor Core）**
 
 > **口径承诺**：本文所有核心速度均采用**多轮中位数或均速**（绝不拿单次偶发峰值做主指标），所有实验均在 `temperature=0`、零降量化、`STRATA_ROUTE_TAIL_SKIP=0`（不丢弃任何冷门专家）、`BF16` 跨卡 AllReduce 的严格无损条件下实测复现。
 
@@ -59,6 +61,21 @@
 | **31K 端到端 HTTP TTFT**（`30,648 tok`） | `~3,483 tok/s` | **`3,696 ~ 3,788 tok/s`** | **`+8.7%`** | 单块满载（240W 档 `3,696` / 320W 档 `3,788`） |
 | **40K 端到端 HTTP TTFT**（`39,551 tok`） | `3,142.9 tok/s` | **`3,690.9 tok/s`** | **`+17.4%`** | 并行 PLE (`+10.3%`) + `STRATA_PREFILL_EQUAL=1` 均衡分块 (`+8.46%`) |
 | **32K 单块引擎内部吞吐**（`32,768 tok`） | `3,823 tok/s`（`8,570 ms`） | **`4,267 tok/s`**（`7,680 ms`） | **`+11.6%`** | PLE 耗时由 `945 ms → 66 ms`（**14.3× 提速**） |
+
+### 4. 双卡 RTX 2080 Ti 22 GB（Turing `sm_75` + 物理 NVLink）实机验证
+
+`strata-ampere` 现已原生适配 **2× 魔改 RTX 2080 Ti 22 GB（共 44 GB 显存，支持 NVLink `NV2` 桥接）**，即便宿主仅配备 6 核工作站 CPU（`Intel Xeon W-2135 6C/12T` + 四通道 DDR4-2666，PCIe Gen3 x16，`Qwen3.8-Flash-Next-UD-Q4_K_XL` 256K 上下文），依然跑出了亮眼的端到端吞吐与 154K 长文零崩溃稳定性：
+
+| 实测维度（2× RTX 2080 Ti 22G + Xeon W-2135 6C） | 优化前（PCIe BF16 / `W8`） | **优化后（NVLink 硬件 FP16 + `sm_75` INT8 TC + P0–P4 `W16`）** | 提升 / 效果 |
+|---|---:|---:|---|
+| **GPU Verify 窗口基耗时**（`W2 / W3 / W4`） | `55 / 68 / 78 ms` | **`36 / 41 / 46 ms`** | **`-41.0%`**（物理 NVLink `65.8 GB/s` + FP16 Reg-MLP） |
+| **短代码 Prompt 端到端**（`67 → 200 tok`） | Prefill `1,124 ms` / `68.7 tok/s` | **Prefill `695 ms` / `72.8 tok/s`** | TTFT **`+61.6%`**，P1 预热命中率 `69.7% → 81.0%` |
+| **16K–25K 冷启动长代码库** | `1,361 tok/s` / `74.6 tok/s` | **`1,474.9 tok/s` / `87.7 tok/s`** | Prefill **`+8.4%`**，冷启预热 320 专家仅 `41.7 ms`（命中 **`85.7%`**） |
+| **16K–25K 多轮代码重构（`W16` 后缀接龙）** | 增量 `~122 tok/s` / `101 tok/s` | **增量 `150.2 tok/s` / `107.7 ~ 109.2 tok/s`** | 命中率 **`91.3%`**（MTP-6 `107.7` / DFlash2 `109.2 tok/s`） |
+| **74K–154K 超长上下文连续生成** | >32K `mtp.cpp` 必现越界崩溃 / `63.7 tok/s` | **110K Prefill `1,570.3 tok/s`，74K–154K Decode `91.0 ~ 103.6 tok/s`** | **彻底根治 >32K 越界崩溃**，Decode **`+55.9%`** |
+
+> **2080 Ti 22G 草稿模型与 CPU 选型实测建议**：
+> - 在同套 5 场景严格对照（`T=0`）中，6 核 CPU 平台上 **`MTP-6` 综合均速 `92.68 tok/s`** 领先 **`DFlash2`（`87.32 tok/s`）`+6.1%`**（尤其中文写作 `88.8 vs 70.5 tok/s`、16K 冷启 `80.7 vs 74.2 tok/s`），因 Turing 无 `sm_80+` BF16 注意力张量核且 6 核 CPU 池对过量草稿惩罚更重；但纯代码多轮重构 `DFlash2` 略快（`109.2 vs 107.7 tok/s`）。若宿主升级为 14 核以上多核 CPU（如 HP Z4 G4 升级 `Xeon W-2170B / W-2275` 吃满四通道内存带宽），双卡 2080 Ti 22G 的 Decode 还能再涨 **`+15% ~ +20%`**。
 
 ---
 
@@ -114,7 +131,10 @@
   - **P1（Prefill 引导热专家抢跑预热 + 双卡显存配平）**：复用 `Prefill::on_routes` 零开销统计 Prompt 真实路由热力图，Prefill 结束瞬间仅用 `~13.5 ms` 提前把 Top-K 缺失热专家异步拉进双卡显存（`STRATA_PREFILL_PREWARM=1`），配合 GPU 0 预留由 `1050 → 680 MiB` 释放 `+368 MiB` 显存多常驻专家，84K 冷启动命中率直涨 `70.0% → 79.2%`、Decode `140.1 → 150.7 tok/s`。
   - **P2（`tp_comm.cu` 寄存器缓存去重读 + `K` 路并发 PCIe MLP 流水线）**：新增模板核 `tp_allreduce_bf16_reg_kernel<K>`（`K=1,2,3,5`），跨栅栏将 `local_buf` 保存在寄存器中彻底消除二次显存重读，并连续并发发射全部 `K` 路 `load_cv_u4` PCIe 读隐藏往返延迟。
   - **P3（按批内命中次数阈值动态分流 A/B 验证）**：在 `expert_source.cpp` 实现可选 `STRATA_PCIE_HIT_MIN=N`，但在本机四通道 DDR4-3200（`77.8 GB/s`）+ 非 P2P 双卡上实测 `--pcie-frac 0.30` 反降 `-4.6%`（因关闭片上 `can_mega_router` 且 PCIe 搬冷专家与 AllReduce 争抢主桥带宽），按严格无回退原则默认关闭（`--pcie-frac 0`），保留为慢速双通道内存平台可选开关。
-  - **P4（Ampere `sm_86` INT8 Tensor Core `mma.sync.aligned.m16n8k32`）**：在 `q8_sm86_fast.cuh` 与 `native_mmvq.cu` 中为 `T = 8..16` 的 `Q8_0 × Q8_1` 稠密投影与 LM Head 引入 PTX `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`（`STRATA_Q8_TC=1`），单次加载 16×32 权重瓦片共享给最多 16 列，240W 下 4 任务热态均速刷新至 **`194.55 tok/s`**、84K 增量 Decode 突破 **`203.50 tok/s`**，贪心 SHA 100% 逐位一致。
+  - **P4（Ampere `sm_86` + Turing `sm_75` INT8 Tensor Core）**：在 `q8_sm86_fast.cuh` 与 `native_mmvq.cu` 中为 `T = 8..16` 的 `Q8_0 × Q8_1` 稠密投影与 LM Head 引入 PTX 张量核（`STRATA_Q8_TC=1`）——Ampere `sm_80+` 走 `mma.sync.aligned.m16n8k32`，Turing `sm_75`（RTX 2080 Ti）自动走 4 条 `mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32` 拼出完全按位等价的 `16×8×32` `int32` 点积（2080 Ti 独立校验 `0/4096` 误差），单次加载 16×32 权重瓦片共享给最多 16 列。3080 240W 4 任务热态均速刷新至 **`194.55 tok/s`**、84K 增量突破 **`203.50 tok/s`**。
+  - **Turing `sm_75` + NVLink 专项增强与 >32K 稳定性修复**：
+    - `tp_comm.hpp` / `tp_comm.cu` 新增 **NVLink P2P 直连显存通路（`STRATA_TP_AR_P2P=1`）**、`tp_allreduce_fp16_reg_kernel<K>`（硬件 FP16 寄存器缓存 + `K` 路并发）与 Prefill 硬件 FP16 打包/解包核（`STRATA_TP_AR_MODE=fp16` / `STRATA_TP_AR_DECODE=fp16`），实测双 2080 Ti NVLink 双向聚合 **`65.8 GB/s`**；
+    - 修复 `src/core/mtp.cpp` 在上下文 **`> 32,768` tokens** 时 `window_ids` 覆写共享 `ident_` 数组导致 `iq_embed_rows` 越界访问崩溃（`illegal memory access`）的底层 Bug，并补充 CUDA 12.x / 13.x `cudaGraphAddNode` 兼容宏。
 - **CPU 专家池 CCX 绑核对齐**：
   - `--pool-workers 15` 跨 Threadripper 8 个 CCX 绑核（`15 worker + 1 host` = 16 活跃线程），吃满四通道 DDR4-3200 带宽且避免跨 CCX 争抢。
 
@@ -135,10 +155,11 @@
 
 ## 四、编译、快速启动与无头超频工具
 
-### 1. 编译（`sm_86`）
-依赖 CUDA Toolkit 13.1（或兼容 `sm_86` 的 12.x+）、CMake、Ninja 与 C++20 编译器：
+### 1. 编译（支持 Ampere `sm_86` 与 Turing `sm_75`）
+依赖 CUDA Toolkit 12.8 / 13.1、CMake、Ninja（或 Make）与 C++20 编译器：
 
 ```bash
+# 双 RTX 3080 20G（Ampere sm_86）
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 cmake -B build86 -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
@@ -146,12 +167,22 @@ cmake -B build86 -G Ninja \
   -DSTRATA_WINDOW_MAX_T=16 \
   -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build86 --target strata -j $(nproc)
+
+# 双 RTX 2080 Ti 22G（Turing sm_75，原生启用 m8n8k16 INT8 Tensor Core + NVLink 硬件 FP16）
+export PATH=/usr/local/cuda-12.8/bin:$PATH
+cmake -B build75 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON \
+  -DSTRATA_WINDOW_MAX_T=16 \
+  -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build75 --target strata -j $(nproc)
 ```
 
 ### 2. 草稿模型选型与配置启动
-同一份 `build86/strata` 二进制无需重编即可切换草稿模型：
-- **偏代码 / 数学 / 逻辑推理（推荐）**：使用 `DFlash2 Q4_0` 模板 [examples/strata-2x3080-20g-dflash2.example.json](examples/strata-2x3080-20g-dflash2.example.json)（内置 `--draft-conf 0.35`、`--vram-reserve-mib 1050`、`STRATA_PREFILL_EQUAL=1`、`STRATA_PREFILL_CPU_SHARE_NT=32`）。
-- **偏中文创意写作 / 全能均衡**：使用 `MTP-6` 模板 [examples/strata-2x3080-20g.example.json](examples/strata-2x3080-20g.example.json)（高随机性创作快 `~12.5 tok/s`）。
+同一份二进制无需重编即可切换草稿模型：
+- **双 RTX 3080 20G — 偏代码 / 数学 / 逻辑推理（推荐）**：使用 `DFlash2 Q4_0` 模板 [examples/strata-2x3080-20g-dflash2.example.json](examples/strata-2x3080-20g-dflash2.example.json)。
+- **双 RTX 3080 20G — 偏中文创意写作 / 全能均衡**：使用 `MTP-6` 模板 [examples/strata-2x3080-20g.example.json](examples/strata-2x3080-20g.example.json)（高随机性创作快 `~12.5 tok/s`）。
+- **双 RTX 2080 Ti 22G（`sm_75` + NVLink）**：直接使用 [examples/strata-2x2080ti-22g.example.json](examples/strata-2x2080ti-22g.example.json)（已预配 `STRATA_TP_AR_P2P=1`、`STRATA_TP_AR_MODE=fp16`、`STRATA_TP_AR_DECODE=fp16`、`STRATA_Q8_TC=1`、`STRATA_PREFILL_PREWARM=1` 与 `W16` 混合后缀缓存）。
 
 复制模板并替换模型路径与 `CHANGE_ME_API_KEY` 后启动：
 ```bash

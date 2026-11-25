@@ -2515,7 +2515,7 @@ bool q8_sm86_on() {
         const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                         cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
         if (!ok) cudaGetLastError();
-        per_dev[dev] = (ok && maj == 8 && min == 6) ? 2 : 1;
+        per_dev[dev] = (ok && ((maj == 8 && min == 6) || (maj == 7 && min == 5))) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 #endif

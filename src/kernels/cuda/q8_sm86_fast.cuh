@@ -106,15 +106,43 @@ bool launch_col(const int8_t* qs, const half* d, const Q81Block* x, float* y,
 }
 
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
-// P4: Ampere sm_80+ INT8 Tensor Core (mma.sync.aligned.m16n8k32) kernel for packed Q8_0 x Q8_1 at NCOLS = 8..16.
-// Exact int32 inner product per 32-element block (bitwise identical integer dots to __dp4a), loading each 16x32
-// weight tile ONCE and sharing it across up to 16 columns (238 TOPS INT8 Tensor Core on RTX 3080 sm_86).
+// P4: Ampere sm_80+ (mma.sync.aligned.m16n8k32) & Turing sm_75 (4x mma.sync.aligned.m8n8k16) INT8 Tensor Core kernel
+// for packed Q8_0 x Q8_1 at NCOLS = 8..16. Exact int32 inner product per 32-element block (bitwise identical integer
+// dots to __dp4a), loading each 16x32 weight tile ONCE and sharing it across up to 16 columns.
+__device__ __forceinline__ void imma_m16n8k32_s8(int& d0, int& d1, int& d2, int& d3,
+                                                 uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                 uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+          "r"(0), "r"(0), "r"(0), "r"(0));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};"
+        : "=r"(d0), "=r"(d1) : "r"(a0), "r"(b0), "r"(0), "r"(0));
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};"
+        : "=r"(d0), "=r"(d1) : "r"(a2), "r"(b1), "r"(d0), "r"(d1));
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};"
+        : "=r"(d2), "=r"(d3) : "r"(a1), "r"(b0), "r"(0), "r"(0));
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};"
+        : "=r"(d2), "=r"(d3) : "r"(a3), "r"(b1), "r"(d2), "r"(d3));
+#else
+    d0 = d1 = d2 = d3 = 0;
+#endif
+}
+
 template<int NCOLS, int WARPS>
 __launch_bounds__(WARPS * 32, 4)
 __global__ void q8_imma_m16n8k32_kernel(const int8_t* __restrict__ qs, const half* __restrict__ dpl,
                                         const Q81Block* __restrict__ x, float* __restrict__ y,
                                         int n_in, int n_out) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800 || __CUDA_ARCH__ == 750)
     const int nb = n_in >> 5;
     const int warp = int(threadIdx.x) >> 5;
     const int lane = int(threadIdx.x) & 31;
@@ -156,12 +184,7 @@ __global__ void q8_imma_m16n8k32_kernel(const int8_t* __restrict__ qs, const hal
             const uint32_t b0 = static_cast<uint32_t>(__ldg(xp + tig));
             const uint32_t b1 = static_cast<uint32_t>(__ldg(xp + tig + 4));
             int d0, d1, d2, d3;
-            asm volatile(
-                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
-                : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
-                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-                  "r"(0), "r"(0), "r"(0), "r"(0));
+            imma_m16n8k32_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
             const float dx0 = __low2float(x[std::size_t(c0_0) * nb + b].ds);
             const float dx1 = __low2float(x[std::size_t(c0_1) * nb + b].ds);
             f0_0 += dw0 * dx0 * float(d0);
@@ -179,12 +202,7 @@ __global__ void q8_imma_m16n8k32_kernel(const int8_t* __restrict__ qs, const hal
                 b1 = static_cast<uint32_t>(__ldg(xp + tig + 4));
             }
             int d0, d1, d2, d3;
-            asm volatile(
-                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
-                : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
-                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
-                  "r"(0), "r"(0), "r"(0), "r"(0));
+            imma_m16n8k32_s8(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
             const float dx0 = (c1_0 < NCOLS) ? __low2float(x[std::size_t(c1_0) * nb + b].ds) : 0.0f;
             const float dx1 = (c1_1 < NCOLS) ? __low2float(x[std::size_t(c1_1) * nb + b].ds) : 0.0f;
             f1_0 += dw0 * dx0 * float(d0);
@@ -213,10 +231,24 @@ __global__ void q8_imma_m16n8k32_kernel(const int8_t* __restrict__ qs, const hal
 #endif
 }
 
+inline bool tc_arch_supported() {
+    static int per_dev[16] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
+    if (per_dev[dev] == 0) {
+        int maj = 0, min = 0;
+        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        per_dev[dev] = (ok && (maj >= 8 || (maj == 7 && min == 5))) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+}
+
 template<int NCOLS>
 bool launch_tc(const int8_t* qs, const half* d, const Q81Block* x, float* y,
                int n_in, int n_out, cudaStream_t s) {
-    constexpr int WARPS = 2;  // 32 output rows/block -> >= 80 blocks for n_out=2560 (saturates 68 SMs on sm_86)
+    constexpr int WARPS = 2;  // 32 output rows/block -> >= 80 blocks for n_out=2560 (saturates 68 SMs on sm_75/sm_86)
     const unsigned grid = static_cast<unsigned>((n_out + WARPS * 16 - 1) / (WARPS * 16));
     q8_imma_m16n8k32_kernel<NCOLS, WARPS><<<grid, WARPS * 32, 0, s>>>(qs, d, x, y, n_in, n_out);
     return true;
@@ -240,7 +272,7 @@ inline bool launch(const int8_t* qs, const half* d, const Q81Block* x, float* y,
     if (on <= 0 || n_in % 32 != 0 || ncols < 1 || ncols > 16) return false;
     if (n_out < 2048) return false;
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
-    if (tc_on > 0 && ncols >= 8) {
+    if (tc_on > 0 && tc_arch_supported() && ncols >= 8) {
         switch (ncols) {
             case 8:  return launch_tc<8>(qs, d, x, y, n_in, n_out, s);
             case 9:  return launch_tc<9>(qs, d, x, y, n_in, n_out, s);
