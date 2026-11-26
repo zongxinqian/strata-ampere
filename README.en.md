@@ -7,19 +7,20 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="README.md"><img src="https://img.shields.io/badge/语言-简体中文-00b894.svg" alt="简体中文"></a>
-  <img src="https://img.shields.io/badge/v1.2.0-203.2%20tok%2Fs%20Warm%20%7C%20185.5%20Chat-00d4ff.svg" alt="v1.2.0 Decode">
-  <img src="https://img.shields.io/badge/Peak-273%E2%80%93287%20tok%2Fs%20%40%20240W-7c4dff.svg" alt="Peak 273-287 tok/s">
+  <img src="https://img.shields.io/badge/v1.3.0-217%20Warm%20%7C%20204.7%20All%20%7C%20173.6%20%40%20117K-00d4ff.svg" alt="v1.3.0 Decode">
+  <img src="https://img.shields.io/badge/Peak-276.6%E2%80%93373%20tok%2Fs%20%40%20240W-7c4dff.svg" alt="Peak 276.6-373 tok/s">
   <img src="https://img.shields.io/badge/PCIe%204.0%20P2P-50.86%20GB%2Fs%20Full--Duplex-00e676.svg" alt="50.86 GB/s P2P">
-  <img src="https://img.shields.io/badge/Precision-100%25%20Bit--Exact%20Lossless-ffbe28.svg" alt="Lossless">
+  <img src="https://img.shields.io/badge/Precision-17%2F17%20Bit--Exact%20Lossless-ffbe28.svg" alt="17/17 Bit-Exact Lossless">
 </p>
 
 <p align="center">
   <img src="docs/assets/dashboard-8080-live.jpg" alt="strata-ampere Port 8080 Live Telemetry Dashboard" width="100%">
   <br>
-  <sub><b>Built-in Port 8080 Live Telemetry Dashboard</b>: 2× Modded RTX 3080 20GB now running <b>v1.2.0 P2P-Native Deep Architecture Optimizations + 50.86 GB/s direct PCIe 4.0 x16 P2P + 72×1 GiB Static HugePages</b> — hitting <code>185.50 tok/s</code> real-chat sampling (<code>temp=0.6</code>, <code>+12.7%</code>), <code>203.22–208.27 tok/s</code> canonical warm mean (<code>273–287 tok/s</code> peak), <code>3,836–3,870 tok/s</code> 84K prefill, <b><code>9,831</code> resident experts</b>, <code>43 °C / 39 °C</code> load, <code>4.8 W</code> idle, <code>0 Xid · 0 AER · 0 DMAR</code></sub>
+  <sub><b>Built-in Port 8080 Live Telemetry Dashboard</b>: 2× Modded RTX 3080 20GB running <b>v1.3.0 Full-Repository Post-P2P Overhaul + DFlash2 Speculative Tree Verification + 50.86 GB/s direct PCIe 4.0 x16 P2P + 72×1 GiB Static HugePages</b> — hitting <code>204.67 tok/s</code> 3-round canonical all-mean (<code>214–217 tok/s</code> warm mean, <code>276.6 tok/s</code> task peak, <code>373.0 tok/s</code> burst peak), <b><code>3,830.9–3,842.6 tok/s</code> 117K cold prefill + <code>173.6 tok/s</code> 117K decode (<code>+45.0%</code>)</b>, <b><code>9,870</code> resident experts</b>, <code>32.9 ms</code> 4.1K cross-GPU session restore, <code>0.00%</code> idle CPU, <code>43 °C / 38 °C</code> load, <code>0 Xid · 0 AER · 0 OOM</code></sub>
 </p>
 
-`strata-ampere` is a systems-engineered fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) built specifically for **2× Modded RTX 3080 20 GB (`sm_86`, 40 GB total VRAM)** to deliver **100% strictly lossless** MoE **Decode & Prefill** performance:
+`strata-ampere` is a systems-engineered fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) built specifically for **2× Modded RTX 3080 20 GB (`sm_86`, 40 GB total VRAM)** to deliver **100% strictly lossless (17/17 SHA256 bit-exact)** MoE **Decode & Prefill** performance:
+- **v1.3.0 Full-Repository Post-P2P Architectural Overhaul + DFlash2 Speculative Tree Verification (`240W` cap, 17/17 Bit-Exact SHA256 verified)**: Eliminates pre-P2P legacy bottlenecks across the entire codebase — **① DFlash2 Frontier Speculative Tree Verification (`STRATA_DF2_TREE=1`) + `sm_86` Fast Q8/MMVQ/AVX2 Microkernels**; **② In-Graph Unified TP=2 BAR1 P2P Top-64 Shortlist Sampler (`STRATA_TP_HEAD_FAST=1`)**: moves penalized real-chat sampling (`presence_penalty=1.5`, `hist_len <= 128`) directly inside the Verify CUDA Graph via coherent mapped `TpHeadSampleCfg`, eliminating legacy-stream `cudaMemcpy` syncs and post-graph re-sampling; **③ Direct `Q4_0` TP=2 BAR1 P2P Draft Head + Native BF16 KV Ring (`STRATA_DF2_KV_BF16=1`)**: unlocks `STRATA_DF2_HEAD_TP2=1` under `STRATA_DF2_HEAD_Q4=1` (eliminating the `98.7 MiB` GPU0 startup spike and cutting DFlash2 draft latency from `1.32 → 0.87–1.17 ms/window`, **`-34%`**), while native BF16 KV rings + `22 MiB` VMM slabs add **`+40` resident experts → `9,870`**; **④ Fused BAR1 P2P `peer_bo_bf16` Prefill AllReduce (`STRATA_TP_FUSE_PF_AR=1`) + Compacted Async PLE Upload**: fuses peer BF16 AllReduce directly into `gr_write_norm_rs_kernel`, driving **117K (`116,800` tok) cold prefill to `3,830.9–3,842.6 tok/s` and 117K decode from `119.70 → 173.60 tok/s` (`+45.0%`)**; **⑤ Per-Device Async `ConversationCache` (`32.9 ms` live restore of 4.1K tokens) + Lock-Free `0.00%` Idle CPU `tp1` Worker + Telemetry `nv_lock` Debounce & SSE `TCP_NODELAY`**!
 - **v1.2.0 P2P-Native Deep Architecture Campaign (`240W` cap, 4/4 Bit-Exact Greedy SHA256 verified)**: Exploits our 50.86 GB/s VMM Push-Write P2P link beyond MoE AllReduce — **① Direct P2P ArgHalf & Full-Logits Gather (`STRATA_TP_HEAD_P2P=1`)**: eliminates the `16 MiB` GPU1→Host→GPU0 PCIe bounce per verify step on `temp > 0`, boosting 4-task real-chat sampling (`temp=0.6`) from `164.57 → 185.50 tok/s` (**`+20.93 tok/s / +12.7%`**); **② DFlash2 106K CJK Vocab-Parallel P2P Draft Head (`STRATA_DF2_HEAD_TP2=1`)**: shards the `146.0 MiB` (`106,299`-row) Q4_0 draft head 50/50 across GPU0 & GPU1 (`53,152 + 53,147` rows, `73.0 MiB/GPU`), pushing `20 KiB` `xq_` over BAR1 to wake GPU1's captured graph and merging `896 B` peer Top-16 in a single 32-lane bitonic warp — **freeing `73.0 MiB` on GPU0** (`--vram-reserve-mib 608` adds **`+24` resident experts → `9,831`**); **③ Ampere `sm_86` `STRATA_DF2_GEMM4=26`** (auto-selected on `sm_86`), raising canonical 4-task warm mean to **`203.22–208.27 tok/s`** (`+8.4% ~ +11.1%`) with **4/4 100% bit-exact SHA256** across 2,560 tokens!
 - **v1.1.0 6-Direction Deep Optimization Campaign**: Adds **GPU1 Sparse-Hit MoE Combine**, **Capacity-Weighted `48:52` Bresenham Expert Partitioning**, **Ampere `sm_86` Hardware `__nanosleep(64)` P2P Spin-Barrier + Warp-Rounded `K=1` Blocks**, **Zen 2 AVX2 Weight Prefetch + PCIe Root Port ACS Disable + `/dev/cpu_dma_latency=0`**, and **`STRATA_DF2_HEAD_Q4=1` + true `--spec 8 --draft-conf 0.50` (`user_args`) + recalibrated `draft-costs.json`**.
 - **50.86 GB/s full-duplex card-to-card PCIe 4.0 x16 P2P on the card's native `256 MiB BAR1` (ZERO BAR1 resize / ZERO PCI `0x610` hacking!)** via our version-matched dynamic BAR1 open-gpu kernel patch ([patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)), CUDA Driver VMM selective peer mapping (`39 / 256 MiB` BAR1 used), 1-hop Push-Write + VRAM-Flag AllReduce, and `72 × 1 GiB` Static HugePages + `iommu=pt`.
@@ -30,7 +31,25 @@
 
 ## 1. Verified Benchmarks (Strictly Lossless, `Qwen3.8-Flash-Next-UD-Q4_K_XL`)
 
-### Latest Milestone — v1.2.0 P2P-Native Deep Architecture Suite (`240W` Pareto, Strict Controlled A/B)
+### Latest Milestone — v1.3.0 Full-Repo Post-P2P Overhaul + Speculative Tree Suite (`240W` Pareto, 17/17 Bit-Exact)
+
+| Metric (`240W` Strictly Lossless `UD-Q4_K_XL`) | Pre-P2P Baseline | Tree Baseline | **v1.3.0 Post-P2P Champion** | Net Gain & Key Mechanism |
+|---|---:|---:|---:|---|
+| **3-Round Canonical `bench_6dir` All-Mean** | `165.30 tok/s` | `200.03 tok/s` | **`204.67 tok/s`** | **`+23.8%`** vs pre-P2P (`80.92%` expert hit rate) |
+| **Warm Mean (`r2 / r3`) · Single-Task Peak** | `176.2` / `~210` | `215.30` / `272.80` | **`217.00 / 214.00` · `276.60 tok/s`** | Live telemetry burst peak **`373.0 tok/s`** |
+| **Real-Chat `temp=0.6` (`presence_penalty=1.5`)** | `~142 tok/s` | `172.15 / 172.75` | **`180.38 / 177.83 tok/s` (`201.2` peak)** | Penalized sampling **100% inside Verify CUDA Graph** (**`+3.9%`**) |
+| **117K (`116,800` tok) Cold Prefill** | `~3,150 tok/s` | `3,798.8 tok/s` | **`3,830.9–3,842.6 tok/s`** | Fused BAR1 P2P `peer_bo_bf16` AllReduce + Compact Async PLE |
+| **117K (`116,800` tok) Long-Context Decode** | `~92 tok/s` | `119.70 tok/s` | **`173.60 tok/s`** | **`+53.90 tok/s` (`+45.0%` surge!)** |
+| **Resident Hot Experts / DFlash2 Draft Latency** | `9,656` / `1.74 ms` | `9,830` / `1.32 ms` | **`9,870 (4766+5104)` / `0.87–1.17 ms`** | **`+40` experts**, up to **`-34%`** draft latency |
+| **4.1K Cross-GPU Session Restore / Idle CPU** | Blocking / High | `~115 ms` / Spin | **`32.9 ms` (+`17.6 ms` rebuild) / `0.00%`** | Per-device async `ParkAsync` + lock-free sleep (`0 Xid / 0 AER`) |
+
+- **17/17 Strict Bit-Exact SHA256 Gate (`CUDA0 4500 + CUDA1 4500 = 9000` symmetric resident experts, `--adapt-every 999999`)**:
+  - **Pure Greedy (`4/4 EXACT`)**, **Unpenalized `temp=0.6` (`4/4 EXACT`)**, **Real-Chat `presence_penalty=1.5` In-Graph Sampling (`4/4 EXACT`)**, **Penalized Greedy (`2/2 EXACT`)**, **`penalty_last_n=256` Post-Graph P2P Merge (`2/2 EXACT`)**, and **`9.7K` Sparse QSA Block-Selection Prefill+Decode (`1/1 EXACT`)** — **17/17 IDENTICAL SHA256** with across-the-board throughput gains!
+- **Honest v1.3.0 Ablation Disclosure**:
+  - ✅ **Enabled ON by default**: `STRATA_DF2_TREE=1`, `STRATA_TP_HEAD_FAST=1`, `STRATA_DF2_KV_BF16=1`, `STRATA_DF2_HEAD_TP2=1` + `STRATA_DF2_HEAD_Q4=1`, `STRATA_TP_FUSE_PF_AR=1`, `STRATA_PLE_COMPACT=1` + `STRATA_PLE_COPY_STREAM=1`, `STRATA_TP_VMM_PIPE_MB=22`.
+  - ⚙️ **Opt-in (`=0` by default)**: `STRATA_TP_QSA_IDX_SPLIT=1` (6+6 cross-GPU BAR1 P2P QSA Indexer split pushes residency to `9,998` experts, but exhibits a 1-ulp BF16 half-order divergence on 1/17 long-prompt test and `-4.5%` prefill barrier wait); `STRATA_ADAPT_SMART=0` (unthrottled `29.6 swaps/win` live adaptation beats static-floor throttling by `+13.9%` hit rate).
+
+### v1.2.0 Milestone — P2P-Native Deep Architecture Suite (`240W` Pareto, Strict Controlled A/B)
 
 Same `build86_w16` (`STRATA_VERIFY_MAX_T=16`) binary, canonical 4-task suite (`moe_arch`, `code_cuda`, `agent_json`, `kv_tech`, 640 tok, `enable_thinking=False`), `240W` cap, `10,151 MHz` GDDR6X, `MRRS 4096B`, `50.86 GB/s` PCIe 4.0 P2P:
 
@@ -90,6 +109,7 @@ All 6 directions were implemented, verified bit-exact, and A/B benchmarked. Winn
 | **v1.0.0: 1G HugePages + `iommu=pt` + 50.86 GB/s VMM Push-P2P** | `187.28` / `3,780` | **`201.40` warm / `3,870`** | **Breaks 200 tok/s** | 72×1 GiB dTLB fit + native 256 MiB BAR1 direct P2P |
 | **v1.1.0: 6-Dir Deep Opt + 48:52 EP + `user_args --spec 8` + ACS/DMA** | `186.22` / `199.68` | **`202.50` fresh / `231.35` warm (`287.2` peak)** | **`+8.7% ~ +15.9%`** | Sparse Combine + 9,807 experts + `__nanosleep` + `DF2_HEAD_Q4` |
 | **v1.2.0: P2P Logits + DFlash2 106K Head TP=2 + `sm_86` GEMM4=26** | `164.6` chat / `187.5` greedy | **`185.5` real chat / `203.2–208.3` warm (`273` peak)** | **`+12.7%` chat / `+8.4%~11.1%` greedy** | Zero 16M host bounce + 73M GPU0 saved (`9,831` experts) + 4/4 SHA256 exact |
+| **v1.3.0: Full-Repo Post-P2P Overhaul + In-Graph Penalized Sampler + BF16 KV + Fused Prefill AR + Tree** | `200.0` all / `119.7` @117K | **`204.67` all (`217` warm / `276.6` peak) / `173.6` @117K** | **`+45.0%` @117K / `3,842.6` Prefill** | 17/17 SHA256 exact, `9,870` experts, `-34%` draft, `32.9 ms` restore, `0.00%` idle CPU |
 
 ---
 
@@ -189,7 +209,7 @@ sudo reboot
 ```
 > **1-Command Rollback Anytime**: `sudo /usr/local/sbin/nvidia-p2p-rollback.sh && sudo reboot`
 
-### Step 5: Build & Run `strata-ampere` v1.2.0 (Including ACS Disable & `/dev/cpu_dma_latency=0`)
+### Step 5: Build & Run `strata-ampere` v1.3.0 (Including ACS Disable & `/dev/cpu_dma_latency=0`)
 ```bash
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 cmake -B build86 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_WINDOW_MAX_T=16 -DCMAKE_CUDA_ARCHITECTURES=86

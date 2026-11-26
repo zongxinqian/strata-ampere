@@ -39,6 +39,9 @@
 #include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
+#if !defined(__HIPCC__)
+#include <cuda_bf16.h>
+#endif
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -3750,6 +3753,38 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
+}
+
+bool native_mmvq_push_p2p(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                          int n_in, int n_out, int ncols,
+                          float* peer_slot_buf, volatile uint32_t* peer_flag,
+                          uint32_t* done_ctr, uint32_t step, void* stream) {
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP)
+    (void) ggml_type; (void) weights; (void) x_q8_1; (void) y;
+    (void) n_in; (void) n_out; (void) ncols;
+    (void) peer_slot_buf; (void) peer_flag; (void) done_ctr; (void) step; (void) stream;
+    return false;
+#else
+    if (ggml_type != 8 || !q8_sm86_on() || !weights || !x_q8_1 || !y || !peer_slot_buf || !peer_flag || !done_ctr || !stream)
+        return false;
+    if (ncols < 1 || ncols > 16 || (((std::uintptr_t) y | (std::uintptr_t) peer_slot_buf) & 15u) != 0)
+        return false;
+    auto& registry = q8_packed_registry();
+    if (registry.empty()) return false;
+    const auto found = registry.find(weights);
+    if (found == registry.end() || found->second.n_in != n_in || found->second.n_out != n_out)
+        return false;
+    const bool ok = q8sm86_fast::launch_push(
+        found->second.qs, found->second.d,
+        static_cast<const Q81Block*>(x_q8_1), y,
+        reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step,
+        n_in, n_out, ncols, static_cast<cudaStream_t>(stream));
+    if (ok) {
+        strata::dispatch::kernel(strata::dispatch::kDense, 9, ggml_type, n_in, n_out, ncols);
+        launch_check();
+    }
+    return ok;
+#endif
 }
 
 #if !defined(__HIPCC__)

@@ -74,10 +74,15 @@ uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
 VmmChunk vmm_chunk_new() {
     const Api& a = api();
     if (!a.ok) return 0;
+    int cur_dev = a.dev;
+    if (cudaGetDevice(&cur_dev) != cudaSuccess || cur_dev < 0) {
+        (void) cudaGetLastError();
+        cur_dev = a.dev;
+    }
     CUmemAllocationProp prop{};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = a.dev;
+    prop.location.id = cur_dev;
     CUmemGenericAllocationHandle h = 0;
     if (a.create(&h, (size_t) a.gran, &prop, 0) != CUDA_SUCCESS) return 0;
     return (VmmChunk) h;

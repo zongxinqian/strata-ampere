@@ -60,8 +60,10 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += gdn_buffers_bytes(g);
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
-    if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+    if (g.n_qsa_layers() > 0) {
+        for (int64_t j = 0; j < q_n; ++j)
+            n += qsa_state_bytes(g, max_cells, j == 0, 0, qsa_tp_idx_owns_on_current_dev(q_lo + j));
+    }
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -100,8 +102,13 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
-    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
+    std::vector<uint64_t> q_off((size_t) s.qsa_alloc + 1, 0);
+    if (g.n_qsa_layers() > 0) {
+        for (int64_t j = 0; j < s.qsa_alloc; ++j)
+            q_off[(size_t) j + 1] = q_off[(size_t) j] +
+                                    qsa_state_bytes(g, max_cells, j == 0, 0, qsa_tp_idx_owns_on_current_dev(s.qsa_ord0 + j));
+    }
+    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? q_off[(size_t) s.qsa_alloc] : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
@@ -109,8 +116,9 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
-        if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+        if (qsa_state_init(g, max_cells, qp + q_off[(size_t) j],
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0], 0,
+                           qsa_tp_idx_owns_on_current_dev(s.qsa_ord0 + j)) == 0)
             return 0;
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 

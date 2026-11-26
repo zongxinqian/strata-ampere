@@ -1460,4 +1460,435 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
     coupled_check("spec_draft merge");
 }
 
+namespace {
+
+struct TpHeadRowScratch {
+    unsigned int counter;
+    unsigned int nf;
+    unsigned int pad[2];
+    int2 block_lists[kSplitMaxBlocks * kSelMax];
+};
+
+__device__ __forceinline__ TpHeadSampleCfg load_tp_head_cfg(const TpHeadSampleCfg* m_cfg,
+                                                            const TpHeadSampleCfg& byval_cfg,
+                                                            int use_mapped_cfg,
+                                                            int* sh_words) {
+    if (!use_mapped_cfg) return byval_cfg;
+    constexpr int kWords = (int) (sizeof(TpHeadSampleCfg) / sizeof(int));
+    const volatile int* vs = reinterpret_cast<const volatile int*>(m_cfg);
+    for (int i = (int) threadIdx.x; i < kWords; i += (int) blockDim.x) sh_words[i] = vs[i];
+    __syncthreads();
+    TpHeadSampleCfg out;
+    int* dst = reinterpret_cast<int*>(&out);
+#pragma unroll
+    for (int i = 0; i < kWords; ++i) dst[i] = sh_words[i];
+    return out;
+}
+
+__global__ void __launch_bounds__(kSplitWarps * 32)
+tp2_head_part_kernel(const float* __restrict__ logits, int local_n, int row_offset, int fallback_vocab,
+                     const int* __restrict__ history, int history_len,
+                     const TpHeadSampleCfg* m_cfg, TpHeadSampleCfg byval_cfg, int use_mapped_cfg,
+                     TpHeadRowScratch* __restrict__ rows_sc, int2* __restrict__ local_out,
+                     uint32_t* __restrict__ m_nf) {
+    __shared__ int sh_cfg_w[sizeof(TpHeadSampleCfg) / sizeof(int)];
+    const TpHeadSampleCfg cfg = load_tp_head_cfg(m_cfg, byval_cfg, use_mapped_cfg, sh_cfg_w);
+    const int full_vocab = cfg.n_vocab > (row_offset + local_n) ? cfg.n_vocab : fallback_vocab;
+    const int t = (int) blockIdx.y;
+    const int b = (int) blockIdx.x;
+    const int n_blocks = (int) gridDim.x;
+    const float* l = logits + (size_t) t * (size_t) local_n;
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    const int blo = b * kSplitBlockSpan;
+    const int lo = blo + warp * kSplitWarpSpan;
+
+    float s[kSplitPerLane];
+    int nf_any = 0;
+#pragma unroll
+    for (int j = 0; j < kSplitPerLane; ++j) {
+        const int v = lo + 32 * j + lane;
+        if (v < local_n) {
+            const float x = l[v];
+            if (m_nf != nullptr && !isfinite(x)) nf_any = 1;
+            s[j] = x;
+        } else {
+            s[j] = __int_as_float(0xff800000);
+        }
+    }
+    if (m_nf != nullptr) {
+        const int blk_nf = __syncthreads_or(nf_any);
+        if (threadIdx.x == 0 && blk_nf) atomicOr(&rows_sc[t].nf, 1u);
+    }
+
+    TpHeadRowScratch* row_st = &rows_sc[t];
+
+    if (cfg.active == 0) {
+        // Fast 1-pass Greedy Argmax over registers (0 extra rounds, lowest global ID tie-break)
+        float b0 = __int_as_float(0xff800000), b1 = __int_as_float(0xff800000);
+        int i0 = full_vocab, i1 = full_vocab;
+#pragma unroll
+        for (int j = 0; j < kSplitPerLane; j += 2) {
+            const int gv0 = row_offset + lo + 32 * j + lane;
+            const int gv1 = gv0 + 32;
+            const float x0 = s[j], x1 = s[j + 1];
+            if (x0 > b0) { b0 = x0; i0 = gv0; }
+            if (x1 > b1) { b1 = x1; i1 = gv1; }
+        }
+        take_first(b0, i0, b1, i1);
+        warp_first(b0, i0);
+        __shared__ float sv[kSplitWarps];
+        __shared__ int si[kSplitWarps];
+        if (lane == 0) { sv[warp] = b0; si[warp] = i0; }
+        __syncthreads();
+        if (warp == 0) {
+            float wv = lane < kSplitWarps ? sv[lane] : __int_as_float(0xff800000);
+            int wi = lane < kSplitWarps ? si[lane] : full_vocab;
+            warp_first(wv, wi);
+            if (lane == 0) {
+                row_st->block_lists[b] = make_int2(wi, __float_as_int(wv));
+            }
+        }
+        __shared__ bool is_last;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence();
+            is_last = (atomicAdd(&row_st->counter, 1u) == (unsigned int) (n_blocks - 1));
+        }
+        __syncthreads();
+        if (!is_last) return;
+        __threadfence();
+        if (warp == 0) {
+            float bv = __int_as_float(0xff800000);
+            int bi = full_vocab;
+            for (int q = lane; q < n_blocks; q += 32) {
+                const volatile int2* vp = row_st->block_lists + q;
+                take_first(bv, bi, __int_as_float(vp->y), vp->x);
+            }
+            warp_first(bv, bi);
+            if (lane == 0) {
+                const int final_id = (bi < full_vocab) ? bi : row_offset;
+                local_out[t] = make_int2(__float_as_int(bv), final_id);
+                if (m_nf != nullptr) {
+                    const uint32_t rnf = ((const volatile unsigned int*) &row_st->nf)[0];
+                    m_nf[t * 16] = rnf;
+                    row_st->nf = 0u;
+                }
+                row_st->counter = 0u;
+            }
+        }
+        return;
+    }
+
+    // Sampled / Penalized Top-k (k <= 64) over [row_offset, row_offset + local_n): 100% bit-exact with split sampler
+    const SamplerParams p = (cfg.fork > 0 && t >= cfg.fork) ? cfg.sp1 : cfg.sp0;
+    const bool greedy_pick = p.greedy || p.temperature <= 0.0f;
+    const int k = greedy_pick ? 1 : sampled_k(p.top_k, full_vocab);
+
+    const bool mapped_hist = (history == nullptr && use_mapped_cfg && cfg.hist_len > 0);
+    const int eff_hlen = history != nullptr ? history_len : (mapped_hist ? cfg.hist_len : 0);
+    int hlen = 0;
+    if (eff_hlen > 0) {
+        hlen = p.penalty_last_n < eff_hlen ? p.penalty_last_n : eff_hlen;
+        if (hlen < 0) hlen = 0;
+    }
+    __shared__ unsigned int bits[kSplitBlockSpan / 32];
+    __shared__ int sh_hrow[kTpHeadMaxHistLen];
+    const int* hrow = nullptr;
+    if (hlen > 0) {
+        if (mapped_hist) {
+            const volatile int* vhb = reinterpret_cast<const volatile int*>(m_cfg + 1) +
+                                      (size_t) t * (size_t) eff_hlen + (eff_hlen - hlen);
+            for (int i = (int) threadIdx.x; i < hlen; i += (int) blockDim.x) sh_hrow[i] = vhb[i];
+            __syncthreads();
+            hrow = sh_hrow;
+        } else {
+            hrow = history + (size_t) t * (size_t) history_len + (history_len - hlen);
+        }
+    }
+    const bool use_bits = hrow != nullptr && hlen > 0;
+    if (use_bits) {
+        for (int w = (int) threadIdx.x; w < kSplitBlockSpan / 32; w += (int) blockDim.x) bits[w] = 0u;
+        __syncthreads();
+        const int gblo = row_offset + blo;
+        for (int i = (int) threadIdx.x; i < hlen; i += (int) blockDim.x) {
+            const int h = hrow[i];
+            if (h >= gblo && h - gblo < kSplitBlockSpan && h < row_offset + local_n)
+                atomicOr(&bits[(h - gblo) >> 5], 1u << ((h - gblo) & 31));
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < kSplitPerLane; ++j) {
+            const int v = lo + 32 * j + lane, lb = v - blo;
+            if (v < local_n && (bits[lb >> 5] & (1u << (lb & 31))))
+                s[j] = apply_penalties(s[j], history_count(hrow, hlen, row_offset + v), p);
+        }
+    }
+
+    __shared__ int2 wl[kSplitWarps][kSelMax];
+    float prev_v = __int_as_float(0x7f800000);
+    int prev_i = -1;
+    int round_i = 0;
+    for (; round_i < k; ++round_i) {
+        float b0 = __int_as_float(0xff800000), b1 = __int_as_float(0xff800000);
+        int i0 = full_vocab, i1 = full_vocab;
+#pragma unroll
+        for (int j = 0; j < kSplitPerLane; j += 2) {
+            const int gv0 = row_offset + lo + 32 * j + lane, gv1 = gv0 + 32;
+            const float x0 = s[j], x1 = s[j + 1];
+            if ((x0 < prev_v || (x0 == prev_v && gv0 > prev_i)) && x0 > b0) { b0 = x0; i0 = gv0; }
+            if ((x1 < prev_v || (x1 == prev_v && gv1 > prev_i)) && x1 > b1) { b1 = x1; i1 = gv1; }
+        }
+        take_first(b0, i0, b1, i1);
+        warp_first(b0, i0);
+        if (i0 >= full_vocab) break;
+        if (lane == 0) wl[warp][round_i] = make_int2(i0, __float_as_int(b0));
+        prev_v = b0;
+        prev_i = i0;
+    }
+    for (int r = round_i + lane; r < k; r += 32) wl[warp][r] = make_int2(full_vocab, (int) 0xff800000u);
+    __syncthreads();
+    if (warp == 0) {
+        int2* dst = row_st->block_lists + (size_t) b * (size_t) k;
+        warp_merge_lists(&wl[0][0], kSplitWarps, kSelMax, k, full_vocab, [&](int r, float v, int id) {
+            if (lane == 0) dst[r] = make_int2(id, __float_as_int(v));
+        });
+    }
+    __shared__ bool is_last;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        is_last = (atomicAdd(&row_st->counter, 1u) == (unsigned int) (n_blocks - 1));
+    }
+    __syncthreads();
+    if (!is_last) return;
+    __threadfence();
+
+    // Last block of row t merges all n_blocks (<= 31) block lists into local_out[t * k .. +k]
+    __shared__ int2 sh_lists[32 * kSelMax];
+    const int total_e = n_blocks * k;
+    for (int e = (int) threadIdx.x; e < total_e; e += (int) blockDim.x) {
+        const volatile int2* vp = row_st->block_lists + e;
+        sh_lists[e] = make_int2(vp->x, vp->y);
+    }
+    __syncthreads();
+    if (warp == 0) {
+        int2* row_dst = local_out + (size_t) t * (size_t) k;
+        warp_merge_lists(sh_lists, n_blocks, k, k, full_vocab, [&](int r, float v, int id) {
+            if (lane == 0) row_dst[r] = make_int2(id, __float_as_int(v));
+        });
+        if (lane == 0) {
+            if (m_nf != nullptr) {
+                const uint32_t rnf = ((const volatile unsigned int*) &row_st->nf)[0];
+                m_nf[t * 16] = rnf;
+                row_st->nf = 0u;
+            }
+            row_st->counter = 0u;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256)
+tp2_head_publish_kernel(const int2* __restrict__ local_out, int2* __restrict__ peer_dst,
+                        volatile uint32_t* __restrict__ peer_flag, volatile uint32_t* __restrict__ my_main_flag,
+                        const TpHeadSampleCfg* m_cfg, TpHeadSampleCfg byval_cfg, int use_mapped_cfg,
+                        int n_rows, uint32_t sig_val) {
+    if (threadIdx.x == 0 && my_main_flag != nullptr) *my_main_flag = 0u;
+    __shared__ int sh_cfg_w[sizeof(TpHeadSampleCfg) / sizeof(int)];
+    const TpHeadSampleCfg cfg = load_tp_head_cfg(m_cfg, byval_cfg, use_mapped_cfg, sh_cfg_w);
+    const bool greedy_pick = cfg.sp0.greedy || cfg.sp0.temperature <= 0.0f;
+    const int k = cfg.active ? (greedy_pick ? 1 : sampled_k(cfg.sp0.top_k, cfg.n_vocab)) : 1;
+    const int n_items = n_rows * k;
+    for (int i = (int) threadIdx.x; i < n_items; i += (int) blockDim.x) {
+        const int2 v = local_out[i];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.global.wt.v2.u32 [%0], {%1, %2};"
+                     :: "l"(peer_dst + i), "r"((uint32_t) v.x), "r"((uint32_t) v.y) : "memory");
+#else
+        volatile int* vd = (volatile int*) (peer_dst + i);
+        vd[0] = v.x;
+        vd[1] = v.y;
+#endif
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t sig = use_mapped_cfg ? cfg.seq : sig_val;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(peer_flag), "r"(sig) : "memory");
+#else
+        __threadfence_system();
+        *peer_flag = sig;
+#endif
+    }
+}
+
+__global__ void __launch_bounds__(512)
+tp2_head_merge_kernel(const int2* __restrict__ local_out0, const int2* __restrict__ peer_out1,
+                      const volatile uint32_t* __restrict__ peer_flag1, volatile uint32_t* __restrict__ my_main_flag0,
+                      const TpHeadSampleCfg* m_cfg, TpHeadSampleCfg byval_cfg, int use_mapped_cfg,
+                      int n_rows, uint32_t wait_val, int32_t* __restrict__ out) {
+    __shared__ int sh_cfg_w[sizeof(TpHeadSampleCfg) / sizeof(int)];
+    const TpHeadSampleCfg cfg = load_tp_head_cfg(m_cfg, byval_cfg, use_mapped_cfg, sh_cfg_w);
+    const uint32_t wval = use_mapped_cfg ? cfg.seq : wait_val;
+    if (threadIdx.x == 0) {
+        if (my_main_flag0 != nullptr) *my_main_flag0 = 0u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag1) : "memory");
+            if ((int32_t) (pf - wval) >= 0) break;
+            __nanosleep(32);
+        }
+#else
+        while ((int32_t) (*peer_flag1 - wval) < 0) {}
+        __threadfence_system();
+#endif
+    }
+    __syncthreads();
+
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+
+    if (cfg.active == 0) {
+        if ((int) threadIdx.x < n_rows) {
+            const int t = (int) threadIdx.x;
+            const int2 a0 = local_out0[t];
+            uint32_t px, py;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+            asm volatile("ld.global.cv.v2.u32 {%0, %1}, [%2];" : "=r"(px), "=r"(py) : "l"(peer_out1 + t) : "memory");
+#else
+            const volatile int2* vp = peer_out1 + t;
+            px = (uint32_t) vp->x; py = (uint32_t) vp->y;
+#endif
+            float bv = __int_as_float(a0.x);
+            int bi = a0.y;
+            take_first(bv, bi, __uint_as_float(px), (int) py);
+            out[t] = bi;
+        }
+    } else if (warp < n_rows) {
+        constexpr int kMaxRowsBlock = 16;
+        __shared__ int2 sh_pair[kMaxRowsBlock][2 * kSelMax];
+        __shared__ int sh_ids[kMaxRowsBlock][kSelMax];
+        __shared__ float sh_log[kMaxRowsBlock][kSelMax];
+        __shared__ double sh_ex[kMaxRowsBlock][kSelMax];
+
+        const int t = warp;
+        const int full_vocab = cfg.n_vocab;
+        const SamplerParams p = (cfg.fork > 0 && t >= cfg.fork) ? cfg.sp1 : cfg.sp0;
+        const bool greedy_pick = p.greedy || p.temperature <= 0.0f;
+        const int k = greedy_pick ? 1 : sampled_k(p.top_k, full_vocab);
+
+        for (int i = lane; i < k; i += 32) {
+            sh_pair[t][i] = local_out0[(size_t) t * (size_t) k + i];
+            uint32_t px, py;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+            asm volatile("ld.global.cv.v2.u32 {%0, %1}, [%2];"
+                         : "=r"(px), "=r"(py) : "l"(peer_out1 + (size_t) t * (size_t) k + i) : "memory");
+#else
+            const volatile int2* vp = peer_out1 + (size_t) t * (size_t) k + i;
+            px = (uint32_t) vp->x; py = (uint32_t) vp->y;
+#endif
+            sh_pair[t][k + i] = make_int2((int) px, (int) py);
+        }
+        __syncwarp();
+        warp_merge_lists(sh_pair[t], 2, k, k, full_vocab, [&](int i, float v, int id) {
+            if (lane == 0) { sh_ids[t][i] = id < full_vocab ? id : 0; sh_log[t][i] = v; }
+        });
+        __syncwarp();
+        if (greedy_pick) {
+            if (lane == 0) out[t] = sh_ids[t][0];
+        } else {
+            const int t_rel = (cfg.fork > 0 && t >= cfg.fork) ? (t - cfg.fork) : t;
+            int* out_base = (cfg.fork > 0 && t >= cfg.fork) ? (out + cfg.fork) : out;
+            sampled_tail_warp(sh_ids[t], sh_log[t], k, p, t_rel, out_base, sh_ex[t]);
+        }
+    }
+}
+
+}  // namespace
+
+size_t tp2_head_sample_scratch_bytes(int max_rows) {
+    return (size_t) (max_rows > 0 ? max_rows : 1) * sizeof(TpHeadRowScratch);
+}
+
+void tp2_head_part_and_publish(const float* logits, int n_rows, int local_n, int row_offset,
+                               const TpHeadSampleCfg* m_cfg, void* scratch, void* local_out,
+                               void* peer_dst, uint32_t* peer_flag, uint32_t* my_main_flag,
+                               uint32_t* m_nf, int rank, void* stream) {
+    if (n_rows <= 0 || local_n <= 0) return;
+    const int n_blocks = (local_n + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    const int safe_sentinel = (row_offset + local_n) > (local_n * 2) ? (row_offset + local_n) : (local_n * 2);
+    TpHeadSampleCfg dummy{};
+    tp2_head_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_rows), kSplitWarps * 32, 0, (cudaStream_t) stream>>>(
+        logits, local_n, row_offset, safe_sentinel, nullptr, 0, m_cfg, dummy, 1,
+        (TpHeadRowScratch*) scratch, (int2*) local_out, m_nf);
+    coupled_check("tp2_head_part");
+    if (rank == 1) {
+        tp2_head_publish_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(
+            (const int2*) local_out, (int2*) peer_dst, peer_flag, my_main_flag, m_cfg, dummy, 1, n_rows, 1u);
+        coupled_check("tp2_head_publish");
+    }
+}
+
+void tp2_head_merge_and_sample(const void* local_out0, const void* peer_out1, const uint32_t* peer_flag1,
+                               uint32_t* my_main_flag0, const TpHeadSampleCfg* m_cfg, int n_rows,
+                               int32_t* out, void* stream) {
+    if (n_rows <= 0) return;
+    const int threads = n_rows * 32 <= 512 ? (n_rows * 32) : 512;
+    TpHeadSampleCfg dummy{};
+    tp2_head_merge_kernel<<<1, (unsigned) threads, 0, (cudaStream_t) stream>>>(
+        (const int2*) local_out0, (const int2*) peer_out1, peer_flag1, my_main_flag0,
+        m_cfg, dummy, 1, n_rows, 0u, out);
+    coupled_check("tp2_head_merge");
+}
+
+bool sample_tokens_tp2_p2p(const float* logits0, int local_n0, int row_off0, void* stream0, int dev0,
+                           const float* logits1, int local_n1, int row_off1, void* stream1, int dev1,
+                           int n_tokens, int full_vocab, const int* hist0_dev, const int* hist1_dev,
+                           int history_len, const SamplerParams& p0_in, const SamplerParams& p1_in, int fork,
+                           uint32_t seq, void* local_out0, void* local_out1, void* scratch0, void* scratch1,
+                           void* p2p_arg0, uint32_t* p2p_flag0, int* out0_mapped) {
+    if (n_tokens <= 0 || n_tokens > 16 || local_n0 <= 0 || local_n1 <= 0 ||
+        scratch0 == nullptr || scratch1 == nullptr || local_out0 == nullptr || local_out1 == nullptr ||
+        p2p_arg0 == nullptr || p2p_flag0 == nullptr)
+        return false;
+    const int nb0 = (local_n0 + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    const int nb1 = (local_n1 + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    if (nb0 > 32 || nb1 > 32) return false;
+    if (p0_in.penalty_last_n > 0 && (hist0_dev == nullptr || hist1_dev == nullptr || history_len <= 0))
+        return false;
+
+    TpHeadSampleCfg cfg{};
+    cfg.sp0 = p0_in;
+    cfg.sp0.gumbel = p0_in.gumbel || gumbel_env();
+    cfg.sp1 = p1_in;
+    cfg.sp1.gumbel = p1_in.gumbel || gumbel_env();
+    cfg.fork = fork;
+    cfg.active = 1;
+    cfg.n_vocab = full_vocab;
+    cfg.seq = seq;
+
+    int prev_dev = 0;
+    cudaGetDevice(&prev_dev);
+
+    // 1. Launch Rank 1 local Top-k + BAR1 P2P shortlist push (<= 8 KiB instead of 8 MiB!)
+    cudaSetDevice(dev1);
+    tp2_head_part_kernel<<<dim3((unsigned) nb1, (unsigned) n_tokens), kSplitWarps * 32, 0, (cudaStream_t) stream1>>>(
+        logits1, local_n1, row_off1, full_vocab, hist1_dev, history_len, nullptr, cfg, 0,
+        (TpHeadRowScratch*) scratch1, (int2*) local_out1, nullptr);
+    tp2_head_publish_kernel<<<1, 256, 0, (cudaStream_t) stream1>>>(
+        (const int2*) local_out1, (int2*) p2p_arg0, p2p_flag0, nullptr, nullptr, cfg, 0, n_tokens, seq);
+    (void) cudaStreamQuery((cudaStream_t) stream1);
+
+    // 2. Overlap Rank 0 local Top-k + merge + sampled_tail_warp
+    cudaSetDevice(dev0);
+    tp2_head_part_kernel<<<dim3((unsigned) nb0, (unsigned) n_tokens), kSplitWarps * 32, 0, (cudaStream_t) stream0>>>(
+        logits0, local_n0, row_off0, full_vocab, hist0_dev, history_len, nullptr, cfg, 0,
+        (TpHeadRowScratch*) scratch0, (int2*) local_out0, nullptr);
+    tp2_head_merge_kernel<<<1, (unsigned) (n_tokens * 32), 0, (cudaStream_t) stream0>>>(
+        (const int2*) local_out0, (const int2*) p2p_arg0, p2p_flag0, nullptr,
+        nullptr, cfg, 0, n_tokens, seq, out0_mapped);
+
+    cudaSetDevice(prev_dev);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 }  // namespace strata::kernels

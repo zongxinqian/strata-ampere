@@ -31,7 +31,7 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr,
-                      int64_t ldx = 0, bool f16img = false);
+                      int64_t ldx = 0, bool f16img = false, const uint16_t* peer_bo_bf16 = nullptr);
 /// S23 (STRATA_CVEC_FUSE=1): gr_write, then the control vector (v_l = layer l's direction row, *s_l its scale,
 /// *on the request flag, mode 0 project / 1 add; cvec_kernel's arithmetic), then gr_norm_rs with the next half's
 /// norm - one pass over R, the same bits as the three kernels.
@@ -51,7 +51,8 @@ bool f16_range_read(float& max_abs, unsigned long long& over, bool reset);
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
 /// R[t, c, d] += bo[t, d] * 2 sigmoid(inj[t, c] / hc)   (inj has row stride inj_ld)
-void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
+void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream,
+              const uint16_t* peer_bo_bf16 = nullptr);
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 

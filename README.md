@@ -7,19 +7,20 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="README.en.md"><img src="https://img.shields.io/badge/Language-English-00b894.svg" alt="English"></a>
-  <img src="https://img.shields.io/badge/v1.2.0-203.2%20tok%2Fs%20Warm%20%7C%20185.5%20Chat-00d4ff.svg" alt="v1.2.0 Decode">
-  <img src="https://img.shields.io/badge/Peak-273%E2%80%93287%20tok%2Fs%20%40%20240W-7c4dff.svg" alt="Peak 273-287 tok/s">
+  <img src="https://img.shields.io/badge/v1.3.0-217%20Warm%20%7C%20204.7%20All%20%7C%20173.6%20%40%20117K-00d4ff.svg" alt="v1.3.0 Decode">
+  <img src="https://img.shields.io/badge/Peak-276.6%E2%80%93373%20tok%2Fs%20%40%20240W-7c4dff.svg" alt="Peak 276.6-373 tok/s">
   <img src="https://img.shields.io/badge/PCIe%204.0%20P2P-50.86%20GB%2Fs%20Full--Duplex-00e676.svg" alt="50.86 GB/s P2P">
-  <img src="https://img.shields.io/badge/Precision-100%25%20Bit--Exact%20Lossless-ffbe28.svg" alt="Lossless">
+  <img src="https://img.shields.io/badge/Precision-17%2F17%20Bit--Exact%20Lossless-ffbe28.svg" alt="17/17 Bit-Exact Lossless">
 </p>
 
 <p align="center">
   <img src="docs/assets/dashboard-8080-live.jpg" alt="strata-ampere Port 8080 Live Telemetry Dashboard" width="100%">
   <br>
-  <sub><b>内置 8080 端口实时监控仪表盘实拍</b>：双魔改 RTX 3080 20GB 7×24 稳定运行，现已升级至 <b>v1.2.0 P2P 原生架构深度优化 + 50.86 GB/s 直接 PCIe 4.0 P2P + 72×1 GiB 静态大页</b> — 真实聊天采样（<code>temp=0.6</code>）暴涨至 <code>185.50 tok/s</code>（<code>+12.7%</code>）、标准 4 任务 Greedy 热态均速 <code>203.22 tok/s</code>（单任务峰值 <code>273–287 tok/s</code>）、84K Cold Prefill <code>3,836–3,870 tok/s</code>、<b>9,831 常驻热专家</b>、满载 <code>43℃ / 39℃</code>、待机 <code>4.8 W</code>、<code>0 Xid · 0 AER · 0 DMAR</code></sub>
+  <sub><b>内置 8080 端口实时监控仪表盘实拍</b>：双魔改 RTX 3080 20GB 7×24 稳定运行，现已全面升级至 <b>v1.3.0 全仓后 P2P 原生架构深度重构 + DFlash2 推测树验证 + 50.86 GB/s 直接 PCIe 4.0 P2P + 72×1 GiB 静态大页</b> — 标准 3 轮全均值 <code>204.67 tok/s</code>（热态均速 <code>214–217 tok/s</code>，单任务峰值 <code>276.6 tok/s</code>，瞬时突发峰值 <code>373.0 tok/s</code>）、<b>117K 超长上下文冷启 Prefill <code>3,830.9–3,842.6 tok/s</code> + Decode 暴涨至 <code>173.6 tok/s</code>（<code>+45.0%</code>）</b>、<b>9,870 常驻热专家</b>、多轮 4.1K 会话跨卡恢复 <code>32.9 ms</code>、待机 CPU <code>0.00%</code>、满载 <code>43℃ / 38℃</code>、<code>0 Xid · 0 AER · 0 OOM</code></sub>
 </p>
 
-`strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度全栈工程重构，专为 **双魔改 RTX 3080 20 GB（Ampere `sm_86`，40 GB 总显存）** 打造，在 **100% 严格无损精度** 下榨干每一分硬件极限：
+`strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度全栈工程重构，专为 **双魔改 RTX 3080 20 GB（Ampere `sm_86`，40 GB 总显存）** 打造，在 **100% 严格无损精度（17/17 SHA256 逐位一致）** 下榨干每一分硬件极限：
+- **v1.3.0 全仓后 P2P 原生架构清查重构 + DFlash2 推测树验证（240W 严格无损，17/17 Bit-Exact SHA256 门禁全通）**：彻底扫除“无 P2P 时代遗留老路”——**① DFlash2 前沿分支推测树验证（`STRATA_DF2_TREE=1`）+ `sm_86` 快速 Q8/MMVQ/AVX2 微核**：将不确定前沿的双候选分支同时送入单次 Verify 图验证，显著抬高每窗接受 token 数；**② 图内统一 TP=2 BAR1 P2P Top-64 采样器（含真实对话惩罚项，`STRATA_TP_HEAD_FAST=1`）**：将 `presence_penalty=1.5` 等历史惩罚（`hist_len <= 128`）通过相干映射缓冲 `TpHeadSampleCfg` 直接纳入 Verify CUDA Graph 内部，消除默认流同步拷贝与图外二次采样，GPU1 仅经 BAR1 推送 `Top-64` 候选；**③ 解锁 DFlash2 原生 `Q4_0` 50/50 P2P 草稿头 + 原生 BF16 KV 环（`STRATA_DF2_KV_BF16=1`）**：打通 `STRATA_DF2_HEAD_Q4=1` 与 `STRATA_DF2_HEAD_TP2=1` 直连共存，消除 GPU0 `98.7 MiB` 启动瞬时峰值、将 DFlash2 单窗草稿耗时从 `1.32 ms` 压低至 **`0.87–1.17 ms`（最高 `-34%`）**，叠加原生 BF16 KV 环与 `22 MiB` 精简 VMM 块，常驻专家再增 **`+40` → `9,870`**；**④ 融合 BAR1 P2P `peer_bo_bf16` Prefill AllReduce（`STRATA_TP_FUSE_PF_AR=1`）+ 紧凑异步 PLE 上传**：`gr_write_norm_rs_kernel` 直接跨 BAR1 融合读取对端 BF16 部分和，**117K（`116,800` tok）冷启 Prefill 达 `3,830.9–3,842.6 tok/s`，长上下文 Decode 从 `119.70 → 173.60 tok/s`（暴涨 `+45.0%`）**；**⑤ 按卡异步会话驻留/恢复（`32.9 ms` 恢复 4.1K 会话）+ 零空转 `tp1` 工作线程（`0.00%` 待机 CPU）+ 遥测去抖 & SSE `TCP_NODELAY`**！
 - **v1.2.0 P2P 原生架构深度优化（240W 严格无损，4/4 Bit-Exact SHA256 校验通过）**：在解锁 `50.86 GB/s` VMM Push-Write P2P 后进一步重构两大高频通信与草稿瓶颈——**① Direct P2P ArgHalf & 全词表 Logits 直传（`STRATA_TP_HEAD_P2P=1`）**：彻底消除真实采样（`temp > 0`）每步 `16 MiB` GPU1→Host→GPU0 绕行拷贝，4 任务真实聊天均速从 `164.57 → 185.50 tok/s`（**`+20.93 tok/s / +12.7%`**）；**② DFlash2 106K CJK 草稿头 P2P TP=2 词表并行（`STRATA_DF2_HEAD_TP2=1`）**：将 `146.0 MiB` Q4_0 草稿头按行 50/50 拆分到双卡（`53,152 + 53,147` 行，各 `73.0 MiB`），GPU0 通过 BAR1 推送 `20 KiB` 激活唤醒 GPU1 捕获图并行算后回推 `896 B` Top-16、单 Warp 32 线程 Bitonic 精确归并，**直接释放 `73.0 MiB` GPU0 显存**（`--vram-reserve-mib 608` 再多装 **`+24` 个常驻专家 → `9,831`**）；**③ Ampere `sm_86` 专属 `STRATA_DF2_GEMM4=26`**（unroll=1 降寄存器压力，自动按 `sm_86` 生效），标准 4 任务热态均速提升至 **`203.22–208.27 tok/s`**（`+8.4% ~ +11.1%`），冻结 Adapt 下 **4/4 任务 2,560 token 逐位一致**！
 - **v1.1.0 六方向深度微核与系统调优**：**GPU1 稀疏命中 MoE Combine**、**48:52 容量加权 Bresenham 专家切分**、**Ampere `sm_86` 硬件 `__nanosleep(64)` P2P 自旋屏障 + `K=1` Warp 对齐**、**Zen 2 AVX2 权重预取 + PCIe Root Port ACS 关闭 + `/dev/cpu_dma_latency=0`**、**`STRATA_DF2_HEAD_Q4=1` + 真 `--spec 8 --draft-conf 0.50`（`user_args`）+ `draft-costs.json` 重校准**。
 - **无需改写 PCIe 寄存器扩 BAR1（原生 `256 MiB BAR1`）**：通过自研 **VMM 选择性 BAR1 映射 + 1-Hop Push-Write + VRAM Flag 屏障** 配合版本精确匹配的开源动态 BAR1 P2P 内核驱动（[patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)）与 **`72 × 1 GiB` 静态大页 + `iommu=pt`**，实测打通 **`50.86 GB/s` 全双工卡对卡直连**。
@@ -30,7 +31,27 @@
 
 ## 一、核心优化实测速度（全历程可复现数据）
 
-### 1. v1.2.0 最新里程碑：P2P 原生架构深度重构（240W 严格无损，同二进制严格隔离 A/B）
+### 1. v1.3.0 最新里程碑：全仓后 P2P 原生架构清查重构 + DFlash2 推测树验证（240W 严格无损）
+
+基于 `Qwen3.8-Flash-Next-UD-Q4_K_XL`（256K 上下文，`DFlash2 Q4_0` P2P 50/50 双卡草稿头 + 原生 BF16 KV 环 + 前沿推测树 + `T=12` 持久化后缀树，单卡 `240W` + 显存 `10,151 MHz` + `MRRS 4096B` + `50.86 GB/s` PCIe 4.0 P2P，4 任务标准套件 `moe_arch / code_cuda / agent_json / kv_tech`，640 tok，`enable_thinking=False`）：
+
+| 核心验收维度（240W 严格无损 `UD-Q4_K_XL`） | 无 P2P 基线 | 树推测前序基线 | **v1.3.0 全仓后 P2P 重构终版** | 净提升与关键亮点 |
+|---|---:|---:|---:|---|
+| **3 轮标准 `bench_6dir` 全均值 (`all_mean`)** | `165.30 tok/s` | `200.03 tok/s` | **`204.67 tok/s`** | 较无 P2P **`+23.8%`**，命中率 **`80.92%`** |
+| **热态均值 (`r2 / r3`) · 单任务峰值** | `176.2` / `~210` | `215.30` / `272.80` | **`217.00 / 214.00` · `276.60 tok/s`** | 面板实测瞬时突发峰值 **`373.0 tok/s`** |
+| **真实对话 `temp=0.6`（默认 `presence=1.5`）** | `~142 tok/s` | `172.15 / 172.75` | **`180.38 / 177.83 tok/s`（峰 `201.2`）** | 历史惩罚采样 **100% 移入 Verify 图内**（**`+3.9%`**） |
+| **`117K` (`116,800` tok) Cold Prefill** | `~3,150 tok/s` | `3,798.8 tok/s` | **`3,830.9–3,842.6 tok/s`** | 融合 BAR1 P2P `peer_bo_bf16` AllReduce + 紧凑异步 PLE |
+| **`117K` (`116,800` tok) 超长文 Decode** | `~92 tok/s` | `119.70 tok/s` | **`173.60 tok/s`** | **`+53.90 tok/s`（暴涨 `+45.0%`！）** |
+| **双卡常驻热专家 / DFlash2 单窗耗时** | `9,656` / `1.74 ms` | `9,830` / `1.32 ms` | **`9,870 (4766+5104)` / `0.87–1.17 ms`** | **`+40` 常驻专家**，草稿延迟最高 **`-34%`** |
+| **4.1K 多轮会话跨卡恢复 / 待机 CPU** | 同步阻塞 / 偏高 | `~115 ms` / 自旋耗核 | **`32.9 ms` (+`17.6 ms` 重建) / `0.00%`** | 按卡异步 `ParkAsync` + 无锁休眠唤醒，`0 Xid / 0 AER / 0 OOM` |
+
+- **17/17 严格 Bit-Exact SHA256 对齐门禁（对称锁定 `4500 + 4500 = 9000` 常驻专家，`--adapt-every 999999`）**：
+  - **Pure Greedy (`4/4 EXACT`)**、**无惩罚 `temp=0.6` (`4/4 EXACT`)**、**真实对话 `presence_penalty=1.5` 图内采样 (`4/4 EXACT`)**、**带惩罚 Greedy (`2/2 EXACT`)**、**`penalty_last_n=256` 图外 P2P 归并 (`2/2 EXACT`)**、**`9.7K` 稀疏块选择长文 Prefill+Decode (`1/1 EXACT`)** —— 全部 **17/17 组 SHA256 100.000% 逐位一致** 且同专家数下全项正提速！
+- **v1.3.0 诚实消融披露（保留正向默认开启，实验特性保留为可选开关）**：
+  - ✅ **默认开启**：`STRATA_DF2_TREE=1`（推测树验证）、`STRATA_TP_HEAD_FAST=1`（图内含惩罚统一 P2P 采样器）、`STRATA_DF2_KV_BF16=1`（原生 BF16 KV 环）、`STRATA_DF2_HEAD_TP2=1` + `STRATA_DF2_HEAD_Q4=1`（Q4_0 50/50 P2P 草稿头）、`STRATA_TP_FUSE_PF_AR=1`（融合 Prefill P2P AllReduce）、`STRATA_PLE_COMPACT=1` + `STRATA_PLE_COPY_STREAM=1`、`STRATA_TP_VMM_PIPE_MB=22`。
+  - ⚙️ **保留为可选开关（默认 `=0`）**：`STRATA_TP_QSA_IDX_SPLIT=1`（6+6 跨卡 QSA Indexer 分片可将双卡常驻专家推高至 `9,998` 个，但长文下因 BF16 双卡 1-ulp 归约顺序差异出现 `16/17` 微差且 Prefill 慢 `~4.5%`，严守 100% 逐位无损红线默认关闭）；`STRATA_ADAPT_SMART=0`（实测提高换入阈值会把实时热专家换入从 `29.6` 压制到 `3.3 swaps/win`，保持无节流实时适应更快）。
+
+### 2. v1.2.0 里程碑：P2P 原生架构深度重构（240W 严格无损，同二进制严格隔离 A/B）
 
 基于 `Qwen3.8-Flash-Next-UD-Q4_K_XL`（256K 上下文，`DFlash2 Q4_0` 106,299-token CJK 草稿头 + `T=12` 持久化后缀树，单卡 `240W` + 显存 `10,151 MHz` + `MRRS 4096B` + `50.86 GB/s` PCIe 4.0 P2P，4 任务标准套件 `moe_arch / code_cuda / agent_json / kv_tech`，640 tok，`enable_thinking=False`）：
 
@@ -98,6 +119,7 @@
 | **v1.0.0：1 GiB 静态大页 + `iommu=pt` + 50.86 GB/s VMM Push-P2P** | `187.28` / `3,780` | **`201.40` 热态 / `3,870`** | **破 200 大关** | 72×1 GiB 锁死 dTLB + 原生 256 MiB BAR1 直接 P2P |
 | **v1.1.0：六方向深度微核 + 48:52 EP + `user_args --spec 8` + ACS/DMA** | `186.22` / `199.68` | **`202.50` 冷启 / `231.35` 热态 (`287.2` 峰)** | **`+8.7% ~ +15.9%`** | 稀疏 Combine + 9,807 专家 + `__nanosleep` + `DF2_HEAD_Q4` + 重校准 |
 | **v1.2.0：P2P Logits 直传 + DFlash2 106K 头 TP=2 + `sm_86` GEMM4=26** | `164.6` 聊天 / `187.5` Greedy | **`185.5` 真实聊天 / `203.2–208.3` 热态 (`273` 峰)** | **`+12.7%` 聊天 / `+8.4%~11.1%` Greedy** | 消除 16M Host 绕行 + GPU0 省 73M (`9,831` 专家) + 4/4 SHA256 逐位一致 |
+| **v1.3.0：全仓后 P2P 重构 + 图内惩罚采样 + BF16 KV + 融合 Prefill AR + 推测树** | `200.0` 全均 / `119.7` @117K | **`204.67` 全均 (`217` 热 / `276.6` 峰) / `173.6` @117K** | **`+45.0%` @117K / `3,842.6` Prefill** | 17/17 SHA256 逐位一致、`9,870` 专家、草稿 `-34%`、`32.9 ms` 跨卡恢复、`0.00%` 待机 CPU |
 
 ### 4. Prefill 提示词吞吐实测（严格无损）
 
@@ -283,10 +305,10 @@ sudo reboot
 
 ---
 
-### Step 5：编译并启动 `strata-ampere` v1.2.0（含 ACS 关闭 + `/dev/cpu_dma_latency=0` 持久化）
+### Step 5：编译并启动 `strata-ampere` v1.3.0（含 ACS 关闭 + `/dev/cpu_dma_latency=0` 持久化）
 
 ```bash
-# 1. 编译 Ampere sm_86（已内置 v1.2.0 全部 P2P 原生优化与 sm_86 GEMM4=26 自动选择）
+# 1. 编译 Ampere sm_86（已内置 v1.3.0 全部后 P2P 原生架构重构、图内惩罚采样器、BF16 KV 环与推测树验证）
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 cmake -B build86 -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \

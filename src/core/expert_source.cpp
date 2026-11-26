@@ -4978,9 +4978,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     pt("begin");
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
-    if (!d.usage.empty())
-        for (int64_t i = 0; i < n_tok * k; ++i)
-            if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    if (!d.usage.empty()) {
+        if (d.defer_usage_to_commit && d.layers >= 0 && d.layers < d.win_usage_layers && k == d.win_usage_k) {
+            const int t0 = d.win_usage_t[(size_t) d.layers];
+            if (t0 >= 0 && t0 + n_tok <= 16) {
+                std::memcpy(d.win_usage_ids.data() + ((size_t) d.layers * 16u + (size_t) t0) * (size_t) k,
+                            ids, (size_t) (n_tok * k) * sizeof(int32_t));
+                d.win_usage_t[(size_t) d.layers] = t0 + (int) n_tok;
+            }
+        } else {
+            for (int64_t i = 0; i < n_tok * k; ++i)
+                if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+        }
+    }
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;

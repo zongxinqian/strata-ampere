@@ -650,6 +650,40 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    std::vector<float> usage_floor;          ///< stationary profile floor per (layer, expert) for core hot ranks
+    bool defer_usage_to_commit = false;      ///< buffer routed ids per layer and count only accepted window rows
+    int win_usage_layers = 0;
+    int win_usage_k = 0;
+    std::vector<int32_t> win_usage_t;        ///< [n_layers] tokens buffered so far in current window
+    std::vector<int32_t> win_usage_ids;      ///< [n_layers * 16 * k] routed ids buffered during current window
+    void reset_window_usage(int64_t n_layers, int64_t k) {
+        if (!defer_usage_to_commit || usage.empty()) return;
+        win_usage_layers = (int) n_layers;
+        win_usage_k = (int) k;
+        if ((int64_t) win_usage_t.size() < n_layers) win_usage_t.assign((size_t) n_layers, 0);
+        else std::fill(win_usage_t.begin(), win_usage_t.begin() + (ptrdiff_t) n_layers, 0);
+        const size_t need = (size_t) n_layers * 16u * (size_t) k;
+        if (win_usage_ids.size() < need) win_usage_ids.assign(need, -1);
+    }
+    void commit_window_usage(const int32_t* rows, int n_keep) {
+        if (!defer_usage_to_commit || usage.empty() || rows == nullptr || n_keep <= 0) return;
+        const int L = win_usage_layers, K = win_usage_k;
+        for (int l = 0; l < L; ++l) {
+            const int nt = win_usage_t[(size_t) l];
+            if (nt <= 0) continue;
+            const int32_t* base = win_usage_ids.data() + (size_t) l * 16u * (size_t) K;
+            float* u = usage.data() + (size_t) l * (size_t) n_expert;
+            for (int s = 0; s < n_keep; ++s) {
+                const int r = rows[s];
+                if (r < 0 || r >= nt) continue;
+                const int32_t* p = base + (size_t) r * (size_t) K;
+                for (int j = 0; j < K; ++j) {
+                    const int32_t e = p[j];
+                    if (e >= 0 && e < n_expert) u[(size_t) e] += 1.0f;
+                }
+            }
+        }
+    }
     /// The adaptive tier's evictions reach the device's table before the next window, not when the round's copies
     /// land: until then doorbell_publish_res can skip a layer's activation while the pool computes an evicted expert
     /// from the one published before.  The driver sets it where the tier does not wait for its copies

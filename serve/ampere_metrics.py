@@ -25,8 +25,8 @@ _RE_PROMPT = re.compile(
     r"(\d+) generated in ([\d.]+) ms \(([\d.]+) tok/s\), drafts accepted (\d+) of (\d+)"
 )
 _RE_EXPERT = re.compile(
-    r"strata serve: decode expert cache hit rate: ([\d.]+)% \((\d+) hits / (\d+) lookups\); "
-    r"\d+ more read by the GPU over PCIe or from another GPU \(([\d.]+)%"
+    r"strata serve: decode expert cache hit rate: ([\d.]+)% \((\d+) hits / (\d+) lookups\)"
+    r"(?:; \d+ more read by the GPU over PCIe or from another GPU \(([\d.]+)%)?"
 )
 _RE_KV = re.compile(
     r"strata serve: KV streaming: ([\d.]+)% of \d+ block reads hit VRAM, ([\d.]+) MiB read from RAM"
@@ -331,7 +331,7 @@ def _parse_engine_log(log_path: str | None) -> dict[str, Any]:
         m = _RE_EXPERT.search(ln)
         if m:
             cur["expert_hit_pct"] = round(float(m.group(1)), 1)
-            cur["pcie_offload_pct"] = round(float(m.group(4)), 1)
+            cur["pcie_offload_pct"] = round(float(m.group(4)), 1) if m.group(4) else 0.0
             continue
         m = _RE_KV.search(ln)
         if m:
@@ -392,9 +392,26 @@ def _parse_engine_log(log_path: str | None) -> dict[str, Any]:
 
 
 def collect_metrics(svc: Any, log_path: str | None = None) -> dict[str, Any]:
-    gpus = _cached("gpus", 1.5, _read_gpus)
-    host = _cached("host", 1.5, _read_host)
-    health = _cached("dmesg_health", 15.0, _read_dmesg_health)
+    # Live engine status (busy/idle + current streaming tok/s) — never touches api_key or text
+    live_status: dict[str, Any] = {"busy": False, "phase": "idle", "tokens": 0, "tokens_per_s": 0.0}
+    try:
+        with svc.status_lock:
+            s = dict(svc.status)
+        live_status["busy"] = bool(s.get("busy", False))
+        live_status["phase"] = s.get("phase") or ("generating" if live_status["busy"] else "idle")
+        live_status["tokens"] = int(s.get("tokens") or 0)
+        if live_status["busy"] and s.get("first_token"):
+            live_status["tokens_per_s"] = round(float(svc._tok_s()), 1)
+            live_status["elapsed_s"] = round(time.time() - float(s.get("started", time.time())), 1)
+    except Exception:
+        pass
+
+    # Avoid spawning nvidia-smi / dmesg during active generation (#905 kernel nv_lock PCIe BAR jitter)
+    gpu_ttl = 20.0 if live_status["busy"] else 1.5
+    dmesg_ttl = 60.0 if live_status["busy"] else 15.0
+    gpus = _cached("gpus", gpu_ttl, _read_gpus)
+    host = _cached("host", 2.0, _read_host)
+    health = _cached("dmesg_health", dmesg_ttl, _read_dmesg_health)
 
     # Resolve log path from svc config if not explicitly passed
     if not log_path:
@@ -413,20 +430,6 @@ def collect_metrics(svc: Any, log_path: str | None = None) -> dict[str, Any]:
                 break
 
     log_data = _cached(f"log:{log_path}", 1.5, lambda: _parse_engine_log(log_path))
-
-    # Live engine status (busy/idle + current streaming tok/s) — never touches api_key or text
-    live_status: dict[str, Any] = {"busy": False, "phase": "idle", "tokens": 0, "tokens_per_s": 0.0}
-    try:
-        with svc.status_lock:
-            s = dict(svc.status)
-        live_status["busy"] = bool(s.get("busy", False))
-        live_status["phase"] = s.get("phase") or ("generating" if live_status["busy"] else "idle")
-        live_status["tokens"] = int(s.get("tokens") or 0)
-        if live_status["busy"] and s.get("first_token"):
-            live_status["tokens_per_s"] = round(float(svc._tok_s()), 1)
-            live_status["elapsed_s"] = round(time.time() - float(s.get("started", time.time())), 1)
-    except Exception:
-        pass
 
     return {
         "ts": int(time.time()),

@@ -91,6 +91,37 @@ bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, cons
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream);
 
+// ---- TP=2 VOCAB-PARALLEL BAR1 P2P HEAD PICK (in-graph greedy + penalized + Top-64 shortlist sampler, and post-graph P2P).
+constexpr int kTpHeadMaxHistLen = 128;
+struct TpHeadSampleCfg {
+    SamplerParams sp0;
+    SamplerParams sp1;
+    int32_t fork = 0;
+    int32_t active = 0;     // 0: unpenalized greedy argmax; 1: Top-k P2P shortlist (+ optional penalties)
+    int32_t n_vocab = 0;    // full unsharded vocabulary size (e.g. 248320)
+    int32_t hist_len = 0;   // > 0 when (const int32_t*)(cfg + 1) holds T * hist_len penalty history ints
+    uint32_t seq = 0;       // monotonic P2P sequence counter for p2p_head_flag(0)
+    uint32_t pad = 0;
+};
+
+size_t tp2_head_sample_scratch_bytes(int max_rows);
+
+void tp2_head_part_and_publish(const float* logits, int n_rows, int local_n, int row_offset,
+                               const TpHeadSampleCfg* m_cfg, void* scratch, void* local_out,
+                               void* peer_dst, uint32_t* peer_flag, uint32_t* my_main_flag,
+                               uint32_t* m_nf, int rank, void* stream);
+
+void tp2_head_merge_and_sample(const void* local_out0, const void* peer_out1, const uint32_t* peer_flag1,
+                               uint32_t* my_main_flag0, const TpHeadSampleCfg* m_cfg, int n_rows,
+                               int32_t* out, void* stream);
+
+bool sample_tokens_tp2_p2p(const float* logits0, int local_n0, int row_off0, void* stream0, int dev0,
+                           const float* logits1, int local_n1, int row_off1, void* stream1, int dev1,
+                           int n_tokens, int full_vocab, const int* hist0_dev, const int* hist1_dev,
+                           int history_len, const SamplerParams& p0, const SamplerParams& p1, int fork,
+                           uint32_t seq, void* local_out0, void* local_out1, void* scratch0, void* scratch1,
+                           void* p2p_arg0, uint32_t* p2p_flag0, int* out0_mapped);
+
 // #4590: which tokens the repeat / frequency / presence penalties count.  By default only the current reply: the
 // tokens the answer has written (the window starts at the last prompt token, the one the first decode step feeds in).
 // The prompt, including earlier assistant turns in it, is not counted, so a number or a quoted answer in the new

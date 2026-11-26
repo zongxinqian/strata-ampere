@@ -71,7 +71,7 @@ bool checkpoint_targets(const SessionState& ss, const ModelGeometry& g, size_t t
         size_t pooled_bytes = 0;
         if (!st.idx_tail || !st.idx_dead || !st.idx_block_pos || !st.idx_pooled ||
             st.max_cells < 0 || tokens > (uint64_t) st.max_cells ||
-            (tokens && tokens / (uint64_t) block >= (uint64_t) std::max<int64_t>(0, st.idx_pooled_rows)) ||
+            (!st.idx_peer_owned && tokens && tokens / (uint64_t) block >= (uint64_t) std::max<int64_t>(0, st.idx_pooled_rows)) ||
             !product(pooled_bytes, {tokens / (uint64_t) block + 1, (uint64_t) g.idx_key_dim, sizeof(float)}))
             return fail(error, "invalid indexer running-state target");
     }
@@ -180,7 +180,19 @@ struct CkptAsync {
     size_t cap = 0;
     int dev = -1;
 };
-CkptAsync& ckpt_async() { static CkptAsync a; return a; }
+constexpr size_t kMaxCkptDevs = 16;
+std::array<CkptAsync, kMaxCkptDevs>& ckpt_async_all() {
+    static auto* arr = new std::array<CkptAsync, kMaxCkptDevs>();
+    return *arr;
+}
+CkptAsync& ckpt_async() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || (size_t) dev >= kMaxCkptDevs) {
+        (void) cudaGetLastError();
+        dev = 0;
+    }
+    return ckpt_async_all()[(size_t) dev];
+}
 // STRATA_CKPT_VRAM_SLOTS=N (with STRATA_CKPT_ASYNC): the last N saved GDN states stay in VRAM (allocated only while
 // more than 1.5 GB stays free); a restore of a checkpoint whose tag a slot holds copies device to device.
 struct VramSlot { void* p = nullptr; size_t n = 0; uint64_t tag = 0, used = 0; int dev = -1; };
@@ -221,7 +233,15 @@ bool ckpt_async_on() {
 // instead of 37.  The same bytes in the same places.  One set of buffers: the mutex serializes the saves a layer
 // split runs on one thread per stage (STRATA_CKPT_THREADS), which otherwise gather through the same buffer.
 struct CkptGather { std::mutex mu; void* stage = nullptr; void* host = nullptr; size_t cap = 0; int dev = -1; };
-CkptGather& ckpt_gather() { static CkptGather a; return a; }
+CkptGather& ckpt_gather() {
+    static auto* arr = new std::array<CkptGather, kMaxCkptDevs>();
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || (size_t) dev >= kMaxCkptDevs) {
+        (void) cudaGetLastError();
+        dev = 0;
+    }
+    return (*arr)[(size_t) dev];
+}
 bool ckpt_gather_on() {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
     return false;
@@ -271,11 +291,12 @@ int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const C
 }  // namespace
 
 void conversation_checkpoint_join(const void* only) {
-    CkptAsync& a = ckpt_async();
-    std::lock_guard<std::mutex> lk(a.mu);
-    if (a.pending.valid() && (only == nullptr || only == a.dst)) {
-        const cudaError_t e = a.pending.get();
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(e));
+    for (CkptAsync& a : ckpt_async_all()) {
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (a.pending.valid() && (only == nullptr || only == a.dst)) {
+            const cudaError_t e = a.pending.get();
+            if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", cudaGetErrorString(e));
+        }
     }
 }
 
@@ -420,7 +441,7 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
         if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
             !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
             !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
-        if (!c.ids.empty()) {
+        if (!c.ids.empty() && !st.idx_peer_owned) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
             if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
         }
@@ -451,7 +472,7 @@ bool conversation_checkpoint_copy(const SessionState& from, SessionState& to, co
         const auto& b = owned(to, j);
         if (!acopy(b.idx_tail, a.idx_tail, zf.tail) || !acopy(b.idx_dead, a.idx_dead, zf.dead) ||
             !acopy(b.idx_block_pos, a.idx_block_pos, zf.block_pos)) return false;
-        if (!ids.empty()) {   // restore writes the saved `dead` row into the pooled row the next token fills
+        if (!ids.empty() && !b.idx_peer_owned) {   // restore writes the saved `dead` row into the pooled row the next token fills
             const size_t row = ids.size() / strata::kernels::qsa_real_shapes().idx_block;
             if (!acopy(b.idx_pooled + row * g.idx_key_dim, a.idx_dead, zf.dead)) return false;
         }

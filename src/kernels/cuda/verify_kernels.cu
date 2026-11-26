@@ -525,7 +525,7 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_kernel(float* __r
                 for (int r = 0; r < RPG; ++r) s_snap[r] = s[r];
             }
         }
-        if (!OUT) continue;
+        if (!OUT || t < t_out_begin) continue;
         __syncthreads();
         red[rg][lc] = o;
         __syncthreads();

@@ -475,7 +475,6 @@ __global__ void tp_push_bytes_kernel(const uint8_t* __restrict__ src,
     for (size_t i = (n16 << 4) + tid; i < n_bytes; i += stride) {
         *(volatile uint8_t*) (peer_dst + i) = src[i];
     }
-    if (threadIdx.x == 0) __threadfence_system();
 }
 
 __global__ void tp_push_logits_f32_kernel(const float* __restrict__ src,
@@ -492,7 +491,6 @@ __global__ void tp_push_logits_f32_kernel(const float* __restrict__ src,
     for (int64_t i = (n4 << 2) + tid; i < n_elems; i += stride) {
         *(volatile float*) (peer_dst + i) = src[i];
     }
-    if (threadIdx.x == 0) __threadfence_system();
 }
 
 __global__ void tp_signal_flag_kernel(volatile uint32_t* __restrict__ flag, uint32_t val) {
@@ -510,13 +508,86 @@ __global__ void tp_wait_flag_kernel(volatile uint32_t* __restrict__ flag, uint32
     uint32_t pf = 0;
     for (;;) {
         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(flag) : "memory");
-        if (pf >= val) break;
+        if ((int32_t) (pf - val) >= 0) break;
         __nanosleep(32);
     }
 #else
-    while (*flag < val) {}
+    while ((int32_t) (*flag - val) < 0) {}
     __threadfence_system();
 #endif
+}
+
+__global__ void __launch_bounds__(512)
+tp_qsa_push_sel_dec_kernel(const int32_t* __restrict__ src, int32_t* __restrict__ peer_dst,
+                           int n_ints, volatile uint32_t* __restrict__ peer_flag, uint32_t sig_val) {
+    const int n4 = n_ints >> 2;
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(peer_dst);
+    for (int i = (int) threadIdx.x; i < n4; i += (int) blockDim.x) store_wt_u4(d4 + i, s4[i]);
+    for (int i = (n4 << 2) + (int) threadIdx.x; i < n_ints; i += (int) blockDim.x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(peer_dst + i), "r"((uint32_t) src[i]) : "memory");
+#else
+        *(volatile int32_t*) (peer_dst + i) = src[i];
+#endif
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(peer_flag), "r"(sig_val) : "memory");
+#else
+        __threadfence_system();
+        *peer_flag = sig_val;
+#endif
+    }
+}
+
+__global__ void __launch_bounds__(512)
+tp_qsa_recv_sel_dec_kernel(const int32_t* __restrict__ my_src, int32_t* __restrict__ dst,
+                           int n_ints, volatile uint32_t* __restrict__ my_flag,
+                           uint32_t wait_val, int reset_after) {
+    if (threadIdx.x == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(my_flag) : "memory");
+            if ((int32_t) (pf - wait_val) >= 0) break;
+            __nanosleep(32);
+        }
+#else
+        while ((int32_t) (*my_flag - wait_val) < 0) {}
+        __threadfence_system();
+#endif
+    }
+    __syncthreads();
+    const int n4 = n_ints >> 2;
+    const uint4* s4 = reinterpret_cast<const uint4*>(my_src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    for (int i = (int) threadIdx.x; i < n4; i += (int) blockDim.x) d4[i] = load_cv_u4(s4 + i);
+    for (int i = (n4 << 2) + (int) threadIdx.x; i < n_ints; i += (int) blockDim.x) {
+        dst[i] = ((const volatile int32_t*) my_src)[i];
+    }
+    if (reset_after) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(my_flag), "r"(0u) : "memory");
+#else
+            __threadfence_system();
+            *my_flag = 0u;
+#endif
+        }
+    }
+}
+
+__global__ void tp_copy_i32_from_vmm_kernel(const int32_t* __restrict__ src, int32_t* __restrict__ dst, int64_t n_ints) {
+    const int64_t tid = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t) gridDim.x * blockDim.x;
+    const int64_t n4 = n_ints >> 2;
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    for (int64_t i = tid; i < n4; i += stride) d4[i] = load_cv_u4(s4 + i);
+    for (int64_t i = (n4 << 2) + tid; i < n_ints; i += stride) dst[i] = ((const volatile int32_t*) src)[i];
 }
 
 __global__ void tp_scatter_logits_2d_kernel(const float* __restrict__ src,
@@ -801,7 +872,6 @@ __global__ void tp_push_kernel(const float* __restrict__ local_buf,
     for (int64_t i = (n4 << 2) + tid; i < n_elems; i += stride) {
         *(volatile float*) (my_map + i) = local_buf[i];
     }
-    if (threadIdx.x == 0) __threadfence_system();
 }
 
 __global__ void tp_barrier_kernel(volatile uint32_t* __restrict__ my_flag,
@@ -1037,7 +1107,6 @@ __global__ void tp_pack_bf16_push_kernel(const float* __restrict__ src,
         std::memcpy(&raw, &bf, 2);
         *(volatile uint16_t*) (reinterpret_cast<uint16_t*>(peer_dst) + i) = raw;
     }
-    if (threadIdx.x == 0) __threadfence_system();
 }
 
 __global__ void tp_pack_fp16_push_kernel(const float* __restrict__ src,
@@ -1068,7 +1137,6 @@ __global__ void tp_pack_fp16_push_kernel(const float* __restrict__ src,
         std::memcpy(&raw, &hf, 2);
         *(volatile uint16_t*) (reinterpret_cast<uint16_t*>(peer_dst) + i) = raw;
     }
-    if (threadIdx.x == 0) __threadfence_system();
 }
 
 #if defined(__linux__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
@@ -1256,6 +1324,11 @@ void TpComm::release_pipe() {
             d_p2p_logits_flag_[r] = nullptr;
             d_p2p_swap_flag_[r] = nullptr;
             d_p2p_df2_flag_[r] = nullptr;
+            d_p2p_qsa_flag_[r] = nullptr;
+            d_p2p_qsa_sel_[r] = nullptr;
+            d_p2p_qsa_pf_sel_[r] = nullptr;
+            d_p2p_qsa_pf_rdy_[r] = nullptr;
+            d_p2p_qsa_pf_ack_[r] = nullptr;
             d_p2p_tx_[r][0] = nullptr;
             d_p2p_tx_[r][1] = nullptr;
             if (d_done_ctr_[r]) { cudaFree(d_done_ctr_[r]); d_done_ctr_[r] = nullptr; }
@@ -1412,13 +1485,18 @@ bool TpComm::init(int dev0, int dev1, size_t max_floats, std::string& err) {
             cudaDeviceCanAccessPeer(&can10, dev_[1], dev_[0]);
         }
         if (want && can01 != 0 && can10 != 0) {
+            const char* pm_env = std::getenv("STRATA_TP_VMM_PIPE_MB");
+            int pipe_mb = (pm_env != nullptr && pm_env[0] != '\0') ? std::atoi(pm_env) : 22;
+            if (pipe_mb < 16) pipe_mb = 16;
+            if (pipe_mb > 96) pipe_mb = 96;
+            p2p_pipe_elems_ = ((int64_t) pipe_mb << 20) / (int64_t) sizeof(uint16_t);
             const size_t dec_bytes = kRingSlots * kP2pDecSlotFloats * sizeof(float);
-            const size_t pipe_tx_bytes = (size_t) kP2pPipeElems * sizeof(uint16_t);
-            const size_t slab_bytes = dec_bytes + 2u * pipe_tx_bytes + 4096u;
+            const size_t pipe_tx_bytes = (size_t) p2p_pipe_elems_ * sizeof(uint16_t);
+            const size_t slab_bytes = dec_bytes + 2u * pipe_tx_bytes + (2048u << 10);
             bool alloc_ok = false;
 
 #if defined(__linux__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
-            // Preferred path: CUDA Driver VMM selective peer BAR1 mapping (~36 MiB per GPU).
+            // Preferred path: CUDA Driver VMM selective peer BAR1 mapping (~84 MiB per GPU inside 256 MiB BAR1).
             // Never calls process-wide cudaDeviceEnablePeerAccess, so model weights/KV consume 0 bytes of BAR1
             // (works natively on 256 MiB BAR1 dynamic-P2P cards as well as ReBAR / NVLink).
             const char* vmm_env = std::getenv("STRATA_TP_AR_P2P_VMM");
@@ -1435,11 +1513,16 @@ bool TpComm::init(int dev0, int dev1, size_t max_floats, std::string& err) {
                         d_p2p_tx_[r][1] = base + dec_bytes + pipe_tx_bytes;
                         uint8_t* tail = base + dec_bytes + 2u * pipe_tx_bytes;
                         d_p2p_flag_[r] = reinterpret_cast<uint32_t*>(tail);
-                        d_p2p_head_arg_[r] = reinterpret_cast<void*>(tail + 256u);
                         d_p2p_head_flag_[r] = reinterpret_cast<uint32_t*>(tail + 512u);
                         d_p2p_logits_flag_[r] = reinterpret_cast<uint32_t*>(tail + 576u);
                         d_p2p_swap_flag_[r] = reinterpret_cast<uint32_t*>(tail + 640u);
                         d_p2p_df2_flag_[r] = reinterpret_cast<uint32_t*>(tail + 704u);
+                        d_p2p_qsa_flag_[r] = reinterpret_cast<uint32_t*>(tail + 1024u);       // 8 x 64B cachelines (512 B)
+                        d_p2p_qsa_pf_rdy_[r] = reinterpret_cast<uint32_t*>(tail + 1536u);     // 64B cacheline
+                        d_p2p_qsa_pf_ack_[r] = reinterpret_cast<uint32_t*>(tail + 1600u);     // 64B cacheline
+                        d_p2p_head_arg_[r] = reinterpret_cast<void*>(tail + 4096u);           // 16 KiB room for Top-64 shortlist P2P
+                        d_p2p_qsa_sel_[r] = reinterpret_cast<int32_t*>(tail + 65536u);        // 8 x 128 KiB = 1 MiB inside 2 MiB VMM tail
+                        d_p2p_qsa_pf_sel_[r] = reinterpret_cast<int32_t*>(tail + 1114112u);   // 8 x 64 KiB = 512 KiB disjoint prefill ring
                     }
                     p2p_vmm_ = true;
                     alloc_ok = true;
@@ -1620,26 +1703,41 @@ void TpComm::reset(uint32_t base) {
                 cudaSetDevice(dev_[r]);
                 (void) cudaMemcpy(d_p2p_head_flag_[r], &z, sizeof(uint32_t), cudaMemcpyHostToDevice);
             }
-            if (d_p2p_logits_flag_[r] != nullptr) {
-                const uint32_t z = 0u;
-                cudaSetDevice(dev_[r]);
-                (void) cudaMemcpy(d_p2p_logits_flag_[r], &z, sizeof(uint32_t), cudaMemcpyHostToDevice);
-            }
-            if (d_p2p_swap_flag_[r] != nullptr) {
-                const uint32_t z = 0u;
-                cudaSetDevice(dev_[r]);
-                (void) cudaMemcpy(d_p2p_swap_flag_[r], &z, sizeof(uint32_t), cudaMemcpyHostToDevice);
-            }
             if (d_p2p_df2_flag_[r] != nullptr) {
                 const uint32_t z = 0u;
                 cudaSetDevice(dev_[r]);
                 (void) cudaMemcpy(d_p2p_df2_flag_[r], &z, sizeof(uint32_t), cudaMemcpyHostToDevice);
             }
         }
-        logits_step_ = 0;
-        swap_step_ = 0;
+        // NOTE: d_p2p_logits_flag_ and d_p2p_swap_flag_ use strictly monotonic step counters
+        // (logits_step_, swap_step_) and MUST NOT be zeroed here because background adapt_stream
+        // P2P swaps may run concurrently across window boundaries.
         cudaSetDevice(prev_dev);
     }
+    flag_dirty_ = false;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+void TpComm::reset_main_flags_async(void* stream0, void* stream1, uint32_t base) {
+    if (h_flag_[0] != nullptr) *(volatile uint32_t*) h_flag_[0] = base;
+    if (h_flag_[1] != nullptr) *(volatile uint32_t*) h_flag_[1] = base;
+    if (d_p2p_flag_[0] != nullptr || d_p2p_flag_[1] != nullptr) {
+        int prev_dev = 0;
+        cudaGetDevice(&prev_dev);
+        void* streams[2] = {stream0, stream1};
+        for (int r = 0; r < 2; ++r) {
+            if (d_p2p_flag_[r] != nullptr) {
+                cudaSetDevice(dev_[r]);
+                if (base == 0u && streams[r] != nullptr) {
+                    (void) cudaMemsetAsync(d_p2p_flag_[r], 0, sizeof(uint32_t), (cudaStream_t) streams[r]);
+                } else {
+                    tp_signal_flag_kernel<<<1, 1, 0, (cudaStream_t) streams[r]>>>(d_p2p_flag_[r], base);
+                }
+            }
+        }
+        cudaSetDevice(prev_dev);
+    }
+    flag_dirty_ = false;
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -1803,7 +1901,7 @@ bool TpComm::p2p_gather_logits_rank0(const float* logits0_dev, const float* logi
         logits0_dev == nullptr || logits1_dev == nullptr || full_logits_dev0 == nullptr)
         return false;
     const size_t peer_bytes = (size_t) T * (size_t) half1 * sizeof(float);
-    const size_t vmm_tx_cap = 2u * (size_t) kP2pPipeElems * sizeof(uint16_t);
+    const size_t vmm_tx_cap = (size_t) p2p_pipe_elems_ * sizeof(uint16_t);
     if (peer_bytes > vmm_tx_cap) return false;
 
     const uint32_t cur_step = ++logits_step_;
@@ -1844,10 +1942,10 @@ bool TpComm::p2p_swap_expert_blobs(void* slot0_dev, void* slot1_dev, size_t byte
                                    void* stream0, void* stream1) {
     if (!p2p_ || !p2p_vmm_ || bytes == 0 ||
         slot0_dev == nullptr || slot1_dev == nullptr ||
-        d_p2p_tx_[0][0] == nullptr || d_p2p_tx_[1][0] == nullptr ||
+        d_p2p_tx_[0][1] == nullptr || d_p2p_tx_[1][1] == nullptr ||
         d_p2p_swap_flag_[0] == nullptr || d_p2p_swap_flag_[1] == nullptr)
         return false;
-    const size_t max_slot = (size_t) kP2pPipeElems * sizeof(uint16_t);
+    const size_t max_slot = (size_t) p2p_pipe_elems_ * sizeof(uint16_t);
     if (bytes > max_slot) return false;
     if ((((uintptr_t) slot0_dev | (uintptr_t) slot1_dev) & 15u) != 0) return false;
 
@@ -1857,13 +1955,14 @@ bool TpComm::p2p_swap_expert_blobs(void* slot0_dev, void* slot1_dev, size_t byte
     int prev_dev = 0;
     cudaGetDevice(&prev_dev);
 
-    // Full-duplex 50.86 GB/s bidirectional push into peer's idle VMM BAR1 slab (0 DDR4 traffic!)
+    // Full-duplex 50.86 GB/s bidirectional push into peer's dedicated VMM BAR1 slab [1]
+    // (collision-free with DFlash2 / head logits which use slab [0], and 0 DDR4 traffic!)
     {
         cudaSetDevice(dev_[0]);
         const cudaStream_t cs0 = (cudaStream_t) stream0;
         tp_push_bytes_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs0>>>(
             reinterpret_cast<const uint8_t*>(slot0_dev),
-            reinterpret_cast<uint8_t*>(d_p2p_tx_[1][0]), bytes);
+            reinterpret_cast<uint8_t*>(d_p2p_tx_[1][1]), bytes);
         tp_signal_flag_kernel<<<1, 1, 0, cs0>>>(d_p2p_swap_flag_[1], cur_step);
         (void) cudaStreamQuery(cs0);
     }
@@ -1872,7 +1971,7 @@ bool TpComm::p2p_swap_expert_blobs(void* slot0_dev, void* slot1_dev, size_t byte
         const cudaStream_t cs1 = (cudaStream_t) stream1;
         tp_push_bytes_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs1>>>(
             reinterpret_cast<const uint8_t*>(slot1_dev),
-            reinterpret_cast<uint8_t*>(d_p2p_tx_[0][0]), bytes);
+            reinterpret_cast<uint8_t*>(d_p2p_tx_[0][1]), bytes);
         tp_signal_flag_kernel<<<1, 1, 0, cs1>>>(d_p2p_swap_flag_[0], cur_step);
         (void) cudaStreamQuery(cs1);
     }
@@ -1881,7 +1980,7 @@ bool TpComm::p2p_swap_expert_blobs(void* slot0_dev, void* slot1_dev, size_t byte
         cudaSetDevice(dev_[0]);
         const cudaStream_t cs0 = (cudaStream_t) stream0;
         tp_wait_flag_kernel<<<1, 1, 0, cs0>>>(d_p2p_swap_flag_[0], cur_step);
-        if (cudaMemcpyAsync(slot0_dev, d_p2p_tx_[0][0], bytes, cudaMemcpyDeviceToDevice, cs0) != cudaSuccess) {
+        if (cudaMemcpyAsync(slot0_dev, d_p2p_tx_[0][1], bytes, cudaMemcpyDeviceToDevice, cs0) != cudaSuccess) {
             cudaSetDevice(prev_dev);
             return false;
         }
@@ -1890,7 +1989,7 @@ bool TpComm::p2p_swap_expert_blobs(void* slot0_dev, void* slot1_dev, size_t byte
         cudaSetDevice(dev_[1]);
         const cudaStream_t cs1 = (cudaStream_t) stream1;
         tp_wait_flag_kernel<<<1, 1, 0, cs1>>>(d_p2p_swap_flag_[1], cur_step);
-        if (cudaMemcpyAsync(slot1_dev, d_p2p_tx_[1][0], bytes, cudaMemcpyDeviceToDevice, cs1) != cudaSuccess) {
+        if (cudaMemcpyAsync(slot1_dev, d_p2p_tx_[1][1], bytes, cudaMemcpyDeviceToDevice, cs1) != cudaSuccess) {
             cudaSetDevice(prev_dev);
             return false;
         }
@@ -1899,8 +1998,38 @@ bool TpComm::p2p_swap_expert_blobs(void* slot0_dev, void* slot1_dev, size_t byte
     return true;
 }
 
+const uint16_t* TpComm::p2p_push_bf16_oneshot(const float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream) {
+    static const bool fuse_pf_ar = [] {
+        const char* v = std::getenv("STRATA_TP_FUSE_PF_AR");
+        return !(v != nullptr && v[0] == '0');
+    }();
+    static const int ar_mode = [] {
+        const char* v = std::getenv("STRATA_TP_AR_MODE");
+        if (v == nullptr) return 1;
+        if (std::strcmp(v, "fp32") == 0 || std::strcmp(v, "0") == 0) return 0;
+        if (std::strcmp(v, "q8") == 0 || std::strcmp(v, "2") == 0) return 2;
+        if (std::strcmp(v, "fp16") == 0 || std::strcmp(v, "half") == 0 || std::strcmp(v, "3") == 0) return 3;
+        return 1;
+    }();
+    if (!fuse_pf_ar || !p2p_ || ar_mode != 1 || n_elems <= 0 || n_elems > p2p_pipe_elems_ ||
+        d_p2p_tx_[0][0] == nullptr || d_p2p_tx_[1][0] == nullptr ||
+        d_p2p_flag_[0] == nullptr || d_p2p_flag_[1] == nullptr)
+        return nullptr;
+    flag_dirty_ = true;
+    const cudaStream_t cs = (cudaStream_t) stream;
+    const uint32_t cur_step = ++step;
+    const int b = (int) (cur_step & 1u);
+    const int64_t n8 = (n_elems + 7) >> 3;
+    const int blocks = (int) ((n8 + 255) / 256 < 256 ? (n8 + 255) / 256 : 256);
+    tp_pack_bf16_push_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(
+        local_buf, reinterpret_cast<__nv_bfloat16*>(d_p2p_tx_[1 - rank][b]), n_elems);
+    tp_barrier_kernel<<<1, 1, 0, cs>>>(d_p2p_flag_[1 - rank], d_p2p_flag_[rank], cur_step);
+    return reinterpret_cast<const uint16_t*>(d_p2p_tx_[rank][b]);
+}
+
 void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream) {
     if (n_elems <= 0 || slot_floats_ == 0) return;
+    flag_dirty_ = true;
     // Mode: "bf16" (1), "q8" (2), "fp16"/"half" (3, hardware on sm_75+), "fp32" (0)
     static const int ar_mode = [] {
         const char* v = std::getenv("STRATA_TP_AR_MODE");
@@ -1974,7 +2103,7 @@ void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& st
             cudaStreamWaitEvent(cs, ed, 0);
             return;
         }
-        const int64_t cap = kP2pPipeElems;
+        const int64_t cap = p2p_pipe_elems_;
         for (int64_t off = 0; off < n_elems; off += cap) {
             const int64_t chunk = (n_elems - off) < cap ? (n_elems - off) : cap;
             const uint32_t cur_step = ++step;
@@ -2090,6 +2219,69 @@ void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& st
                 local_buf + off, m_buf_[rank][1 - rank] + slot_off, chunk);
         }
         off += chunk;
+    }
+}
+
+void TpComm::p2p_push_qsa_sel_dec(const int32_t* src, int slot, int dst_off_ints, int n_ints,
+                                  uint32_t sig_val, int rank, void* stream) {
+    if (!p2p_qsa_ready() || src == nullptr || n_ints <= 0 || slot < 0 || (size_t) slot >= kP2pQsaSlots) return;
+    const int peer = 1 - rank;
+    int32_t* peer_dst = d_p2p_qsa_sel_[peer] + (size_t) slot * kP2pQsaSelInts + (size_t) dst_off_ints;
+    volatile uint32_t* peer_flag = d_p2p_qsa_flag_[peer] + (size_t) slot * 16u;
+    tp_qsa_push_sel_dec_kernel<<<1, 512, 0, (cudaStream_t) stream>>>(src, peer_dst, n_ints, peer_flag, sig_val);
+}
+
+void TpComm::p2p_recv_qsa_sel_dec(int32_t* dst, int slot, int src_off_ints, int n_ints,
+                                  uint32_t wait_val, bool reset_after, int rank, void* stream) {
+    if (!p2p_qsa_ready() || dst == nullptr || n_ints <= 0 || slot < 0 || (size_t) slot >= kP2pQsaSlots) return;
+    const int32_t* my_src = d_p2p_qsa_sel_[rank] + (size_t) slot * kP2pQsaSelInts + (size_t) src_off_ints;
+    volatile uint32_t* my_flag = d_p2p_qsa_flag_[rank] + (size_t) slot * 16u;
+    tp_qsa_recv_sel_dec_kernel<<<1, 512, 0, (cudaStream_t) stream>>>(
+        my_src, dst, n_ints, my_flag, wait_val, reset_after ? 1 : 0);
+}
+
+void TpComm::p2p_push_qsa_sel_pf(const int32_t* src, int64_t n_ints, int rank, void* stream) {
+    if (!p2p_qsa_ready() || d_p2p_qsa_pf_sel_[0] == nullptr || src == nullptr || n_ints <= 0) return;
+    constexpr int kPfRingSlots = 8;
+    constexpr size_t kPfSlotBytes = 65536u;   // 64 KiB x 8 = 512 KiB dedicated disjoint ring inside 2 MiB VMM tail
+    constexpr int64_t kPfSlotInts = (int64_t) (kPfSlotBytes / sizeof(int32_t));
+    const int peer = 1 - rank;
+    const cudaStream_t cs = (cudaStream_t) stream;
+    for (int64_t off = 0; off < n_ints; off += kPfSlotInts) {
+        const int64_t chunk = (n_ints - off < kPfSlotInts) ? (n_ints - off) : kPfSlotInts;
+        const uint32_t step = ++qsa_pf_step_[rank][rank];
+        if (step > (uint32_t) kPfRingSlots) {
+            tp_wait_flag_kernel<<<1, 1, 0, cs>>>(d_p2p_qsa_pf_ack_[rank], step - (uint32_t) kPfRingSlots);
+        }
+        uint8_t* peer_slot = reinterpret_cast<uint8_t*>(d_p2p_qsa_pf_sel_[peer]) +
+                             (size_t) ((step - 1u) & (kPfRingSlots - 1u)) * kPfSlotBytes;
+        const size_t nbytes = (size_t) chunk * sizeof(int32_t);
+        const size_t n16 = (nbytes + 15u) >> 4;
+        const int blocks = (int) ((n16 + 255u) / 256u < 256u ? (n16 + 255u) / 256u : 256u);
+        tp_push_bytes_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(
+            reinterpret_cast<const uint8_t*>(src + off), peer_slot, nbytes);
+        tp_signal_flag_kernel<<<1, 1, 0, cs>>>(d_p2p_qsa_pf_rdy_[peer], step);
+    }
+}
+
+void TpComm::p2p_recv_qsa_sel_pf(int32_t* dst, int64_t n_ints, int rank, void* stream) {
+    if (!p2p_qsa_ready() || d_p2p_qsa_pf_sel_[0] == nullptr || dst == nullptr || n_ints <= 0) return;
+    constexpr int kPfRingSlots = 8;
+    constexpr size_t kPfSlotBytes = 65536u;
+    constexpr int64_t kPfSlotInts = (int64_t) (kPfSlotBytes / sizeof(int32_t));
+    const int peer = 1 - rank;
+    const cudaStream_t cs = (cudaStream_t) stream;
+    for (int64_t off = 0; off < n_ints; off += kPfSlotInts) {
+        const int64_t chunk = (n_ints - off < kPfSlotInts) ? (n_ints - off) : kPfSlotInts;
+        const uint32_t step = ++qsa_pf_step_[rank][peer];
+        tp_wait_flag_kernel<<<1, 1, 0, cs>>>(d_p2p_qsa_pf_rdy_[rank], step);
+        const int32_t* my_slot = reinterpret_cast<const int32_t*>(
+            reinterpret_cast<const uint8_t*>(d_p2p_qsa_pf_sel_[rank]) +
+            (size_t) ((step - 1u) & (kPfRingSlots - 1u)) * kPfSlotBytes);
+        const int64_t n4 = (chunk + 3) >> 2;
+        const int blocks = (int) ((n4 + 255) / 256 < 256 ? (n4 + 255) / 256 : 256);
+        tp_copy_i32_from_vmm_kernel<<<blocks > 0 ? blocks : 1, 256, 0, cs>>>(my_slot, dst + off, chunk);
+        tp_signal_flag_kernel<<<1, 1, 0, cs>>>(d_p2p_qsa_pf_ack_[peer], step);
     }
 }
 

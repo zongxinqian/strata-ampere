@@ -153,6 +153,12 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+/// Fused packed Q8_0 GEMV + 1-hop BAR1 BF16 peer push + atomic last-CTA flag release (sm_86 / sm_80+ TP=2).
+/// Bitwise identical y and peer BF16 words to native_mmvq + tp_allreduce_bf16_reg_kernel. Returns false if unsupported.
+bool native_mmvq_push_p2p(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                          int n_in, int n_out, int ncols,
+                          float* peer_slot_buf, volatile uint32_t* peer_flag,
+                          uint32_t* done_ctr, uint32_t step, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG="${1:-$(dirname "$0")/strata-2x3080-20g.example.json}"
+CONFIG="${1:-$(dirname "$0")/strata-2x3080-20g-dflash2.example.json}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [[ ! -f "$CONFIG" ]]; then

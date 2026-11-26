@@ -177,10 +177,16 @@ public:
     /// row 0 alone (before 0.1.19) left the drafted rows with unwritten histories.  Null disables the penalties
     /// entirely - the neutral run's sampling call is byte-for-byte what it was.  The engine re-uploads the rows
     /// before every window; the buffer must hold kVerifyMaxT rows and stay alive across the request.
-    void set_history(const int32_t* history, int history_len) {
+    void set_history(const int32_t* history, int history_len, const int32_t* host_history = nullptr) {
         hist_d_ = history;
         hist_len_ = history_len;
-        if (next_) next_->set_history(history, history_len);
+        hist_h_ = host_history;
+        if (next_) next_->set_history(history, history_len, host_history);
+    }
+    bool can_in_graph_hist(int hist_len) const {
+        return tp_head_sharded_ && h_igs_ != nullptr && tp2_samp_scratch_ != nullptr && tp2_head_out_ != nullptr &&
+               head_sampling_ && hist_len > 0 && hist_len <= strata::kernels::kTpHeadMaxHistLen &&
+               sampling_.logit_bias == nullptr && !spec_measure_ && spec_nq_ == 0;
     }
     /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): for the NEXT run() only, judge the
     /// window's first `n_q` drafts against the drafter's distributions `q` (host memory, n_q rows of kSpecQStride
@@ -246,10 +252,13 @@ public:
     bool tp2_dev_plan_runtime() const;
     bool set_tp_head_peer(strata::kernels::ArgHalf* h_arg, uint32_t* h_flag);
     bool set_tp_miss_peer(uint32_t* h_flag, float* h_ymiss);
+    bool set_tp_shared_ple(float* h_ple, strata::kernels::TpHeadSampleCfg* h_igs);
     strata::kernels::ArgHalf* h_head_arg() const { return h_head_arg_; }
     uint32_t* h_head_flag() const { return h_head_flag_; }
     uint32_t* h_flag() const { return h_flag_; }
     float* h_ymiss() const { return h_ymiss_; }
+    float* h_ple() const { return h_ple_; }
+    strata::kernels::TpHeadSampleCfg* h_igs() const { return h_igs_; }
     /// #2-B: optional abortable L->L+1 CPU L3 cache pre-warming hook called right after `*flag = want`
     /// while GPUs run layer L combine/allreduce and layer L+1 attention/GDN/router.
     using IdlePrewarmFn = void (*)(void* user, const float* x_f, const int32_t* ids, int n_tok, int k,
@@ -441,6 +450,11 @@ public:
     void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
     const float* tap_dev() const { return tap_dev_; }
     bool tapping() const { return tap_on_; }
+    /// Phase 3A: Layer-45 completion counter on GPU0 for deterministic async DFlash2 context overlap.
+    const uint32_t* tap45_ctr() const { return d_tap45_ctr_; }
+    uint32_t next_tap45_want() const { return tap45_seq_ + 1u; }
+    bool can_l45_overlap(int T, int64_t pos0) const;
+    void abort_tap45_wait();
     /// Batch windows tap too (default off: the graphs of --batch windows carry no tap kernels): the slot drafters of DFlash2 read rows of tap_dev().  Before init.
     void set_batch_taps(bool on) { tap_batch_ = on; }
     /// Layer split (DFlash2): every stage of this chain keeps the requested layers inside its own range (set_taps on each stage before init).
@@ -462,6 +476,7 @@ public:
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
+    void set_split_min_t(int min_t) { split_min_t_ = min_t; }
     /// Plan v0.3 P6: how the PCIe share of the misses reaches the GPU: 0 = DMA into staging (the copy engine works
     /// beside the CPU; best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
@@ -618,6 +633,8 @@ private:
         return s;
     }();   ///< greedy by default; per-request via set_sampling
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
+    const int32_t* hist_h_ = nullptr;   ///< optional host staging of penalty-history rows for TP2 in-graph sampling
+    uint32_t tp_head_seq_ = 0;          ///< monotonic P2P sequence counter for p2p_head_flag(0)
     const int32_t* spec_q_ = nullptr;   ///< set_spec_q: the drafter's q rows for the next window (host)
     int spec_nq_ = 0;
     bool spec_measure_ = false;   ///< explicit per-call measure borrow
@@ -714,6 +731,7 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    cudaEvent_t ev_sh_fork_[2] = {}, ev_sh_join_[2] = {};
     // STRATA_DF_BRANCH: a layer's mixer work that reads only the layer's input, captured as parallel graph branches
     // on these side streams (record_window); the same kernels on the same inputs, only their order is freer
     bool df_branch_ = false;
@@ -770,6 +788,8 @@ private:
     std::vector<int> tap_layers_;                 ///< the tapped layer ids (zero-based, completed outputs)
     std::vector<int> tap_slot_;                   ///< layer -> slot in tap_layers_, or -1
     float* tap_dev_ = nullptr;                    ///< [max_t][n_taps][n_embd]
+    uint32_t* d_tap45_ctr_ = nullptr;             ///< Phase 3A: monotonic GPU0 counter incremented right after final tap layer
+    uint32_t tap45_seq_ = 0;                      ///< host count of non-tree non-batch GPU0 window launches so far
     float* tap_scratch_ = nullptr;                ///< one row's streams, [hc][n_embd]
     cudaStream_t tap_cs_ = nullptr;               ///< gather_taps: this stage's copies of its taps (lazily created on device_)
     cudaEvent_t tap_ev_ = nullptr;
@@ -820,6 +840,7 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
+    int split_min_t_ = 0;  // STRATA_SPLIT_MIN_T: adaptive G=2 microbatch threshold (e.g. 4 or 6 on TP=2)
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
     int groups_[strata::kernels::kVerifyLongT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
@@ -872,23 +893,31 @@ private:
     uint32_t* m_flag_peer_ = nullptr;
     float* m_ymiss_peer_ = nullptr;
     strata::kernels::ArgHalf* arg_half_dev_ = nullptr;
+    strata::kernels::TpHeadSampleCfg* h_igs_ = nullptr;
+    strata::kernels::TpHeadSampleCfg* m_igs_ = nullptr;
+    uint8_t* tp2_samp_scratch_ = nullptr;
+    void* tp2_head_out_ = nullptr;
+    int32_t* tp2_peer_hist_d_ = nullptr;
+    size_t tp2_peer_hist_cap_ = 0;
+    bool shared_ple_ = false;
     float* full_logits_dev_ = nullptr;
     mutable std::vector<float> full_logits_host_;
     bool copy_full_logits_host(int T, float* dst_host) const;
     float* ensure_full_logits_dev(int T);
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 
-    // Concurrent TP1 verify graph launch worker (overlaps GPU1 cudaGraphLaunch with GPU0)
+    // Concurrent TP1 verify graph launch worker (hybrid lock-free spin-then-sleep)
     std::thread tp_launch_thr_;
     std::mutex tp_launch_mu_;
     std::condition_variable tp_launch_cv_;
     cudaGraphExec_t tp_launch_exec_ = nullptr;
     cudaStream_t tp_launch_cs_ = nullptr;
     cudaError_t tp_launch_err_ = cudaSuccess;
-    uint64_t tp_launch_req_ = 0;
-    uint64_t tp_launch_done_ = 0;
+    std::atomic<uint64_t> tp_launch_req_{0};
+    std::atomic<uint64_t> tp_launch_done_{0};
+    std::atomic<bool> tp_launch_sleeping_{false};
     int tp_launch_dev_ = -1;
-    bool tp_launch_stop_ = false;
+    std::atomic<bool> tp_launch_stop_{false};
     void ensure_tp1_launcher(int dev);
     void stop_tp1_launcher();
     void start_tp1_launch(cudaGraphExec_t exec, cudaStream_t cs);

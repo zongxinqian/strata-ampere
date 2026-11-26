@@ -174,12 +174,24 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
 // F-2: gr_write_kernel for one row (t, c), then gr_norm_rs_kernel's reduction over it with the next half's norm
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
 // the same bits, and R is not read back
+__device__ __forceinline__ float load_peer_bf16(const uint16_t* __restrict__ p, int64_t idx) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    uint16_t raw;
+    asm volatile("ld.global.cv.u16 %0, [%1];" : "=h"(raw) : "l"(p + idx) : "memory");
+    return __uint_as_float((uint32_t) raw << 16);
+#else
+    const uint16_t raw = *(const volatile uint16_t*) (p + idx);
+    return __uint_as_float((uint32_t) raw << 16);
+#endif
+}
+
 constexpr int GRW_PER = (N + 255) / 256;
 __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict__ R, const float* __restrict__ bo,
                                                                const float* __restrict__ inj, int64_t inj_ld,
                                                                const float* __restrict__ w, float eps,
                                                                float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
-                                                               uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img) {
+                                                               uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img,
+                                                               const uint16_t* __restrict__ peer_bo_bf16) {
     __shared__ float sh[32];
     const int64_t row = blockIdx.x;                 // t * 4 + c
     const int64_t t = row / HC;
@@ -192,7 +204,9 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
     int k = 0;
 #pragma unroll
     for (int d = threadIdx.x; d < N; d += 256, ++k) {
-        const float x = fmaf(bo[t * N + d], sc, r[d]);
+        const int64_t bi = t * N + d;
+        const float bval = peer_bo_bf16 ? (bo[bi] + load_peer_bf16(peer_bo_bf16, bi)) : bo[bi];
+        const float x = fmaf(bval, sc, r[d]);
         r[d] = x;
         v[k] = x;
         ss += x * x;
@@ -302,11 +316,13 @@ __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restr
     if (mixed_h) mixed_h[i] = hf(s);
 }
 __global__ void gr_write_kernel(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
-                                int64_t inj_ld, int64_t T) {
+                                int64_t inj_ld, int64_t T, const uint16_t* __restrict__ peer_bo_bf16) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * D) return;
     const int64_t t = i / D, c = (i % D) / N, d = i % N;
-    R[i] = fmaf(bo[t * N + d], 2.0f * sigm(inj[t * inj_ld + c] / (float) HC), R[i]);
+    const int64_t bi = t * N + d;
+    const float bval = peer_bo_bf16 ? (bo[bi] + load_peer_bf16(peer_bo_bf16, bi)) : bo[bi];
+    R[i] = fmaf(bval, 2.0f * sigm(inj[t * inj_ld + c] / (float) HC), R[i]);
 }
 __global__ void gr_broadcast_kernel(const float* __restrict__ e, float* __restrict__ R, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -2957,10 +2973,12 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
 #endif
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
-                      float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+                      float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img,
+                      const uint16_t* peer_bo_bf16) {
     gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                       rs, xn16, xn16_lo,
-                                                                                      ldx > 0 ? ldx : D, f16img ? 1 : 0);
+                                                                                      ldx > 0 ? ldx : D, f16img ? 1 : 0,
+                                                                                      peer_bo_bf16);
     check("gr_write_norm_rs");
 }
 void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* v_l,
@@ -2979,8 +2997,9 @@ void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16
     gr_mix_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(xn, gated, mixed, mixed16, T, mixed_h, mixed16_lo);
     check("gr_mix");
 }
-void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream) {
-    gr_write_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, T);
+void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream,
+              const uint16_t* peer_bo_bf16) {
+    gr_write_kernel<<<blocks_for(T * D), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, T, peer_bo_bf16);
     check("gr_write");
 }
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {

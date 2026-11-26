@@ -145,6 +145,17 @@ public:
     /// own stream) can launch first and finish after, so their graphs run at the same time.
     bool draft_launch(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, std::string& err);
     bool draft_finish(int32_t* drafts, float* probs, std::string& err);
+    /// Phase 2C: Stateless block-only draft pass (no context update, zero KV ring writes, ~0.85 ms).
+    /// Used for Branch-B tree continuations and Phase 3A Layer-45 async context overlap.
+    bool draft_block_only(int64_t anchor_pos, int32_t anchor, int32_t* drafts, float* probs, std::string& err);
+    /// Phase 3A: Pre-launch DFlash2 context update on cs2_ waiting for GPU0's Layer-45 tap completion counter.
+    /// Runs completely overlapped with Layers 46-47 + LM Head (100% deterministic, zero speculation waste).
+    bool context_prelaunch(const float* taps_dev, int n_rows, int64_t pos0, const uint32_t* tap45_ctr, uint32_t want_ctr, std::string& err);
+    /// Sync cs2_ and commit only the accepted prefix [0..n_keep-1] into the ring log / slot shadow.
+    bool context_prelaunch_finish(int n_keep, std::string& err);
+    /// Phase 2A: exact 2nd-best candidate token & probability from the last draft() round (zero extra latency).
+    int32_t last_top2(int i) const { return (i >= 0 && i < kDrafts) ? last_tok2_[i] : -1; }
+    float last_top2_prob(int i) const { return (i >= 0 && i < kDrafts) ? last_prob2_[i] : 0.0f; }
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
@@ -176,7 +187,6 @@ private:
     /// planar Q8 matrices (1..3 of them, same input width) times the planar activations in xqp_ / xdp_ (ncols columns)
     void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd);
     bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope = true);
-    bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
     bool capture(int n, const float* taps, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
@@ -220,6 +230,7 @@ private:
     int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens then 7 probabilities
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
+    bool kv_bf16_ = false;          ///< BF16 KV ring on sm_80+ TC attention (100% bit-exact, saves 40.3 MiB VRAM)
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
     double* rope_inv_ = nullptr;   ///< theta^(-2 i / 128), once
     cudaEvent_t ev_hs_[2] = {};     ///< the selector's projection runs beside the head
@@ -235,10 +246,22 @@ private:
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
     float *ao_ = nullptr, *o_ = nullptr, *gate_ = nullptr, *up_ = nullptr, *mlp_ = nullptr, *part_ = nullptr, *fn_ = nullptr;
-    float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
-    int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
+    float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr, *out_prob2_ = nullptr;
+    int32_t *toptok_ = nullptr, *out_tok_ = nullptr, *out_tok2_ = nullptr;
+    int32_t last_tok2_[kDrafts] = {};
+    float last_prob2_[kDrafts] = {};
     uint32_t* topscratch_ = nullptr;
     cudaGraphExec_t exec_[kRows + 1] = {};
+    cudaGraphExec_t blk_exec_ = nullptr;   ///< Phase 2C: stateless block-only graph (no context branch)
+    bool capture_block_only(std::string& err);
+    cudaGraphExec_t ctx_pre_exec_[kRows + 1] = {};   ///< Phase 3A: Layer-45 wait + record_context graph on cs2_
+    const float* ctx_pre_taps_ = nullptr;
+    const uint32_t* ctx_pre_flag_ = nullptr;
+    int64_t ctx_pre_pos0_ = 0;
+    int ctx_pre_n_ = 0;
+    bool ctx_pre_active_ = false;
+    bool capture_context_pre(int n, const float* taps, const uint32_t* tap45_ctr, std::string& err);
+    bool record_block(cudaStream_t cs, std::string& err, bool rope = true, bool allow_hs_fork = false);
     const float* graph_taps_ = nullptr;
     int ndraft_ = kDrafts;          ///< drafts a window can use (set_max_drafts)
     int64_t have_ctx_ = 0;

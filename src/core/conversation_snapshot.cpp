@@ -50,7 +50,8 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
                               : (size_t) g.head_dim * (int8_keys ? 1 : 2);
     // Include the moving spare row, not only completed blocks. The checkpoint
     // restore reconstructs that row when rewinding to an earlier prefix.
-    const int64_t pooled = index && upto > 0 ? upto / s.idx_block + 1 : 0;
+    const bool has_idx = index && !st.idx_peer_owned;
+    const int64_t pooled = has_idx && upto > 0 ? upto / s.idx_block + 1 : 0;
     // Format 3 identifies snapshot K8V4 only; never pass it to the block movers.  Rotated INT8 K/V (#293,
     // STRATA_KV_ROT=1) is another format too (+16): its bytes mean nothing to a state that does not rotate, so a
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
@@ -227,7 +228,19 @@ struct ParkAsync {
     VramKvSlot* slot = nullptr;   // STRATA_PARK_VRAM_MIB: the begun park's slot (the stage is not used then)
     uint64_t slot_tag = 0;        // its tag, kept past launch for the image's and its layers' tokens
 };
-ParkAsync& park_async() { static ParkAsync a; return a; }
+constexpr size_t kMaxParkDevs = 16;
+std::array<ParkAsync, kMaxParkDevs>& park_async_all() {
+    static auto* arr = new std::array<ParkAsync, kMaxParkDevs>();
+    return *arr;
+}
+ParkAsync& park_async() {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || (size_t) dev >= kMaxParkDevs) {
+        (void) cudaGetLastError();
+        dev = 0;
+    }
+    return park_async_all()[(size_t) dev];
+}
 constexpr size_t kParkPiece = (size_t) 4 << 20;
 bool park_async_on() {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
@@ -316,7 +329,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
-        const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+        const size_t keep = i == 4 ? ((index && !st.idx_peer_owned) ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         {   // STRATA_PARK_VRAM_MIB: with a slot, the whole part goes device to device into it (a restore of this image
@@ -582,11 +595,12 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
 }
 
 void conversation_park_join() {
-    ParkAsync& a = park_async();
-    std::lock_guard<std::mutex> lk(a.mu);
-    if (a.pending.valid()) {
-        const cudaError_t e = a.pending.get();
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", cudaGetErrorString(e));
+    for (ParkAsync& a : park_async_all()) {
+        std::lock_guard<std::mutex> lk(a.mu);
+        if (a.pending.valid()) {
+            const cudaError_t e = a.pending.get();
+            if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", cudaGetErrorString(e));
+        }
     }
 }
 
@@ -742,24 +756,29 @@ void conversation_park_slot_release(uint64_t tag) {
 size_t conversation_park_vram_release_all() {
     if (park_vram_budget() == 0) return 0;   // off: nothing was taken, and the stage stays as it was
     conversation_park_join();   // the background copy may be reading a slot or the stage
-    ParkAsync& a = park_async();
+    auto& all = park_async_all();
     VramKv& v = vram_kv();
     size_t freed = 0;
     for (size_t i = 0; i < v.slots.size();) {
-        if (a.active && v.slots[i].get() == a.slot) { ++i; continue; }   // a park in progress keeps its own
+        bool in_use = false;
+        for (const ParkAsync& a : all)
+            if (a.active && v.slots[i].get() == a.slot) { in_use = true; break; }
+        if (in_use) { ++i; continue; }   // a park in progress keeps its own
         freed += v.slots[i]->cap;
         vram_kv_free(*v.slots[i]);
         v.slots.erase(v.slots.begin() + (std::ptrdiff_t) i);
     }
-    if (a.stage != nullptr && !a.active) {
-        int cur = a.dev;
-        (void) cudaGetDevice(&cur);
-        if (cur != a.dev) (void) cudaSetDevice(a.dev);
-        (void) cudaFree(a.stage);
-        if (cur != a.dev) (void) cudaSetDevice(cur);
-        (void) cudaGetLastError();
-        freed += a.cap;
-        a.stage = nullptr; a.cap = 0;
+    int cur = 0;
+    (void) cudaGetDevice(&cur);
+    for (ParkAsync& a : all) {
+        if (a.stage != nullptr && !a.active) {
+            if (cur != a.dev) (void) cudaSetDevice(a.dev);
+            (void) cudaFree(a.stage);
+            if (cur != a.dev) (void) cudaSetDevice(cur);
+            (void) cudaGetLastError();
+            freed += a.cap;
+            a.stage = nullptr; a.cap = 0;
+        }
     }
     return freed;
 }

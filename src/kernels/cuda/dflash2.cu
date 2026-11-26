@@ -296,8 +296,9 @@ __device__ __forceinline__ void df2_mma_bf16_m16n8k16(float (&d)[4], uint32_t a0
 
 constexpr int AS16 = 136;   // 128 bf16 + 8 pad (16-byte aligned, bank-conflict-free)
 constexpr int VS16 = 36;    // 32 bf16 + 4 pad (8-byte aligned)
+template <bool RingBf16 = false>
 __global__ void __launch_bounds__(128) attn_part_tc_kernel(
-    const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
+    const float* __restrict__ q, const void* __restrict__ kring_raw, const void* __restrict__ vring_raw,
     const float* __restrict__ kblk, const float* __restrict__ vblk,
     const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
     const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
@@ -354,45 +355,52 @@ __global__ void __launch_bounds__(128) attn_part_tc_kernel(
     for (int nd = 0; nd < 8; ++nd) { O[nd][0] = 0.0f; O[nd][1] = 0.0f; O[nd][2] = 0.0f; O[nd][3] = 0.0f; }
 
     const int k_end = min(k_begin + kDf2Chunk, nkeys);
-    auto fetch = [&](int k0, float4 (&reg)[8], const float* ring, const float* blk) {
+    const float* kring_f = static_cast<const float*>(kring_raw);
+    const float* vring_f = static_cast<const float*>(vring_raw);
+    const uint16_t* kring_h = static_cast<const uint16_t*>(kring_raw);
+    const uint16_t* vring_h = static_cast<const uint16_t*>(vring_raw);
+
+    auto fetch = [&](int k0, uint2 (&reg)[8], const float* ring_f, const uint16_t* ring_h, const float* blk) {
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (k < nctx) v = *reinterpret_cast<const float4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
-            else if (k < nkeys) v = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
-            reg[u] = v;
+            uint2 v2 = make_uint2(0u, 0u);
+            if (k < nctx) {
+                const size_t off = ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4;
+                if constexpr (RingBf16) {
+                    v2 = *reinterpret_cast<const uint2*>(ring_h + off);
+                } else {
+                    const float4 vf = *reinterpret_cast<const float4*>(ring_f + off);
+                    v2 = make_uint2(f2bf16x2(vf.x, vf.y), f2bf16x2(vf.z, vf.w));
+                }
+            } else if (k < nkeys) {
+                const float4 vf = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
+                v2 = make_uint2(f2bf16x2(vf.x, vf.y), f2bf16x2(vf.z, vf.w));
+            }
+            reg[u] = v2;
         }
     };
-    auto put_k = [&](const float4 (&reg)[8]) {
+    auto put_k = [&](const uint2 (&reg)[8]) {
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
-            const uint32_t p0 = f2bf16x2(reg[u].x, reg[u].y);
-            const uint32_t p1 = f2bf16x2(reg[u].z, reg[u].w);
-            *reinterpret_cast<uint2*>(&kv_s.K[t * AS16 + d4 * 4]) = make_uint2(p0, p1);
+            *reinterpret_cast<uint2*>(&kv_s.K[t * AS16 + d4 * 4]) = reg[u];
         }
     };
-    auto put_vt = [&](const float4 (&reg)[8]) {
+    auto put_vt = [&](const uint2 (&reg)[8]) {
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
             const int d0 = d4 * 4;
-            const __nv_bfloat16 b0 = __float2bfloat16_rn(reg[u].x);
-            const __nv_bfloat16 b1 = __float2bfloat16_rn(reg[u].y);
-            const __nv_bfloat16 b2 = __float2bfloat16_rn(reg[u].z);
-            const __nv_bfloat16 b3 = __float2bfloat16_rn(reg[u].w);
-            uint16_t u0, u1, u2, u3;
-            memcpy(&u0, &b0, 2); memcpy(&u1, &b1, 2); memcpy(&u2, &b2, 2); memcpy(&u3, &b3, 2);
-            kv_s.VT[(d0 + 0) * VS16 + t] = u0;
-            kv_s.VT[(d0 + 1) * VS16 + t] = u1;
-            kv_s.VT[(d0 + 2) * VS16 + t] = u2;
-            kv_s.VT[(d0 + 3) * VS16 + t] = u3;
+            kv_s.VT[(d0 + 0) * VS16 + t] = (uint16_t) (reg[u].x & 0xffffu);
+            kv_s.VT[(d0 + 1) * VS16 + t] = (uint16_t) (reg[u].x >> 16);
+            kv_s.VT[(d0 + 2) * VS16 + t] = (uint16_t) (reg[u].y & 0xffffu);
+            kv_s.VT[(d0 + 3) * VS16 + t] = (uint16_t) (reg[u].y >> 16);
         }
     };
 
-    float4 kreg[8], vreg[8];
-    fetch(k_begin, kreg, kring, kblk);
+    uint2 kreg[8], vreg[8];
+    fetch(k_begin, kreg, kring_f, kring_h, kblk);
 
     for (int k0 = k_begin; k0 < k_end; k0 += 32) {
         __syncthreads();
@@ -401,7 +409,7 @@ __global__ void __launch_bounds__(128) attn_part_tc_kernel(
             const int k = k0 + tid;
             kvalid[tid] = (tag == nullptr || k >= nctx || k >= nkeys) ? 1 : (tag[(lo + k) % ring_slots] == (ep | (int64_t) (lo + k)) ? 1 : 0);
         }
-        fetch(k0, vreg, vring, vblk);
+        fetch(k0, vreg, vring_f, vring_h, vblk);
         __syncthreads();
 
         // Stage 1: S = Q * K^T (32 x 32 over HD=128) via BF16 Tensor Cores (all 4 warps active!).
@@ -472,7 +480,7 @@ __global__ void __launch_bounds__(128) attn_part_tc_kernel(
 
         // Stage 3: Transpose-store V into kv_s.VT, prefetch next K, run O = O*corr + P * V via BF16 TC!
         put_vt(vreg);
-        if (k0 + 32 < k_end) fetch(k0 + 32, kreg, kring, kblk);
+        if (k0 + 32 < k_end) fetch(k0 + 32, kreg, kring_f, kring_h, kblk);
         __syncthreads();
 
         const float cr0 = corr_s[q0 + g];
@@ -512,7 +520,7 @@ __global__ void __launch_bounds__(128) attn_part_tc_kernel(
         *reinterpret_cast<float2*>(pbase + (size_t) (q0 + g + 8) * 130 + d_off) = make_float2(O[nd][2], O[nd][3]);
     }
 #else
-    (void) q; (void) kring; (void) vring; (void) kblk; (void) vblk; (void) anchor_pos;
+    (void) q; (void) kring_raw; (void) vring_raw; (void) kblk; (void) vblk; (void) anchor_pos;
     (void) ring_slots; (void) window; (void) part; (void) variant; (void) tag; (void) epoch_ptr;
 #endif
 }
@@ -954,6 +962,43 @@ __global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __res
     if (tag != nullptr && h == 0 && d == 0) tag[slot] = ((int64_t) *epoch_ptr << 32) | (int64_t) pos[r];
 }
 
+__global__ void kv_ring_bf16_kernel(const float* __restrict__ kin, const float* __restrict__ vin, const float* __restrict__ gk,
+                                    const int32_t* __restrict__ pos, const float* __restrict__ table,
+                                    uint16_t* __restrict__ kring, uint16_t* __restrict__ vring, int slots, int heads, float eps,
+                                    int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
+    const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    __shared__ float red[4];
+    __shared__ float y[HD];
+    const float x = kin[((size_t) r * heads + h) * HD + d];
+    float ss = x * x;
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((d & 31) == 0) red[d >> 5] = ss;
+    __syncthreads();
+    const float v = x * rsqrtf((red[0] + red[1] + red[2] + red[3]) / (float) HD + eps) * gk[d];
+    y[d] = v;
+    __syncthreads();
+    const int i = d & 63;
+    const float c = table[(r * 2 + 0) * 64 + i], sn = table[(r * 2 + 1) * 64 + i];
+    const int slot = (int) (pos[r] % slots);
+    const size_t at = ((size_t) h * slots + slot) * HD + d;
+    const float kf = d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn;
+    const float vf = vin[((size_t) r * heads + h) * HD + d];
+#if !defined(__HIPCC__)
+    const __nv_bfloat16 bk = __float2bfloat16_rn(kf);
+    const __nv_bfloat16 bv = __float2bfloat16_rn(vf);
+    uint16_t uk, uv;
+    memcpy(&uk, &bk, 2);
+    memcpy(&uv, &bv, 2);
+#else
+    const uint32_t bk32 = __float_as_uint(kf), bv32 = __float_as_uint(vf);
+    const uint16_t uk = (uint16_t) ((bk32 + 0x7fffu + ((bk32 >> 16) & 1u)) >> 16);
+    const uint16_t uv = (uint16_t) ((bv32 + 0x7fffu + ((bv32 >> 16) & 1u)) >> 16);
+#endif
+    kring[at] = uk;
+    vring[at] = uv;
+    if (tag != nullptr && h == 0 && d == 0) tag[slot] = ((int64_t) *epoch_ptr << 32) | (int64_t) pos[r];
+}
+
 // silu(gate) * up then the planar quantization: grid (ceil(I / 32 / 8), rows), 256 threads
 __global__ void swiglu_quant_kernel(const float* __restrict__ gate, const float* __restrict__ up, int I, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int blk = blockIdx.x * 8 + (threadIdx.x >> 5), b = blockIdx.y, lane = threadIdx.x & 31;
@@ -1097,7 +1142,8 @@ __device__ __forceinline__ float q4row_at(const uint8_t* row, int i) {
 template <bool Q4>
 __global__ void select_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
                               const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
-                              const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+                              const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob,
+                              int32_t* __restrict__ out_tok2, float* __restrict__ out_prob2) {
     __shared__ float vp[256];
     __shared__ float sc[kDf2TopK];
     __shared__ int prev;
@@ -1129,14 +1175,18 @@ __global__ void select_kernel(const float* __restrict__ hp, const float* __restr
         }
         __syncthreads();
         if (tid == 0) {
-            int bj = 0;
-            float bv = sc[0];
-            for (int j = 1; j < kDf2TopK; ++j)
-                if (sc[j] > bv) { bv = sc[j]; bj = j; }
+            int bj = 0, bj2 = 1;
+            float bv = sc[0], bv2 = -INFINITY;
+            for (int j = 1; j < kDf2TopK; ++j) {
+                if (sc[j] > bv) { bv2 = bv; bj2 = bj; bv = sc[j]; bj = j; }
+                else if (sc[j] > bv2) { bv2 = sc[j]; bj2 = j; }
+            }
             float z = 0.0f;
             for (int j = 0; j < kDf2TopK; ++j) z += __expf(sc[j] - bv);
             out_tok[i] = tok[i * kDf2TopK + bj];
             out_prob[i] = 1.0f / z;
+            if (out_tok2 != nullptr) out_tok2[i] = tok[i * kDf2TopK + bj2];
+            if (out_prob2 != nullptr) out_prob2[i] = __expf(bv2 - bv) / z;
             prev = out_tok[i];
         }
         __syncthreads();
@@ -1263,6 +1313,31 @@ __global__ void df2_p2p_wait_merge_top16_kernel(uint32_t* __restrict__ local_fla
     }
 }
 
+// ---- Phase 3A: Layer-45 monotonic counter signal & wait for deterministic async DFlash2 context overlap
+__global__ void df2_inc_flag_kernel(uint32_t* __restrict__ flag) {
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(flag, 1u);
+    }
+}
+
+__global__ void df2_wait_flag_ge_dev_kernel(const uint32_t* __restrict__ flag, const int32_t* __restrict__ want_dev) {
+    if (threadIdx.x != 0) return;
+    const uint32_t want = static_cast<uint32_t>(*want_dev);
+    while (true) {
+        uint32_t v = 0u;
+#if !defined(__HIPCC__)
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(flag));
+#else
+        v = *reinterpret_cast<const volatile uint32_t*>(flag);
+#endif
+        if ((int32_t) (v - want) >= 0) break;
+#if !defined(__HIPCC__) && __CUDA_ARCH__ >= 700
+        __nanosleep(64);
+#endif
+    }
+}
+
 }  // namespace
 
 void df2_tap_gr(const float* R, int64_t R_stride, const float* bo, int64_t bo_stride, const float* inject, int64_t inj_stride, float* out, int64_t out_stride,
@@ -1296,8 +1371,7 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
     check("copy_rows");
 }
 
-void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
-                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
+bool df2_attn_tc_supported() {
 #if !defined(__HIPCC__)
     static const bool tc_ok = [] {
         if (const char* e = std::getenv("STRATA_DF2_ATTN_TC"); e && e[0] == '0') return false;
@@ -1309,8 +1383,17 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
         }
         return major >= 8;
     }();
-    if (tc_ok) {
-        attn_part_tc_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+    return tc_ok;
+#else
+    return false;
+#endif
+}
+
+void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
+                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
+#if !defined(__HIPCC__)
+    if (df2_attn_tc_supported()) {
+        attn_part_tc_kernel<false><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
         check("attn_part_tc");
     } else
 #endif
@@ -1318,6 +1401,14 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
         attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
         check("attn_part");
     }
+    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
+    check("attn_merge");
+}
+
+void df2_attention_bf16(const float* q, const uint16_t* kring, const uint16_t* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
+                        int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
+    attn_part_tc_kernel<true><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+    check("attn_part_tc_bf16");
     attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
 }
@@ -1339,6 +1430,12 @@ void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int3
                  int heads, float eps, void* stream, int64_t* tag, const int32_t* epoch) {
     kv_ring_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
     check("kv_ring");
+}
+
+void df2_kv_ring_bf16(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, uint16_t* kring, uint16_t* vring, int slots, int rows,
+                      int heads, float eps, void* stream, int64_t* tag, const int32_t* epoch) {
+    kv_ring_bf16_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
+    check("kv_ring_bf16");
 }
 
 void df2_rope_inv(float theta, double* inv, void* stream) {
@@ -1525,10 +1622,11 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 }
 
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4) {
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4,
+                int32_t* out_tok2, float* out_prob2) {
     if (rank != 256) throw std::invalid_argument("df2_select: the selector rank must be 256");
-    if (cb_q4) select_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
-    else select_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+    if (cb_q4) select_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob, out_tok2, out_prob2);
+    else select_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob, out_tok2, out_prob2);
     check("select");
 }
 
@@ -1556,6 +1654,16 @@ void df2_p2p_wait_merge_top16(uint32_t* local_flag, const void* local_peer_buf, 
     const int threads = (rows > 0 ? rows : 1) * 32;
     df2_p2p_wait_merge_top16_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(local_flag, static_cast<const uint8_t*>(local_peer_buf), val0, tok0, rows);
     check("df2_p2p_wait_merge_top16");
+}
+
+void df2_inc_flag(uint32_t* flag, void* stream) {
+    df2_inc_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag);
+    check("df2_inc_flag");
+}
+
+void df2_wait_flag_ge_dev(const uint32_t* flag, const int32_t* want_dev, void* stream) {
+    df2_wait_flag_ge_dev_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, want_dev);
+    check("df2_wait_flag_ge_dev");
 }
 
 }  // namespace strata::kernels

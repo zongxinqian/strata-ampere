@@ -6699,12 +6699,28 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
         }
     }
     __syncthreads();
-    for (int idx = tid; idx < T * UPC; idx += THREADS) {
-        const int k = idx / UPC, col = idx - k * UPC;
+    // Phase 3B: fused register q8_1 quantizer (32 columns per block = exact 1 GrQ81 block per token warp, 0 atomics!)
+    const int warp = tid >> 5;
+    if (warp < T) {
         float s = 0.0f;
 #pragma unroll
-        for (int c = 0; c < HC; ++c) s += g[k][c][col];
-        f.a[k].mixed[b * UPC + col] = s / (float) HC;
+        for (int c = 0; c < HC; ++c) s += g[warp][c][lane];
+        const float xi = s / (float) HC;
+        f.a[warp].mixed[b * UPC + lane] = xi;
+        if constexpr (!DP) {
+            if (f.a[warp].q8_mixed != nullptr) {
+                float amax = fabsf(xi), sum = xi;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, shfl_xor_persist(amax, o));
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) sum += shfl_xor_persist(sum, o);
+                const float d = q8_1_finite(q81_div(amax, 127.0f));
+                const int8_t q = q8_1_quant(xi, d, amax);
+                GrQ81* y = reinterpret_cast<GrQ81*>(f.a[warp].q8_mixed) + b;
+                y->qs[lane] = q;
+                if (lane == 0) y->ds = q8_1_ds(d, sum);
+            }
+        }
     }
 }
 struct DevState {
@@ -6908,8 +6924,10 @@ bool fused_gr_read_persist(const FusedGrArgs* a, int n_tok, void* stream) {
     const hcp::DevState& st = hcp::g_dev[dev];
     if (n_tok > st.max_t) return false;
     if (a[0].q8_down != nullptr || a[0].q8_up != nullptr) return false;    // STRATA_HC_Q8: the default read
-    for (int t = 0; t < n_tok; ++t)
-        if (a[t].q8_mixed != nullptr) return false;                         // STRATA_QFUSE: the default read
+    if (hcp::dp_on()) {
+        for (int t = 0; t < n_tok; ++t)
+            if (a[t].q8_mixed != nullptr) return false;
+    }
     hcp::launch(a, n_tok, st, (cudaStream_t) stream, hcp::kTicksRun);
     return true;
 }
