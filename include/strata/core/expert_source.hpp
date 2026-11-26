@@ -621,6 +621,8 @@ struct ExpertDispatch {
     bool tp2_dev_plan = false;             ///< GPU0 & GPU1 build their own hit plans via tp2_resident_plan
     const uint8_t* tp_cache_base1 = nullptr;
     const uint64_t* tp_cache_slot_off1 = nullptr;
+    int tp2_miss_256 = 0;
+    int tp2_miss_min_t = 1;
     int pcie_num = 0;
     PcieModel pcie_model;          ///< Verifier::set_pcie_balance: the PCIe count from measured costs
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows

@@ -38,5 +38,6 @@ void native_router_fused_bf16_bell_plan(
     float* x_out, int32_t* ids, float* weights, int32_t* ids_out, uint32_t* d_seq, uint32_t ring,
     const int32_t* res_self, const int32_t* res_peer,
     const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
-    int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream);
+    int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream,
+    const unsigned long long* host_blobs = nullptr, int layer_idx = 0, int miss_frac256 = 0);
 }

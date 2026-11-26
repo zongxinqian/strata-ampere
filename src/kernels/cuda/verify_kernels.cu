@@ -2053,12 +2053,20 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     check("resident_plan");
 }
 
+__device__ __forceinline__ bool tp2_plan_takes_miss(int layer_idx, int32_t eid, int frac256) {
+    if (frac256 <= 0) return false;
+    if (frac256 >= 256) return true;
+    const uint32_t h = (uint32_t) (layer_idx * 512 + eid) * 2654435761u;
+    return (int) (h >> 24) < frac256;
+}
+
 template<int NT>
 __global__ void __launch_bounds__(NT) tp2_resident_plan_kernel(
         const int32_t* __restrict__ ids, int n, int k,
         const int32_t* __restrict__ res0, const int32_t* __restrict__ res1,
         int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
-        long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring) {
+        long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring,
+        const unsigned long long* __restrict__ host_blobs, int layer_idx, int miss_frac256) {
     constexpr int NW = NT / 32;
     __shared__ int32_t s_ids[NT];
     __shared__ int32_t s_excl[NT];
@@ -2072,20 +2080,29 @@ __global__ void __launch_bounds__(NT) tp2_resident_plan_kernel(
     int32_t eid = -1;
     int32_t slot = -1;
     bool hit1 = false;
+    unsigned long long hblob = 0ull;
     if (tid < n) {
         eid = ids[tid];
         if (eid >= 0 && eid < n_expert) {
             slot = res0[eid];
-            if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true;
+            if (slot < 0) {
+                if (host_blobs != nullptr) {
+                    if (res1 != nullptr && res1[eid] < 0 && tp2_plan_takes_miss(layer_idx, eid, miss_frac256))
+                        hblob = host_blobs[eid];
+                } else if (res1 != nullptr && (res1[eid] >= 0 || tp2_plan_takes_miss(layer_idx, eid, miss_frac256))) {
+                    hit1 = true;
+                }
+            }
         }
     }
-    s_ids[tid] = (tid < n && slot >= 0) ? eid : -1;
+    const bool is_mine = (tid < n && (slot >= 0 || hblob != 0ull));
+    s_ids[tid] = is_mine ? eid : -1;
     __syncthreads();
 
     int first_j = tid;
     int rank_in_group = 0;
     int count_same = 0;
-    if (tid < n && slot >= 0) {
+    if (is_mine) {
         for (int j = 0; j < n; ++j) {
             if (s_ids[j] == eid) {
                 if (j < first_j) first_j = j;
@@ -2094,7 +2111,7 @@ __global__ void __launch_bounds__(NT) tp2_resident_plan_kernel(
             }
         }
     }
-    const bool is_first = (tid < n && slot >= 0 && first_j == tid);
+    const bool is_first = (is_mine && first_j == tid);
     const int my_cnt = is_first ? count_same : 0;
     const int my_pack = (my_cnt << 16) | (is_first ? 1 : 0);
     const int my_h1 = (tid < n && hit1) ? 1 : 0;
@@ -2138,10 +2155,12 @@ __global__ void __launch_bounds__(NT) tp2_resident_plan_kernel(
         for (int w = 0; w < NW; ++w) if (w < warp) tot += s_wsum[w];
         const int grp_idx = tot & 0xffff;
         const int ent_start = tot >> 16;
-        ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+        ptr[grp_idx] = (slot >= 0)
+            ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
+            : hblob;
         start[grp_idx] = ent_start;
     }
-    if (tid < n && slot >= 0) {
+    if (is_mine) {
         const int fj_warp = first_j >> 5;
         int fj_tot = s_excl[first_j];
 #pragma unroll
@@ -2173,22 +2192,32 @@ __global__ void __launch_bounds__(32) tp2_resident_plan_kernel_32(
         const int32_t* __restrict__ ids, int n, int k,
         const int32_t* __restrict__ res0, const int32_t* __restrict__ res1,
         int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
-        long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring) {
+        long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring,
+        const unsigned long long* __restrict__ host_blobs, int layer_idx, int miss_frac256) {
     const int lane = threadIdx.x;
     int32_t eid = -1;
     int32_t slot = -1;
     bool hit1 = false;
+    unsigned long long hblob = 0ull;
     if (lane < n) {
         eid = ids[lane];
         if (eid >= 0 && eid < n_expert) {
             slot = res0[eid];
-            if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true;
+            if (slot < 0) {
+                if (host_blobs != nullptr) {
+                    if (res1 != nullptr && res1[eid] < 0 && tp2_plan_takes_miss(layer_idx, eid, miss_frac256))
+                        hblob = host_blobs[eid];
+                } else if (res1 != nullptr && (res1[eid] >= 0 || tp2_plan_takes_miss(layer_idx, eid, miss_frac256))) {
+                    hit1 = true;
+                }
+            }
         }
     }
+    const bool is_mine = (lane < n && (slot >= 0 || hblob != 0ull));
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
-    const int32_t key = (lane < n && slot >= 0) ? eid : (-2 - lane);
+    const int32_t key = is_mine ? eid : (-2 - lane);
     const uint32_t mask = __match_any_sync(0xffffffffu, key);
-    const bool act = (lane < n && slot >= 0);
+    const bool act = is_mine;
     const int first_j = act ? (__ffs((int) mask) - 1) : lane;
     const int rank_in_group = __popc(mask & ((1u << lane) - 1u));
     const int count_same = __popc(mask);
@@ -2241,7 +2270,9 @@ __global__ void __launch_bounds__(32) tp2_resident_plan_kernel_32(
     if (is_first) {
         const int grp_idx = excl & 0xffff;
         const int ent_start = excl >> 16;
-        ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+        ptr[grp_idx] = (slot >= 0)
+            ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
+            : hblob;
         start[grp_idx] = ent_start;
     }
     if (act) {
@@ -2267,21 +2298,25 @@ __global__ void __launch_bounds__(32) tp2_resident_plan_kernel_32(
 
 void tp2_resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_self, const int32_t* res_peer,
                        int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
-                       int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream) {
+                       int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream,
+                       const unsigned long long* host_blobs, int layer_idx, int miss_frac256) {
     if (n_entries <= 32) {
         tp2_resident_plan_kernel_32<<<1, 32, 0, (cudaStream_t) stream>>>(
-            ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring);
+            ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring,
+            host_blobs, layer_idx, miss_frac256);
     } else if (n_entries > kResidentPlanNarrow) {
         if (n_entries <= kResidentPlanMax) {
             tp2_resident_plan_kernel<kResidentPlanMax><<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(
-                ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring);
+                ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring,
+                host_blobs, layer_idx, miss_frac256);
         } else {
             std::fprintf(stderr, "tp2_resident_plan: %d entries, at most %d\n", n_entries, kResidentPlanMax);
             std::exit(1);
         }
     } else {
         tp2_resident_plan_kernel<kResidentPlanNarrow><<<1, kResidentPlanNarrow, 0, (cudaStream_t) stream>>>(
-            ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring);
+            ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring,
+            host_blobs, layer_idx, miss_frac256);
     }
     check("tp2_resident_plan");
 }

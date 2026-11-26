@@ -37,4 +37,22 @@ void native_moe_combine_multi_hits(const float* hits, const float* weights, cons
 void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,
                                          const float* shared_gate, float* output, int64_t n_embd, int64_t k, int n_tok,
                                          void* stream);
+/// TP2 GPU1 sparse-hit combine: reads ONLY hit rows listed in dst[0, *count) without zero-filling parts.
+void native_moe_combine_multi_sparse_hits(const float* hits, const int32_t* dst, const int32_t* count,
+                                          const float* weights, const float* shared, float* output,
+                                          int64_t n_embd, int64_t k, int n_tok, void* stream);
+void native_moe_combine_multi_sparse_hits_gated(const float* hits, const int32_t* dst, const int32_t* count,
+                                                const float* weights, const float* shared, const float* shared_gate,
+                                                float* output, int64_t n_embd, int64_t k, int n_tok, void* stream);
+/// Fused Combine + P2P BF16 Push epilogue (bit-exact with combine + tp_allreduce_bf16_reg_kernel push phase).
+void native_moe_combine_multi_hits_added_push(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                              const float* weights, const float* shared, const float* shared_gate,
+                                              float* output, float* peer_slot_buf, volatile uint32_t* peer_flag,
+                                              uint32_t* done_ctr, uint32_t step, int64_t n_embd, int64_t k,
+                                              int n_tok, void* stream);
+void native_moe_combine_multi_sparse_hits_push(const float* hits, const int32_t* dst, const int32_t* count,
+                                               const float* weights, const float* shared, const float* shared_gate,
+                                               float* output, float* peer_slot_buf, volatile uint32_t* peer_flag,
+                                               uint32_t* done_ctr, uint32_t step, int64_t n_embd, int64_t k,
+                                               int n_tok, void* stream);
 }

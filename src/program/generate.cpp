@@ -7686,14 +7686,26 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> p0;
         p0.reserve((profile.size() + 1) / 2);
         tp1_profile.reserve(profile.size() / 2);
-        // Thue-Morse 4-way partition: avoid systematic even-rank bias onto CUDA0 and give rank-0 edge to CUDA1 (+462 slots, no draft head).
+        // Capacity-weighted Bresenham partition: matches CUDA0:CUDA1 actual VRAM slot ratio (~48:52 with DFlash2 on GPU0)
+        // so 100% of global Top-(slots0+slots1) hottest experts stay resident with zero mid-rank eviction gap.
+        const int w0_env = [] { const char* v = std::getenv("STRATA_TP2_PART_W0"); return v ? std::atoi(v) : 48; }();
+        const int w1_env = [] { const char* v = std::getenv("STRATA_TP2_PART_W1"); return v ? std::atoi(v) : 52; }();
+        const int w0 = std::max(1, w0_env);
+        const int w1 = std::max(1, w1_env);
+        const int wsum = w0 + w1;
+        int acc0 = wsum / 2;
         for (size_t i = 0; i < profile.size(); ++i) {
-            if ((i & 3u) == 1u || (i & 3u) == 2u) p0.push_back(profile[i]);
-            else tp1_profile.push_back(profile[i]);
+            acc0 += w0;
+            if (acc0 >= wsum) {
+                acc0 -= wsum;
+                p0.push_back(profile[i]);
+            } else {
+                tp1_profile.push_back(profile[i]);
+            }
         }
         profile.swap(p0);
-        std::fprintf(stderr, "strata generate: STRATA_TP2=1: partitioned %zu profiled experts into %zu (CUDA0) + %zu (CUDA1) disjoint sets\n",
-                     profile_all.size(), profile.size(), tp1_profile.size());
+        std::fprintf(stderr, "strata generate: STRATA_TP2=1: capacity-weighted (%d:%d) partitioned %zu profiled experts into %zu (CUDA0) + %zu (CUDA1) disjoint sets\n",
+                     w0, w1, profile_all.size(), profile.size(), tp1_profile.size());
     }
     if (multi_gpu) {
         profile_all = profile;
@@ -9703,6 +9715,9 @@ int main(int argc, char** argv) {
         strata::core::ExpertCache cache;
         std::vector<int32_t> host_res;
         int32_t* d_res = nullptr;
+        int32_t* d_res_peer = nullptr;
+        uint64_t* d_host_blobs = nullptr;
+        int64_t host_blobs_mapped = 0;
         strata::core::Verifier ver;
         strata::core::TpComm comm;
         cudaStream_t pf_stream = nullptr;
@@ -10966,6 +10981,44 @@ int main(int argc, char** argv) {
                 cudaMemcpy(tp1->d_res, tp1->host_res.data(), tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
                 std::fprintf(stderr, "strata generate: TP2 CUDA1 residency table failed\n");
                 return 1;
+            }
+            if (cudaMalloc((void**) &tp1->d_res_peer, host_res.size() * sizeof(int32_t)) == cudaSuccess) {
+                if (cudaMemcpy(tp1->d_res_peer, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
+                    cudaFree(tp1->d_res_peer);
+                    tp1->d_res_peer = nullptr;
+                }
+            } else {
+                (void) cudaGetLastError();
+                tp1->d_res_peer = nullptr;
+            }
+            // Build GPU1 device pointer table into the 72x1GiB portable HugePage expert arena (192 KiB VRAM).
+            {
+                const size_t total_exp = (size_t) (g.n_layers * g.n_expert);
+                std::vector<uint64_t> h_ptrs(total_exp, 0ull);
+                int64_t mapped_cnt = 0;
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        const uint8_t* hb = arena_src.blob_at(l, e); if (hb == nullptr) hb = src.resident_blob(l, e);
+                        if (hb != nullptr) {
+                            void* dp = nullptr;
+                            if (cudaHostGetDevicePointer(&dp, const_cast<uint8_t*>(hb), 0) == cudaSuccess && dp != nullptr) {
+                                h_ptrs[(size_t) (l * g.n_expert + e)] = (uint64_t) (uintptr_t) dp;
+                                ++mapped_cnt;
+                            } else {
+                                (void) cudaGetLastError();
+                            }
+                        }
+                    }
+                }
+                if (mapped_cnt == (int64_t) total_exp &&
+                    cudaMalloc((void**) &tp1->d_host_blobs, total_exp * sizeof(uint64_t)) == cudaSuccess &&
+                    cudaMemcpy(tp1->d_host_blobs, h_ptrs.data(), total_exp * sizeof(uint64_t), cudaMemcpyHostToDevice) == cudaSuccess) {
+                    tp1->host_blobs_mapped = mapped_cnt;
+                } else {
+                    (void) cudaGetLastError();
+                    if (tp1->d_host_blobs != nullptr) { cudaFree(tp1->d_host_blobs); tp1->d_host_blobs = nullptr; }
+                    tp1->host_blobs_mapped = 0;
+                }
             }
             resident += res1;
         }
@@ -13082,6 +13135,8 @@ int main(int argc, char** argv) {
                 if (tp1 && tp1->d_res != nullptr) {
                     const strata::core::OnDevice on1(tp1->dev);
                     cudaMemcpy(tp1->d_res, tp1->host_res.data(), tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                    if (tp1->d_res_peer != nullptr)
+                        cudaMemcpy(tp1->d_res_peer, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                     cudaStreamSynchronize(nullptr);
                 }
                 for (auto& st : stages) {
@@ -13345,8 +13400,15 @@ int main(int argc, char** argv) {
             ver.set_tp(&tp1->comm, 0, true, &tp1->ver);
             if (use_mtp) mtp.set_head_peer(tp1->dev);
         }
+        const int tp2_miss_256 = (tp1 && tp1->d_res_peer != nullptr && tp1->d_host_blobs != nullptr &&
+                                  tp1->host_blobs_mapped == g.n_layers * g.n_expert)
+            ? [] { const char* v = std::getenv("STRATA_TP2_GPU1_MISS_256"); int x = v ? std::atoi(v) : 0; return x < 0 ? 0 : (x > 256 ? 256 : x); }()
+            : 0;
+        const int tp2_miss_min_t = [] { const char* v = std::getenv("STRATA_TP2_GPU1_MISS_MIN_T"); int x = v ? std::atoi(v) : 1; return x < 1 ? 1 : x; }();
         vh.d_res_self = d_res_self;
         vh.d_res_peer = d_res_peer;
+        vh.tp2_miss_256 = tp2_miss_256;
+        vh.tp2_miss_min_t = tp2_miss_min_t;
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_max_t(), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -13360,6 +13422,10 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on1(tp1->dev);
                 strata::core::VerifyHits vh1;
                 vh1.d_res = tp1->d_res;
+                vh1.d_res_peer = tp1->d_res_peer;
+                vh1.d_host_blobs = tp1->d_host_blobs;
+                vh1.tp2_miss_256 = tp2_miss_256;
+                vh1.tp2_miss_min_t = tp2_miss_min_t;
                 vh1.h_res = tp1->host_res.data();
                 vh1.cache_base = (const uint8_t*) tp1->cache.device_slot(0);
                 vh1.blob = thits.blob;
@@ -13378,6 +13444,11 @@ int main(int argc, char** argv) {
             drive.d.tp_res1 = tp1->host_res.data();
             drive.d.tp_cache_base1 = (const uint8_t*) tp1->cache.device_slot(0);
             drive.d.tp_cache_slot_off1 = tp1->cache.slot_offsets();
+            drive.d.tp2_miss_256 = tp2_miss_256;
+            drive.d.tp2_miss_min_t = tp2_miss_min_t;
+            if (tp2_miss_256 > 0)
+                std::fprintf(stderr, "strata serve: TP2 GPU1 HugePage direct-PCIe miss offload ON (frac=%d/256, min_t=%d, %lld/%lld blobs mapped)\n",
+                             tp2_miss_256, tp2_miss_min_t, (long long) tp1->host_blobs_mapped, (long long) (g.n_layers * g.n_expert));
             std::fprintf(stderr, "strata serve: STRATA_TP2=1 ready: CUDA0 (%lld experts) + CUDA%d (%lld experts) = %lld total resident experts\n",
                          (long long) xcache.slots(), tp1->dev, (long long) tp1->cache.slots(),
                          (long long) (xcache.slots() + tp1->cache.slots()));
@@ -15107,7 +15178,7 @@ int main(int argc, char** argv) {
                 res_pin0 = nullptr; (void) cudaGetLastError();
             }
             if (d_res_self != nullptr &&
-                cudaHostAlloc((void**) &res_pin_self, res_bytes, cudaHostAllocDefault) != cudaSuccess) {
+                cudaHostAlloc((void**) &res_pin_self, res_bytes, cudaHostAllocPortable) != cudaSuccess) {
                 res_pin_self = nullptr; (void) cudaGetLastError();
             }
             if (tp1 && tp1->d_res != nullptr &&
@@ -15174,6 +15245,16 @@ int main(int argc, char** argv) {
                     e1 = e0 != cudaSuccess ? e0 : cudaStreamSynchronize(nullptr);
                 }
                 if (r == cudaSuccess) r = e1;
+                if (tp1->d_res_peer != nullptr && !host_res.empty()) {
+                    cudaError_t ep1 = cudaSuccess;
+                    if (async_streams && res_pin_self != nullptr && stages.empty()) {
+                        ep1 = cudaMemcpyAsync(tp1->d_res_peer, res_pin_self, res_bytes, cudaMemcpyHostToDevice, tp1->ver.stream());
+                    } else {
+                        const cudaError_t e0 = cudaMemcpy(tp1->d_res_peer, host_res.data(), res_bytes, cudaMemcpyHostToDevice);
+                        ep1 = e0 != cudaSuccess ? e0 : cudaStreamSynchronize(nullptr);
+                    }
+                    if (r == cudaSuccess) r = ep1;
+                }
             }
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
@@ -15276,7 +15357,7 @@ int main(int argc, char** argv) {
         int32_t* res_pairs = (serial_windows && (drive.d.fetch_admit > 0 || drive.d.evict_sync))
                                  ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
         int32_t* res_pairs_self = (res_pairs != nullptr && d_res_self != nullptr)
-                                      ? res_pairs_alloc(kResPatchCap, {-1}) : nullptr;
+                                      ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
         int32_t* res_pairs_peer = (res_pairs != nullptr && d_res_peer != nullptr && tp1 != nullptr)
                                       ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
         auto res_sync = [&](bool check, std::string& e) -> bool {
@@ -15323,6 +15404,8 @@ int main(int argc, char** argv) {
                     if (tp1 && tp1->d_res != nullptr && r == cudaSuccess) {
                         const strata::core::OnDevice on1(tp1->dev);
                         strata::kernels::res_patch(tp1->d_res, res_pairs_peer ? res_pairs_peer : res_pairs, (int) np, tp1->ver.stream());
+                        if (tp1->d_res_peer != nullptr && res_pairs_self != nullptr)
+                            strata::kernels::res_patch(tp1->d_res_peer, res_pairs_self, (int) np, tp1->ver.stream());
                         r = cudaGetLastError();
                     }
                     for (size_t k = 0; k < stages.size() && r == cudaSuccess; ++k) {
@@ -23886,6 +23969,8 @@ int main(int argc, char** argv) {
             if (tp1 && tp1->d_res != nullptr) {
                 const strata::core::OnDevice on1(tp1->dev);
                 cudaMemcpy(tp1->d_res, tp1->host_res.data(), tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                if (tp1->d_res_peer != nullptr)
+                    cudaMemcpy(tp1->d_res_peer, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
                 cudaStreamSynchronize(nullptr);
             }
         };

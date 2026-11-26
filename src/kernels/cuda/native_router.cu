@@ -471,7 +471,8 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
         const int32_t* __restrict__ res0, const int32_t* __restrict__ res1,
         int32_t* __restrict__ ids_out, uint32_t* __restrict__ seq, uint32_t ring,
         const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
-        int32_t* __restrict__ pl, long long capx, uint32_t* __restrict__ skip) {
+        int32_t* __restrict__ pl, long long capx, uint32_t* __restrict__ skip,
+        const unsigned long long* __restrict__ host_blobs, int layer_idx, int miss_frac256) {
     constexpr int n_out = 512;
     const int t = threadIdx.x;
     const int warp = t >> 5, lane = t & 31;
@@ -638,26 +639,43 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
         if (t == 0) *done_ctr = 0u;
     }
     if (pl != nullptr) {
+        auto takes_miss = [layer_idx, miss_frac256](int32_t e) -> bool {
+            if (miss_frac256 <= 0) return false;
+            if (miss_frac256 >= 256) return true;
+            const uint32_t h = (uint32_t) (layer_idx * 512 + e) * 2654435761u;
+            return (int) (h >> 24) < miss_frac256;
+        };
         if (n_ent <= 32) {
             if (warp == 0) {
-                int32_t eid = -1, slot = -1; bool hit1 = false;
+                int32_t eid = -1, slot = -1; bool hit1 = false; unsigned long long hblob = 0ull;
                 if (lane < n_ent) {
                     eid = s_ids[lane];
-                    if (eid >= 0 && eid < 512) { slot = res0[eid]; if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true; }
+                    if (eid >= 0 && eid < 512) {
+                        slot = res0[eid];
+                        if (slot < 0) {
+                            if constexpr (BELL) {
+                                if (res1 != nullptr && (res1[eid] >= 0 || takes_miss(eid))) hit1 = true;
+                            } else {
+                                if (host_blobs != nullptr && res1 != nullptr && res1[eid] < 0 && takes_miss(eid))
+                                    hblob = host_blobs[eid];
+                            }
+                        }
+                    }
                 }
+                const bool is_mine = (lane < n_ent && (slot >= 0 || hblob != 0ull));
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
-                const int32_t key = (lane < n_ent && slot >= 0) ? eid : (-2 - lane);
+                const int32_t key = is_mine ? eid : (-2 - lane);
                 const uint32_t mask = __match_any_sync(0xffffffffu, key);
-                const bool act = (lane < n_ent && slot >= 0);
+                const bool act = is_mine;
                 const int first_j = act ? (__ffs((int) mask) - 1) : lane;
                 const int rank_in_group = __popc(mask & ((1u << lane) - 1u));
                 const int count_same = __popc(mask);
 #else
                 __shared__ int32_t sm32[32];
-                sm32[lane] = (lane < n_ent && slot >= 0) ? eid : -1;
+                sm32[lane] = is_mine ? eid : -1;
                 __syncwarp();
                 int first_j = lane, rank_in_group = 0, count_same = 0;
-                const bool act = (lane < n_ent && slot >= 0);
+                const bool act = is_mine;
                 if (act) for (int j = 0; j < n_ent; ++j) if (sm32[j] == eid) { if (j < first_j) first_j = j; if (j < lane) ++rank_in_group; ++count_same; }
 #endif
                 const bool is_first = act && (first_j == lane);
@@ -681,7 +699,9 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
                 int32_t* start2 = pl + ptr_off + 4 * capx;
                 if (is_first) {
                     const int g = excl & 0xffff;
-                    ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+                    ptr[g] = (slot >= 0)
+                        ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
+                        : hblob;
                     start[g] = excl >> 16;
                 }
                 if (act) { const int oi = (fj_tot >> 16) + rank_in_group; dst[oi] = lane; tok[oi] = lane / 10; }
@@ -694,20 +714,31 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
             }
         } else {
             __shared__ int32_t p_ids[160], p_excl[160], p_wsum[8], p_excl1[160], p_wsum1[8];
-            int32_t eid = -1, slot = -1; bool hit1 = false;
+            int32_t eid = -1, slot = -1; bool hit1 = false; unsigned long long hblob = 0ull;
             if (t < n_ent) {
                 eid = s_ids[t];
-                if (eid >= 0 && eid < 512) { slot = res0[eid]; if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true; }
+                if (eid >= 0 && eid < 512) {
+                    slot = res0[eid];
+                    if (slot < 0) {
+                        if constexpr (BELL) {
+                            if (res1 != nullptr && (res1[eid] >= 0 || takes_miss(eid))) hit1 = true;
+                        } else {
+                            if (host_blobs != nullptr && res1 != nullptr && res1[eid] < 0 && takes_miss(eid))
+                                hblob = host_blobs[eid];
+                        }
+                    }
+                }
             }
-            if (t < 160) p_ids[t] = (t < n_ent && slot >= 0) ? eid : -1;
+            const bool is_mine = (t < n_ent && (slot >= 0 || hblob != 0ull));
+            if (t < 160) p_ids[t] = is_mine ? eid : -1;
             __syncthreads();
             int first_j = t, rank_in_group = 0, count_same = 0;
-            if (t < n_ent && slot >= 0) {
+            if (is_mine) {
                 for (int j = 0; j < n_ent; ++j) {
                     if (p_ids[j] == eid) { if (j < first_j) first_j = j; if (j < t) ++rank_in_group; ++count_same; }
                 }
             }
-            const bool is_first = (t < n_ent && slot >= 0 && first_j == t);
+            const bool is_first = (is_mine && first_j == t);
             const int my_pack = ((is_first ? count_same : 0) << 16) | (is_first ? 1 : 0);
             const int my_h1 = (t < n_ent && hit1) ? 1 : 0;
             int pref = my_pack, pref1 = my_h1;
@@ -730,10 +761,12 @@ __global__ void __launch_bounds__(256) bf16_2560_router_mega_k(
             if (is_first) {
                 int tot = p_excl[t]; for (int w_i = 0; w_i < warp; ++w_i) tot += p_wsum[w_i];
                 const int g = tot & 0xffff;
-                ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+                ptr[g] = (slot >= 0)
+                    ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
+                    : hblob;
                 start[g] = tot >> 16;
             }
-            if (t < n_ent && slot >= 0) {
+            if (is_mine) {
                 const int fw = first_j >> 5;
                 int ft = p_excl[first_j]; for (int w_i = 0; w_i < fw; ++w_i) ft += p_wsum[w_i];
                 const int oi = (ft >> 16) + rank_in_group; dst[oi] = t; tok[oi] = t / 10;
@@ -757,11 +790,13 @@ inline void launch_router_mega(
     int32_t* ids, float* weights, const int32_t* res0, const int32_t* res1,
     int32_t* ids_out, uint32_t* seq, uint32_t ring, const uint8_t* cache_base,
     const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx,
-    uint32_t* skip, cudaStream_t st) {
+    uint32_t* skip, cudaStream_t st,
+    const unsigned long long* host_blobs, int layer_idx, int miss_frac256) {
     const unsigned nb = (unsigned) (512 / RPB + (AUX ? 1 : 0));
     bf16_2560_router_mega_k<RPB, NT, AUX, BELL><<<nb, 256, 0, st>>>(
         x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights,
-        res0, res1, ids_out, seq, ring, cache_base, slot_off, blob, pl, capx, skip);
+        res0, res1, ids_out, seq, ring, cache_base, slot_off, blob, pl, capx, skip,
+        host_blobs, layer_idx, miss_frac256);
 }
 }  // namespace
 
@@ -771,7 +806,8 @@ void native_router_fused_bf16_bell_plan(
     float* x_out, int32_t* ids, float* weights, int32_t* ids_out, uint32_t* d_seq, uint32_t ring,
     const int32_t* res_self, const int32_t* res_peer,
     const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
-    int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream) {
+    int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream,
+    const unsigned long long* host_blobs, int layer_idx, int miss_frac256) {
 #if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
     constexpr int kMegaMaxT = STRATA_VERIFY_MAX_T;
 #else
@@ -785,7 +821,7 @@ void native_router_fused_bf16_bell_plan(
         throw std::invalid_argument("native_router_fused_bf16_bell_plan: bad arguments");
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
     const bool has_aux = (w_aux != nullptr && y_aux != nullptr);
-#define STRATA_MEGA_CASE(NT) case NT: {         constexpr int RPB = (NT == 1 || NT > 8) ? 2 : 4;         if (bell) {             if (has_aux) launch_router_mega<RPB, NT, true, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);             else launch_router_mega<RPB, NT, false, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);         } else {             if (has_aux) launch_router_mega<RPB, NT, true, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);             else launch_router_mega<RPB, NT, false, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);         }     } break
+#define STRATA_MEGA_CASE(NT) case NT: {         constexpr int RPB = (NT == 1 || NT > 8) ? 2 : 4;         if (bell) {             if (has_aux) launch_router_mega<RPB, NT, true, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st, host_blobs, layer_idx, miss_frac256);             else launch_router_mega<RPB, NT, false, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st, host_blobs, layer_idx, miss_frac256);         } else {             if (has_aux) launch_router_mega<RPB, NT, true, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st, host_blobs, layer_idx, miss_frac256);             else launch_router_mega<RPB, NT, false, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st, host_blobs, layer_idx, miss_frac256);         }     } break
     switch (n_tok) {
         STRATA_MEGA_CASE(1);
         STRATA_MEGA_CASE(2);

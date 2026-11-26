@@ -32,15 +32,15 @@
     "--adapt-every",
     "1",
     "--spec",
-    "6",
+    "8",
     "--pcie-frac",
     "0",
     "--aux-cpus",
     "23,47",
     "--lookup-max-t",
-    "16",
+    "12",
     "--lookup-sizes",
-    "8,12,16",
+    "12",
     "--lookup-chain",
     "6",
     "--draft-costs",
@@ -60,7 +60,13 @@
     "--mtp-draft-vocab",
     "/path/to/dflash2/draft_vocab.bin",
     "--draft-conf",
-    "0.35"
+    "0.50"
+  ],
+  "user_args": [
+    "--spec",
+    "8",
+    "--draft-conf",
+    "0.50"
   ],
   "cwd": "/path/to/strata-runtime",
   "tokenizer": "/path/to/packs/unsloth-ud-q4_k_xl/tokenizer",
@@ -122,7 +128,12 @@
     "STRATA_DF2_LOOKUP_SKIP": "6",
     "STRATA_SUFFIX_CACHE": "1",
     "STRATA_PREFILL_PREWARM": "1",
-    "STRATA_Q8_TC": "1"
+    "STRATA_Q8_TC": "1",
+    "STRATA_DF2_HEAD_Q4": "1",
+    "STRATA_TP2_GPU1_SPARSE_COMBINE": "1",
+    "STRATA_TP2_EXPERT_SPLIT": "48:52",
+    "STRATA_TP_FUSE_MOE_PUSH": "0",
+    "STRATA_TP2_GPU1_MISS_256": "0"
   },
   "gpu": [
     0,

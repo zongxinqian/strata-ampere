@@ -78,6 +78,7 @@ __global__ void tp_allreduce_kernel(float* __restrict__ local_buf,
         for (;;) {
             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
             if (pf >= step) break;
+            __nanosleep(64);
         }
 #elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
         __threadfence_system();
@@ -157,6 +158,7 @@ tp_allreduce_bf16_reg_kernel(float* __restrict__ local_buf,
         for (;;) {
             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
             if (pf >= step) break;
+            __nanosleep(64);
         }
 #elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
         __threadfence_system();
@@ -183,6 +185,73 @@ tp_allreduce_bf16_reg_kernel(float* __restrict__ local_buf,
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         const int i = tid + k * 1024;
+        if (i < n8) {
+            const uint4 v = pv[k];
+            __nv_bfloat162 p0, p1, p2, p3;
+            std::memcpy(&p0, &v.x, 4);
+            std::memcpy(&p1, &v.y, 4);
+            std::memcpy(&p2, &v.z, 4);
+            std::memcpy(&p3, &v.w, 4);
+            const float2 f0 = __bfloat1622float2(p0);
+            const float2 f1 = __bfloat1622float2(p1);
+            const float2 f2 = __bfloat1622float2(p2);
+            const float2 f3 = __bfloat1622float2(p3);
+            float4 a = ra[k];
+            float4 b = rb[k];
+            a.x += f0.x; a.y += f0.y; a.z += f1.x; a.w += f1.y;
+            b.x += f2.x; b.y += f2.y; b.z += f3.x; b.w += f3.y;
+            l4[2 * i] = a;
+            l4[2 * i + 1] = b;
+        }
+    }
+}
+
+// Fused-epilogue companion: local_buf was already pushed to peer BAR1 + flagged by combine epilogue.
+// Waits on local VRAM flag (with Ampere nanosleep), then reads peer BF16 from local VRAM and adds into local_buf.
+template <int K>
+__global__ void __launch_bounds__(1024, 1)
+tp_allreduce_wait_add_bf16_kernel(float* __restrict__ local_buf,
+                                  const float* __restrict__ peer_map_base,
+                                  volatile uint32_t* __restrict__ peer_flag,
+                                  int n_elems,
+                                  size_t slot_floats,
+                                  uint32_t step) {
+    const int tid = threadIdx.x;
+    const size_t slot_off = (size_t) (step & (TpComm::kRingSlots - 1u)) * slot_floats;
+    const float* peer_map = peer_map_base + slot_off;
+    const int n8 = n_elems >> 3;
+    float4* l4 = reinterpret_cast<float4*>(local_buf);
+    const uint4* p4 = reinterpret_cast<const uint4*>(peer_map);
+
+    if (tid == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+            if (pf >= step) break;
+            __nanosleep(64);
+        }
+#else
+        while (*peer_flag < step) {}
+        __threadfence_system();
+#endif
+    }
+    __syncthreads();
+
+    uint4 pv[K];
+    float4 ra[K], rb[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = tid + k * blockDim.x;
+        if (i < n8) {
+            pv[k] = load_cv_u4(p4 + i);
+            ra[k] = l4[2 * i];
+            rb[k] = l4[2 * i + 1];
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = tid + k * blockDim.x;
         if (i < n8) {
             const uint4 v = pv[k];
             __nv_bfloat162 p0, p1, p2, p3;
@@ -253,6 +322,7 @@ __global__ void tp_allreduce_bf16_kernel(float* __restrict__ local_buf,
         for (;;) {
             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
             if (pf >= step) break;
+            __nanosleep(64);
         }
 #elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
         __threadfence_system();
@@ -341,6 +411,7 @@ tp_allreduce_fp16_reg_kernel(float* __restrict__ local_buf,
         for (;;) {
             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
             if (pf >= step) break;
+            __nanosleep(64);
         }
 #else
         *my_flag = step;
@@ -419,6 +490,7 @@ __global__ void tp_allreduce_fp16_kernel(float* __restrict__ local_buf,
         for (;;) {
             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
             if (pf >= step) break;
+            __nanosleep(64);
         }
 #elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
         __threadfence_system();
@@ -915,6 +987,7 @@ void TpComm::release_pipe() {
             d_p2p_flag_[r] = nullptr;
             d_p2p_tx_[r][0] = nullptr;
             d_p2p_tx_[r][1] = nullptr;
+            if (d_done_ctr_[r]) { cudaFree(d_done_ctr_[r]); d_done_ctr_[r] = nullptr; }
         } else {
             if (d_dec_buf_[r] != nullptr) {
                 cudaFree(d_dec_buf_[r]);
@@ -1131,6 +1204,15 @@ bool TpComm::init(int dev0, int dev1, size_t max_floats, std::string& err) {
                 p2p_ = true;
                 const char* pdec = std::getenv("STRATA_TP_AR_P2P_DECODE");
                 p2p_dec_ = (pdec == nullptr || std::atoi(pdec) != 0);
+                for (int r = 0; r < 2; ++r) {
+                    cudaSetDevice(dev_[r]);
+                    if (cudaMalloc((void**) &d_done_ctr_[r], 64) == cudaSuccess) {
+                        (void) cudaMemset(d_done_ctr_[r], 0, 64);
+                    } else {
+                        (void) cudaGetLastError();
+                        d_done_ctr_[r] = nullptr;
+                    }
+                }
             } else {
                 (void) cudaGetLastError();
                 if (p2p_vmm_) {
@@ -1150,6 +1232,7 @@ bool TpComm::init(int dev0, int dev1, size_t max_floats, std::string& err) {
                         cudaSetDevice(dev_[r]);
                         if (d_dec_buf_[r]) { cudaFree(d_dec_buf_[r]); d_dec_buf_[r] = nullptr; }
                         if (d_p2p_flag_[r]) { cudaFree(d_p2p_flag_[r]); d_p2p_flag_[r] = nullptr; }
+            if (d_done_ctr_[r]) { cudaFree(d_done_ctr_[r]); d_done_ctr_[r] = nullptr; }
                         for (int b = 0; b < 2; ++b) {
                             if (d_p2p_tx_[r][b]) { cudaFree(d_p2p_tx_[r][b]); d_p2p_tx_[r][b] = nullptr; }
                         }
@@ -1250,7 +1333,8 @@ void TpComm::allreduce_add(float* local_buf, int n_elems, uint32_t step, int ran
             }
         } else {
             if (n8 <= 1024) {
-                tp_allreduce_bf16_reg_kernel<1><<<1, 1024, 0, (cudaStream_t) stream>>>(
+                const int nth = ((n8 + 31) & ~31);
+                tp_allreduce_bf16_reg_kernel<1><<<1, nth > 0 ? nth : 32, 0, (cudaStream_t) stream>>>(
                     local_buf, my_base, peer_base, my_flag, peer_flag, n_elems, s_floats, step);
             } else if (n8 <= 2048) {
                 tp_allreduce_bf16_reg_kernel<2><<<1, 1024, 0, (cudaStream_t) stream>>>(
@@ -1272,6 +1356,52 @@ void TpComm::allreduce_add(float* local_buf, int n_elems, uint32_t step, int ran
     tp_allreduce_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(
         local_buf, my_base, peer_base,
         my_flag, peer_flag, n_elems, s_floats, step);
+}
+
+bool TpComm::p2p_push_target(int n_elems, uint32_t step, int rank, P2pPushTarget& out) const {
+    static const int dec_mode = [] {
+        const char* d = std::getenv("STRATA_TP_AR_DECODE");
+        const char* v = (d != nullptr && d[0] != '\0') ? d : std::getenv("STRATA_TP_AR_MODE");
+        if (v == nullptr) return 1;
+        if (std::strcmp(v, "fp32") == 0 || std::strcmp(v, "0") == 0) return 0;
+        if (std::strcmp(v, "fp16") == 0 || std::strcmp(v, "half") == 0) return 2;
+        return 1;
+    }();
+    if (!p2p_dec_ || dec_mode != 1 || (n_elems & 7) != 0 ||
+        (size_t) n_elems > kP2pDecSlotFloats ||
+        d_dec_buf_[1 - rank] == nullptr || d_p2p_flag_[0] == nullptr ||
+        d_p2p_flag_[1] == nullptr || d_done_ctr_[rank] == nullptr)
+        return false;
+    const size_t slot_off = (size_t) (step & (kRingSlots - 1u)) * kP2pDecSlotFloats;
+    out.peer_slot_buf = d_dec_buf_[1 - rank] + slot_off;
+    out.peer_flag = d_p2p_flag_[1 - rank];
+    out.done_ctr = d_done_ctr_[rank];
+    out.step = step;
+    return true;
+}
+
+void TpComm::allreduce_wait_add_bf16(float* local_buf, int n_elems, uint32_t step, int rank, void* stream) {
+    const int n8 = n_elems >> 3;
+    const float* peer_base = d_dec_buf_[rank];
+    volatile uint32_t* peer_flag = d_p2p_flag_[rank];
+    const size_t s_floats = kP2pDecSlotFloats;
+    if (n8 <= 1024) {
+        const int nth = ((n8 + 31) & ~31);
+        tp_allreduce_wait_add_bf16_kernel<1><<<1, nth > 0 ? nth : 32, 0, (cudaStream_t) stream>>>(
+            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
+    } else if (n8 <= 2048) {
+        tp_allreduce_wait_add_bf16_kernel<2><<<1, 1024, 0, (cudaStream_t) stream>>>(
+            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
+    } else if (n8 <= 3072) {
+        tp_allreduce_wait_add_bf16_kernel<3><<<1, 1024, 0, (cudaStream_t) stream>>>(
+            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
+    } else if (n8 <= 5120) {
+        tp_allreduce_wait_add_bf16_kernel<5><<<1, 1024, 0, (cudaStream_t) stream>>>(
+            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
+    } else {
+        tp_allreduce_wait_add_bf16_kernel<8><<<1, 1024, 0, (cudaStream_t) stream>>>(
+            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
+    }
 }
 
 void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream) {

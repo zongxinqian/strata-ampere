@@ -23,7 +23,9 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/geometry.hpp"
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstring>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -164,6 +166,173 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
     const float gval = GATED ? __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk))) : 1.0f;
     output4[c4] = add_shared_maybe_gated(sum, sh, GATED, gval);
 }
+template<bool GATED = false>
+__global__ void combine_k10_vec4_sparse_hits(const float4* __restrict__ hits4,
+                                             const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                                             const float* __restrict__ weights, const float4* __restrict__ shared4,
+                                             float4* __restrict__ output4, int64_t n4, const float* __restrict__ sg = nullptr) {
+    const int64_t tk = blockIdx.y;
+    __shared__ int hit_mask;
+    if (threadIdx.x == 0) hit_mask = 0;
+    __syncthreads();
+    const int nh = *count;
+    for (int h = threadIdx.x; h < nh; h += blockDim.x) {
+        const int r = dst[h];
+        if (r / KU == (int) tk) atomicOr(&hit_mask, 1 << (r % KU));
+    }
+    __syncthreads();
+    const int mask = hit_mask;
+    hits4 += tk * KU * n4;
+    weights += tk * KU;
+    shared4 += tk * n4;
+    output4 += tk * n4;
+    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c4 >= n4) return;
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (mask != 0) {
+#pragma unroll
+        for (int expert = 0; expert < KU; ++expert) {
+            if ((mask >> expert) & 1) {
+                const float w = __ldg(weights + expert);
+                const float4 hh = hits4[int64_t(expert) * n4 + c4];
+                sum.x = fmaf(hh.x, w, sum.x);
+                sum.y = fmaf(hh.y, w, sum.y);
+                sum.z = fmaf(hh.z, w, sum.z);
+                sum.w = fmaf(hh.w, w, sum.w);
+            }
+        }
+    }
+    const float4 sh = shared4[c4];
+    const float gval = GATED ? __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk))) : 1.0f;
+    output4[c4] = add_shared_maybe_gated(sum, sh, GATED, gval);
+}
+__device__ __forceinline__ void moe_store_wt_u4(uint4* p, uint4 v) {
+#if defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+    asm volatile("st.global.wt.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+#else
+    *p = v;
+#endif
+}
+
+__device__ __forceinline__ void moe_push_bf16_pair(uint4* peer_u4, float4 a, float4 b) {
+    const __nv_bfloat162 p0 = __floats2bfloat162_rn(a.x, a.y);
+    const __nv_bfloat162 p1 = __floats2bfloat162_rn(a.z, a.w);
+    const __nv_bfloat162 p2 = __floats2bfloat162_rn(b.x, b.y);
+    const __nv_bfloat162 p3 = __floats2bfloat162_rn(b.z, b.w);
+    uint4 v;
+    std::memcpy(&v.x, &p0, 4);
+    std::memcpy(&v.y, &p1, 4);
+    std::memcpy(&v.z, &p2, 4);
+    std::memcpy(&v.w, &p3, 4);
+    moe_store_wt_u4(peer_u4, v);
+}
+
+__device__ __forceinline__ void moe_push_finish_block(volatile uint32_t* peer_flag, uint32_t* done_ctr, uint32_t step) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        const uint32_t total = gridDim.x * gridDim.y;
+        if (atomicAdd(done_ctr, 1u) + 1u == total) {
+            *done_ctr = 0u;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(peer_flag), "r"(step) : "memory");
+#else
+            *peer_flag = step;
+            __threadfence_system();
+#endif
+        }
+    }
+}
+
+template<bool GATED, bool SPARSE_ONLY>
+__global__ void combine_k10_vec8_push(const float4* __restrict__ parts4, const float4* __restrict__ hits4,
+                                      const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                                      const float* __restrict__ weights, const float4* __restrict__ shared4,
+                                      float4* __restrict__ output4, uint4* __restrict__ peer_u4,
+                                      volatile uint32_t* __restrict__ peer_flag, uint32_t* __restrict__ done_ctr,
+                                      uint32_t step, int64_t n4, const float* __restrict__ sg) {
+    const int64_t tk = blockIdx.y;
+    __shared__ int hit_mask;
+    if (threadIdx.x == 0) hit_mask = 0;
+    __syncthreads();
+    const int nh = *count;
+    for (int h = threadIdx.x; h < nh; h += blockDim.x) {
+        const int r = dst[h];
+        if (r / KU == (int) tk) atomicOr(&hit_mask, 1 << (r % KU));
+    }
+    __syncthreads();
+    const int mask = hit_mask;
+    const int64_t n8 = n4 >> 1;
+    const int64_t c8 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c8 < n8) {
+        const int64_t c4a = c8 * 2;
+        const int64_t c4b = c4a + 1;
+        if constexpr (!SPARSE_ONLY) parts4 += tk * KU * n4;
+        hits4 += tk * KU * n4;
+        weights += tk * KU;
+        shared4 += tk * n4;
+        output4 += tk * n4;
+        peer_u4 += tk * n8;
+
+        float4 sa, sb;
+        if constexpr (SPARSE_ONLY) {
+            sa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            sb = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (mask != 0) {
+#pragma unroll
+                for (int expert = 0; expert < KU; ++expert) {
+                    if ((mask >> expert) & 1) {
+                        const float w = __ldg(weights + expert);
+                        const float4 ha = hits4[int64_t(expert) * n4 + c4a];
+                        const float4 hb = hits4[int64_t(expert) * n4 + c4b];
+                        sa.x = fmaf(ha.x, w, sa.x); sa.y = fmaf(ha.y, w, sa.y);
+                        sa.z = fmaf(ha.z, w, sa.z); sa.w = fmaf(ha.w, w, sa.w);
+                        sb.x = fmaf(hb.x, w, sb.x); sb.y = fmaf(hb.y, w, sb.y);
+                        sb.z = fmaf(hb.z, w, sb.z); sb.w = fmaf(hb.w, w, sb.w);
+                    }
+                }
+            }
+        } else {
+            const float w0 = __ldg(weights + 0);
+            float4 pa = parts4[c4a], pb = parts4[c4b];
+            if (mask & 1) {
+                const float4 ha = hits4[c4a], hb = hits4[c4b];
+                pa.x += ha.x; pa.y += ha.y; pa.z += ha.z; pa.w += ha.w;
+                pb.x += hb.x; pb.y += hb.y; pb.z += hb.z; pb.w += hb.w;
+            }
+            sa = make_float4(pa.x * w0, pa.y * w0, pa.z * w0, pa.w * w0);
+            sb = make_float4(pb.x * w0, pb.y * w0, pb.z * w0, pb.w * w0);
+#pragma unroll
+            for (int expert = 1; expert < KU; ++expert) {
+                const float w = __ldg(weights + expert);
+                float4 p_a = parts4[int64_t(expert) * n4 + c4a];
+                float4 p_b = parts4[int64_t(expert) * n4 + c4b];
+                if ((mask >> expert) & 1) {
+                    const float4 ha = hits4[int64_t(expert) * n4 + c4a];
+                    const float4 hb = hits4[int64_t(expert) * n4 + c4b];
+                    p_a.x += ha.x; p_a.y += ha.y; p_a.z += ha.z; p_a.w += ha.w;
+                    p_b.x += hb.x; p_b.y += hb.y; p_b.z += hb.z; p_b.w += hb.w;
+                }
+                sa.x = fmaf(p_a.x, w, sa.x); sa.y = fmaf(p_a.y, w, sa.y);
+                sa.z = fmaf(p_a.z, w, sa.z); sa.w = fmaf(p_a.w, w, sa.w);
+                sb.x = fmaf(p_b.x, w, sb.x); sb.y = fmaf(p_b.y, w, sb.y);
+                sb.z = fmaf(p_b.z, w, sb.z); sb.w = fmaf(p_b.w, w, sb.w);
+            }
+        }
+        const float4 sha = shared4[c4a], shb = shared4[c4b];
+        const float gval = GATED ? __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk))) : 1.0f;
+        sa = add_shared_maybe_gated(sa, sha, GATED, gval);
+        sb = add_shared_maybe_gated(sb, shb, GATED, gval);
+        output4[c4a] = sa;
+        output4[c4b] = sb;
+        moe_push_bf16_pair(peer_u4 + c8, sa, sb);
+    }
+    moe_push_finish_block(peer_flag, done_ctr, step);
+}
+
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
@@ -277,6 +446,74 @@ void native_moe_combine_multi_hits(const float* hits, const float* weights, cons
     } else {
         combine<true><<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
             hits, weights, shared, output, n_embd, int(k));
+    }
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_sparse_hits(const float* hits, const int32_t* dst, const int32_t* count,
+                                          const float* weights, const float* shared, float* output,
+                                          int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || !native_moe_combine_hits_supported(hits, shared, output, n_embd, k, n_tok))
+        throw std::invalid_argument("native MoE combine (sparse hits) requires k = 10, aligned spans, 1..maxT tokens");
+    const int64_t n4 = n_embd >> 2;
+    combine_k10_vec4_sparse_hits<false><<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const float4*>(hits), dst, count, weights,
+        reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_sparse_hits_gated(const float* hits, const int32_t* dst, const int32_t* count,
+                                                const float* weights, const float* shared, const float* shared_gate,
+                                                float* output, int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || !shared_gate || !native_moe_combine_hits_supported(hits, shared, output, n_embd, k, n_tok))
+        throw std::invalid_argument("native MoE combine (sparse hits, gated) requires k = 10, aligned spans, gate, 1..maxT tokens");
+    const int64_t n4 = n_embd >> 2;
+    combine_k10_vec4_sparse_hits<true><<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const float4*>(hits), dst, count, weights,
+        reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4, shared_gate);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_hits_added_push(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
+                                              const float* weights, const float* shared, const float* shared_gate,
+                                              float* output, float* peer_slot_buf, volatile uint32_t* peer_flag,
+                                              uint32_t* done_ctr, uint32_t step, int64_t n_embd, int64_t k,
+                                              int n_tok, void* stream) {
+    const int64_t n4 = n_embd >> 2;
+    const int64_t n8 = n4 >> 1;
+    const dim3 grid(unsigned((n8 + 127) / 128), (unsigned) n_tok);
+    if (shared_gate != nullptr) {
+        combine_k10_vec8_push<true, false><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+            reinterpret_cast<const float4*>(parts), reinterpret_cast<const float4*>(hits), dst, count, weights,
+            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output),
+            reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step, n4, shared_gate);
+    } else {
+        combine_k10_vec8_push<false, false><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+            reinterpret_cast<const float4*>(parts), reinterpret_cast<const float4*>(hits), dst, count, weights,
+            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output),
+            reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step, n4, nullptr);
+    }
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_sparse_hits_push(const float* hits, const int32_t* dst, const int32_t* count,
+                                               const float* weights, const float* shared, const float* shared_gate,
+                                               float* output, float* peer_slot_buf, volatile uint32_t* peer_flag,
+                                               uint32_t* done_ctr, uint32_t step, int64_t n_embd, int64_t k,
+                                               int n_tok, void* stream) {
+    const int64_t n4 = n_embd >> 2;
+    const int64_t n8 = n4 >> 1;
+    const dim3 grid(unsigned((n8 + 127) / 128), (unsigned) n_tok);
+    if (shared_gate != nullptr) {
+        combine_k10_vec8_push<true, true><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+            nullptr, reinterpret_cast<const float4*>(hits), dst, count, weights,
+            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output),
+            reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step, n4, shared_gate);
+    } else {
+        combine_k10_vec8_push<false, true><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+            nullptr, reinterpret_cast<const float4*>(hits), dst, count, weights,
+            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output),
+            reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step, n4, nullptr);
     }
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

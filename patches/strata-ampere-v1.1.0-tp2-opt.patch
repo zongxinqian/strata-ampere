@@ -1,0 +1,1274 @@
+--- a/include/strata/kernels/native_moe.hpp
++++ b/include/strata/kernels/native_moe.hpp
+@@ -37,4 +37,22 @@
+ void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,
+                                          const float* shared_gate, float* output, int64_t n_embd, int64_t k, int n_tok,
+                                          void* stream);
++/// TP2 GPU1 sparse-hit combine: reads ONLY hit rows listed in dst[0, *count) without zero-filling parts.
++void native_moe_combine_multi_sparse_hits(const float* hits, const int32_t* dst, const int32_t* count,
++                                          const float* weights, const float* shared, float* output,
++                                          int64_t n_embd, int64_t k, int n_tok, void* stream);
++void native_moe_combine_multi_sparse_hits_gated(const float* hits, const int32_t* dst, const int32_t* count,
++                                                const float* weights, const float* shared, const float* shared_gate,
++                                                float* output, int64_t n_embd, int64_t k, int n_tok, void* stream);
++/// Fused Combine + P2P BF16 Push epilogue (bit-exact with combine + tp_allreduce_bf16_reg_kernel push phase).
++void native_moe_combine_multi_hits_added_push(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
++                                              const float* weights, const float* shared, const float* shared_gate,
++                                              float* output, float* peer_slot_buf, volatile uint32_t* peer_flag,
++                                              uint32_t* done_ctr, uint32_t step, int64_t n_embd, int64_t k,
++                                              int n_tok, void* stream);
++void native_moe_combine_multi_sparse_hits_push(const float* hits, const int32_t* dst, const int32_t* count,
++                                               const float* weights, const float* shared, const float* shared_gate,
++                                               float* output, float* peer_slot_buf, volatile uint32_t* peer_flag,
++                                               uint32_t* done_ctr, uint32_t step, int64_t n_embd, int64_t k,
++                                               int n_tok, void* stream);
+ }
+--- a/src/kernels/cuda/native_moe.cu
++++ b/src/kernels/cuda/native_moe.cu
+@@ -23,7 +23,9 @@
+ #include "strata/kernels/native_moe.hpp"
+ #include "strata/kernels/verify_kernels.hpp"
+ #include "strata/core/geometry.hpp"
++#include <cuda_bf16.h>
+ #include <cuda_runtime.h>
++#include <cstring>
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+@@ -164,6 +166,173 @@
+     const float gval = GATED ? __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk))) : 1.0f;
+     output4[c4] = add_shared_maybe_gated(sum, sh, GATED, gval);
+ }
++template<bool GATED = false>
++__global__ void combine_k10_vec4_sparse_hits(const float4* __restrict__ hits4,
++                                             const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
++                                             const float* __restrict__ weights, const float4* __restrict__ shared4,
++                                             float4* __restrict__ output4, int64_t n4, const float* __restrict__ sg = nullptr) {
++    const int64_t tk = blockIdx.y;
++    __shared__ int hit_mask;
++    if (threadIdx.x == 0) hit_mask = 0;
++    __syncthreads();
++    const int nh = *count;
++    for (int h = threadIdx.x; h < nh; h += blockDim.x) {
++        const int r = dst[h];
++        if (r / KU == (int) tk) atomicOr(&hit_mask, 1 << (r % KU));
++    }
++    __syncthreads();
++    const int mask = hit_mask;
++    hits4 += tk * KU * n4;
++    weights += tk * KU;
++    shared4 += tk * n4;
++    output4 += tk * n4;
++    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (c4 >= n4) return;
++    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    if (mask != 0) {
++#pragma unroll
++        for (int expert = 0; expert < KU; ++expert) {
++            if ((mask >> expert) & 1) {
++                const float w = __ldg(weights + expert);
++                const float4 hh = hits4[int64_t(expert) * n4 + c4];
++                sum.x = fmaf(hh.x, w, sum.x);
++                sum.y = fmaf(hh.y, w, sum.y);
++                sum.z = fmaf(hh.z, w, sum.z);
++                sum.w = fmaf(hh.w, w, sum.w);
++            }
++        }
++    }
++    const float4 sh = shared4[c4];
++    const float gval = GATED ? __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk))) : 1.0f;
++    output4[c4] = add_shared_maybe_gated(sum, sh, GATED, gval);
++}
++__device__ __forceinline__ void moe_store_wt_u4(uint4* p, uint4 v) {
++#if defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
++    asm volatile("st.global.wt.v4.u32 [%0], {%1, %2, %3, %4};"
++                 :
++                 : "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
++                 : "memory");
++#else
++    *p = v;
++#endif
++}
++
++__device__ __forceinline__ void moe_push_bf16_pair(uint4* peer_u4, float4 a, float4 b) {
++    const __nv_bfloat162 p0 = __floats2bfloat162_rn(a.x, a.y);
++    const __nv_bfloat162 p1 = __floats2bfloat162_rn(a.z, a.w);
++    const __nv_bfloat162 p2 = __floats2bfloat162_rn(b.x, b.y);
++    const __nv_bfloat162 p3 = __floats2bfloat162_rn(b.z, b.w);
++    uint4 v;
++    std::memcpy(&v.x, &p0, 4);
++    std::memcpy(&v.y, &p1, 4);
++    std::memcpy(&v.z, &p2, 4);
++    std::memcpy(&v.w, &p3, 4);
++    moe_store_wt_u4(peer_u4, v);
++}
++
++__device__ __forceinline__ void moe_push_finish_block(volatile uint32_t* peer_flag, uint32_t* done_ctr, uint32_t step) {
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        __threadfence_system();
++        const uint32_t total = gridDim.x * gridDim.y;
++        if (atomicAdd(done_ctr, 1u) + 1u == total) {
++            *done_ctr = 0u;
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
++            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(peer_flag), "r"(step) : "memory");
++#else
++            *peer_flag = step;
++            __threadfence_system();
++#endif
++        }
++    }
++}
++
++template<bool GATED, bool SPARSE_ONLY>
++__global__ void combine_k10_vec8_push(const float4* __restrict__ parts4, const float4* __restrict__ hits4,
++                                      const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
++                                      const float* __restrict__ weights, const float4* __restrict__ shared4,
++                                      float4* __restrict__ output4, uint4* __restrict__ peer_u4,
++                                      volatile uint32_t* __restrict__ peer_flag, uint32_t* __restrict__ done_ctr,
++                                      uint32_t step, int64_t n4, const float* __restrict__ sg) {
++    const int64_t tk = blockIdx.y;
++    __shared__ int hit_mask;
++    if (threadIdx.x == 0) hit_mask = 0;
++    __syncthreads();
++    const int nh = *count;
++    for (int h = threadIdx.x; h < nh; h += blockDim.x) {
++        const int r = dst[h];
++        if (r / KU == (int) tk) atomicOr(&hit_mask, 1 << (r % KU));
++    }
++    __syncthreads();
++    const int mask = hit_mask;
++    const int64_t n8 = n4 >> 1;
++    const int64_t c8 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (c8 < n8) {
++        const int64_t c4a = c8 * 2;
++        const int64_t c4b = c4a + 1;
++        if constexpr (!SPARSE_ONLY) parts4 += tk * KU * n4;
++        hits4 += tk * KU * n4;
++        weights += tk * KU;
++        shared4 += tk * n4;
++        output4 += tk * n4;
++        peer_u4 += tk * n8;
++
++        float4 sa, sb;
++        if constexpr (SPARSE_ONLY) {
++            sa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            sb = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            if (mask != 0) {
++#pragma unroll
++                for (int expert = 0; expert < KU; ++expert) {
++                    if ((mask >> expert) & 1) {
++                        const float w = __ldg(weights + expert);
++                        const float4 ha = hits4[int64_t(expert) * n4 + c4a];
++                        const float4 hb = hits4[int64_t(expert) * n4 + c4b];
++                        sa.x = fmaf(ha.x, w, sa.x); sa.y = fmaf(ha.y, w, sa.y);
++                        sa.z = fmaf(ha.z, w, sa.z); sa.w = fmaf(ha.w, w, sa.w);
++                        sb.x = fmaf(hb.x, w, sb.x); sb.y = fmaf(hb.y, w, sb.y);
++                        sb.z = fmaf(hb.z, w, sb.z); sb.w = fmaf(hb.w, w, sb.w);
++                    }
++                }
++            }
++        } else {
++            const float w0 = __ldg(weights + 0);
++            float4 pa = parts4[c4a], pb = parts4[c4b];
++            if (mask & 1) {
++                const float4 ha = hits4[c4a], hb = hits4[c4b];
++                pa.x += ha.x; pa.y += ha.y; pa.z += ha.z; pa.w += ha.w;
++                pb.x += hb.x; pb.y += hb.y; pb.z += hb.z; pb.w += hb.w;
++            }
++            sa = make_float4(pa.x * w0, pa.y * w0, pa.z * w0, pa.w * w0);
++            sb = make_float4(pb.x * w0, pb.y * w0, pb.z * w0, pb.w * w0);
++#pragma unroll
++            for (int expert = 1; expert < KU; ++expert) {
++                const float w = __ldg(weights + expert);
++                float4 p_a = parts4[int64_t(expert) * n4 + c4a];
++                float4 p_b = parts4[int64_t(expert) * n4 + c4b];
++                if ((mask >> expert) & 1) {
++                    const float4 ha = hits4[int64_t(expert) * n4 + c4a];
++                    const float4 hb = hits4[int64_t(expert) * n4 + c4b];
++                    p_a.x += ha.x; p_a.y += ha.y; p_a.z += ha.z; p_a.w += ha.w;
++                    p_b.x += hb.x; p_b.y += hb.y; p_b.z += hb.z; p_b.w += hb.w;
++                }
++                sa.x = fmaf(p_a.x, w, sa.x); sa.y = fmaf(p_a.y, w, sa.y);
++                sa.z = fmaf(p_a.z, w, sa.z); sa.w = fmaf(p_a.w, w, sa.w);
++                sb.x = fmaf(p_b.x, w, sb.x); sb.y = fmaf(p_b.y, w, sb.y);
++                sb.z = fmaf(p_b.z, w, sb.z); sb.w = fmaf(p_b.w, w, sb.w);
++            }
++        }
++        const float4 sha = shared4[c4a], shb = shared4[c4b];
++        const float gval = GATED ? __fdividef(1.0f, 1.0f + __expf(-__ldg(sg + tk))) : 1.0f;
++        sa = add_shared_maybe_gated(sa, sha, GATED, gval);
++        sb = add_shared_maybe_gated(sb, shb, GATED, gval);
++        output4[c4a] = sa;
++        output4[c4b] = sb;
++        moe_push_bf16_pair(peer_u4 + c8, sa, sb);
++    }
++    moe_push_finish_block(peer_flag, done_ctr, step);
++}
++
+ bool valid_span(const void* p, size_t bytes) {
+     const auto address = reinterpret_cast<uintptr_t>(p);
+     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
+@@ -280,5 +449,73 @@
+     }
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++}
++void native_moe_combine_multi_sparse_hits(const float* hits, const int32_t* dst, const int32_t* count,
++                                          const float* weights, const float* shared, float* output,
++                                          int64_t n_embd, int64_t k, int n_tok, void* stream) {
++    if (!stream || !native_moe_combine_hits_supported(hits, shared, output, n_embd, k, n_tok))
++        throw std::invalid_argument("native MoE combine (sparse hits) requires k = 10, aligned spans, 1..maxT tokens");
++    const int64_t n4 = n_embd >> 2;
++    combine_k10_vec4_sparse_hits<false><<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
++        reinterpret_cast<const float4*>(hits), dst, count, weights,
++        reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4);
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++}
++void native_moe_combine_multi_sparse_hits_gated(const float* hits, const int32_t* dst, const int32_t* count,
++                                                const float* weights, const float* shared, const float* shared_gate,
++                                                float* output, int64_t n_embd, int64_t k, int n_tok, void* stream) {
++    if (!stream || !shared_gate || !native_moe_combine_hits_supported(hits, shared, output, n_embd, k, n_tok))
++        throw std::invalid_argument("native MoE combine (sparse hits, gated) requires k = 10, aligned spans, gate, 1..maxT tokens");
++    const int64_t n4 = n_embd >> 2;
++    combine_k10_vec4_sparse_hits<true><<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
++        reinterpret_cast<const float4*>(hits), dst, count, weights,
++        reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4, shared_gate);
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++}
++void native_moe_combine_multi_hits_added_push(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
++                                              const float* weights, const float* shared, const float* shared_gate,
++                                              float* output, float* peer_slot_buf, volatile uint32_t* peer_flag,
++                                              uint32_t* done_ctr, uint32_t step, int64_t n_embd, int64_t k,
++                                              int n_tok, void* stream) {
++    const int64_t n4 = n_embd >> 2;
++    const int64_t n8 = n4 >> 1;
++    const dim3 grid(unsigned((n8 + 127) / 128), (unsigned) n_tok);
++    if (shared_gate != nullptr) {
++        combine_k10_vec8_push<true, false><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
++            reinterpret_cast<const float4*>(parts), reinterpret_cast<const float4*>(hits), dst, count, weights,
++            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output),
++            reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step, n4, shared_gate);
++    } else {
++        combine_k10_vec8_push<false, false><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
++            reinterpret_cast<const float4*>(parts), reinterpret_cast<const float4*>(hits), dst, count, weights,
++            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output),
++            reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step, n4, nullptr);
++    }
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++}
++void native_moe_combine_multi_sparse_hits_push(const float* hits, const int32_t* dst, const int32_t* count,
++                                               const float* weights, const float* shared, const float* shared_gate,
++                                               float* output, float* peer_slot_buf, volatile uint32_t* peer_flag,
++                                               uint32_t* done_ctr, uint32_t step, int64_t n_embd, int64_t k,
++                                               int n_tok, void* stream) {
++    const int64_t n4 = n_embd >> 2;
++    const int64_t n8 = n4 >> 1;
++    const dim3 grid(unsigned((n8 + 127) / 128), (unsigned) n_tok);
++    if (shared_gate != nullptr) {
++        combine_k10_vec8_push<true, true><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
++            nullptr, reinterpret_cast<const float4*>(hits), dst, count, weights,
++            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output),
++            reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step, n4, shared_gate);
++    } else {
++        combine_k10_vec8_push<false, true><<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
++            nullptr, reinterpret_cast<const float4*>(hits), dst, count, weights,
++            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output),
++            reinterpret_cast<uint4*>(peer_slot_buf), peer_flag, done_ctr, step, n4, nullptr);
++    }
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+ }
+ }
+--- a/include/strata/core/tp_comm.hpp
++++ b/include/strata/core/tp_comm.hpp
+@@ -20,7 +20,15 @@
+     bool init(int dev0, int dev1, size_t max_floats, std::string& err);
+     void release();
+     void reset(uint32_t base = 0);
++    struct P2pPushTarget {
++        float* peer_slot_buf = nullptr;
++        volatile uint32_t* peer_flag = nullptr;
++        uint32_t* done_ctr = nullptr;
++        uint32_t step = 0;
++    };
+     void allreduce_add(float* local_buf, int n_elems, uint32_t step, int rank, void* stream);
++    bool p2p_push_target(int n_elems, uint32_t step, int rank, P2pPushTarget& out) const;
++    void allreduce_wait_add_bf16(float* local_buf, int n_elems, uint32_t step, int rank, void* stream);
+     void allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream);
+     size_t max_floats() const { return max_floats_; }
+     size_t slot_floats() const { return slot_floats_; }
+@@ -42,6 +50,7 @@
+     float* d_dec_buf_[2] = {nullptr, nullptr};
+     void* d_p2p_tx_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
+     uint32_t* d_p2p_flag_[2] = {nullptr, nullptr};
++    uint32_t* d_done_ctr_[2] = {nullptr, nullptr};
+     // Optional VMM backing (selective peer BAR1 mapping without process-wide cudaDeviceEnablePeerAccess)
+     void* vmm_base_[2] = {nullptr, nullptr};
+     uint64_t vmm_handle_[2] = {0, 0};
+--- a/src/kernels/cuda/tp_comm.cu
++++ b/src/kernels/cuda/tp_comm.cu
+@@ -78,6 +78,7 @@
+         for (;;) {
+             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+             if (pf >= step) break;
++            __nanosleep(64);
+         }
+ #elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+         __threadfence_system();
+@@ -157,6 +158,7 @@
+         for (;;) {
+             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+             if (pf >= step) break;
++            __nanosleep(64);
+         }
+ #elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+         __threadfence_system();
+@@ -204,6 +206,73 @@
+     }
+ }
+ 
++// Fused-epilogue companion: local_buf was already pushed to peer BAR1 + flagged by combine epilogue.
++// Waits on local VRAM flag (with Ampere nanosleep), then reads peer BF16 from local VRAM and adds into local_buf.
++template <int K>
++__global__ void __launch_bounds__(1024, 1)
++tp_allreduce_wait_add_bf16_kernel(float* __restrict__ local_buf,
++                                  const float* __restrict__ peer_map_base,
++                                  volatile uint32_t* __restrict__ peer_flag,
++                                  int n_elems,
++                                  size_t slot_floats,
++                                  uint32_t step) {
++    const int tid = threadIdx.x;
++    const size_t slot_off = (size_t) (step & (TpComm::kRingSlots - 1u)) * slot_floats;
++    const float* peer_map = peer_map_base + slot_off;
++    const int n8 = n_elems >> 3;
++    float4* l4 = reinterpret_cast<float4*>(local_buf);
++    const uint4* p4 = reinterpret_cast<const uint4*>(peer_map);
++
++    if (tid == 0) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
++        uint32_t pf = 0;
++        for (;;) {
++            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
++            if (pf >= step) break;
++            __nanosleep(64);
++        }
++#else
++        while (*peer_flag < step) {}
++        __threadfence_system();
++#endif
++    }
++    __syncthreads();
++
++    uint4 pv[K];
++    float4 ra[K], rb[K];
++#pragma unroll
++    for (int k = 0; k < K; ++k) {
++        const int i = tid + k * blockDim.x;
++        if (i < n8) {
++            pv[k] = load_cv_u4(p4 + i);
++            ra[k] = l4[2 * i];
++            rb[k] = l4[2 * i + 1];
++        }
++    }
++#pragma unroll
++    for (int k = 0; k < K; ++k) {
++        const int i = tid + k * blockDim.x;
++        if (i < n8) {
++            const uint4 v = pv[k];
++            __nv_bfloat162 p0, p1, p2, p3;
++            std::memcpy(&p0, &v.x, 4);
++            std::memcpy(&p1, &v.y, 4);
++            std::memcpy(&p2, &v.z, 4);
++            std::memcpy(&p3, &v.w, 4);
++            const float2 f0 = __bfloat1622float2(p0);
++            const float2 f1 = __bfloat1622float2(p1);
++            const float2 f2 = __bfloat1622float2(p2);
++            const float2 f3 = __bfloat1622float2(p3);
++            float4 a = ra[k];
++            float4 b = rb[k];
++            a.x += f0.x; a.y += f0.y; a.z += f1.x; a.w += f1.y;
++            b.x += f2.x; b.y += f2.y; b.z += f3.x; b.w += f3.y;
++            l4[2 * i] = a;
++            l4[2 * i + 1] = b;
++        }
++    }
++}
++
+ __global__ void tp_p2p_selftest_write_kernel(uint32_t* __restrict__ remote_dst, uint32_t magic, int n) {
+     const int tid = threadIdx.x;
+     if (tid < n) {
+@@ -253,6 +322,7 @@
+         for (;;) {
+             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+             if (pf >= step) break;
++            __nanosleep(64);
+         }
+ #elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+         __threadfence_system();
+@@ -341,6 +411,7 @@
+         for (;;) {
+             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+             if (pf >= step) break;
++            __nanosleep(64);
+         }
+ #else
+         *my_flag = step;
+@@ -419,6 +490,7 @@
+         for (;;) {
+             asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(peer_flag) : "memory");
+             if (pf >= step) break;
++            __nanosleep(64);
+         }
+ #elif defined(__CUDA_ARCH__) && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+         __threadfence_system();
+@@ -915,6 +987,7 @@
+             d_p2p_flag_[r] = nullptr;
+             d_p2p_tx_[r][0] = nullptr;
+             d_p2p_tx_[r][1] = nullptr;
++            if (d_done_ctr_[r]) { cudaFree(d_done_ctr_[r]); d_done_ctr_[r] = nullptr; }
+         } else {
+             if (d_dec_buf_[r] != nullptr) {
+                 cudaFree(d_dec_buf_[r]);
+@@ -1131,6 +1204,15 @@
+                 p2p_ = true;
+                 const char* pdec = std::getenv("STRATA_TP_AR_P2P_DECODE");
+                 p2p_dec_ = (pdec == nullptr || std::atoi(pdec) != 0);
++                for (int r = 0; r < 2; ++r) {
++                    cudaSetDevice(dev_[r]);
++                    if (cudaMalloc((void**) &d_done_ctr_[r], 64) == cudaSuccess) {
++                        (void) cudaMemset(d_done_ctr_[r], 0, 64);
++                    } else {
++                        (void) cudaGetLastError();
++                        d_done_ctr_[r] = nullptr;
++                    }
++                }
+             } else {
+                 (void) cudaGetLastError();
+                 if (p2p_vmm_) {
+@@ -1150,6 +1232,7 @@
+                         cudaSetDevice(dev_[r]);
+                         if (d_dec_buf_[r]) { cudaFree(d_dec_buf_[r]); d_dec_buf_[r] = nullptr; }
+                         if (d_p2p_flag_[r]) { cudaFree(d_p2p_flag_[r]); d_p2p_flag_[r] = nullptr; }
++            if (d_done_ctr_[r]) { cudaFree(d_done_ctr_[r]); d_done_ctr_[r] = nullptr; }
+                         for (int b = 0; b < 2; ++b) {
+                             if (d_p2p_tx_[r][b]) { cudaFree(d_p2p_tx_[r][b]); d_p2p_tx_[r][b] = nullptr; }
+                         }
+@@ -1250,7 +1333,8 @@
+             }
+         } else {
+             if (n8 <= 1024) {
+-                tp_allreduce_bf16_reg_kernel<1><<<1, 1024, 0, (cudaStream_t) stream>>>(
++                const int nth = ((n8 + 31) & ~31);
++                tp_allreduce_bf16_reg_kernel<1><<<1, nth > 0 ? nth : 32, 0, (cudaStream_t) stream>>>(
+                     local_buf, my_base, peer_base, my_flag, peer_flag, n_elems, s_floats, step);
+             } else if (n8 <= 2048) {
+                 tp_allreduce_bf16_reg_kernel<2><<<1, 1024, 0, (cudaStream_t) stream>>>(
+@@ -1274,6 +1358,52 @@
+         my_flag, peer_flag, n_elems, s_floats, step);
+ }
+ 
++bool TpComm::p2p_push_target(int n_elems, uint32_t step, int rank, P2pPushTarget& out) const {
++    static const int dec_mode = [] {
++        const char* d = std::getenv("STRATA_TP_AR_DECODE");
++        const char* v = (d != nullptr && d[0] != '\0') ? d : std::getenv("STRATA_TP_AR_MODE");
++        if (v == nullptr) return 1;
++        if (std::strcmp(v, "fp32") == 0 || std::strcmp(v, "0") == 0) return 0;
++        if (std::strcmp(v, "fp16") == 0 || std::strcmp(v, "half") == 0) return 2;
++        return 1;
++    }();
++    if (!p2p_dec_ || dec_mode != 1 || (n_elems & 7) != 0 ||
++        (size_t) n_elems > kP2pDecSlotFloats ||
++        d_dec_buf_[1 - rank] == nullptr || d_p2p_flag_[0] == nullptr ||
++        d_p2p_flag_[1] == nullptr || d_done_ctr_[rank] == nullptr)
++        return false;
++    const size_t slot_off = (size_t) (step & (kRingSlots - 1u)) * kP2pDecSlotFloats;
++    out.peer_slot_buf = d_dec_buf_[1 - rank] + slot_off;
++    out.peer_flag = d_p2p_flag_[1 - rank];
++    out.done_ctr = d_done_ctr_[rank];
++    out.step = step;
++    return true;
++}
++
++void TpComm::allreduce_wait_add_bf16(float* local_buf, int n_elems, uint32_t step, int rank, void* stream) {
++    const int n8 = n_elems >> 3;
++    const float* peer_base = d_dec_buf_[rank];
++    volatile uint32_t* peer_flag = d_p2p_flag_[rank];
++    const size_t s_floats = kP2pDecSlotFloats;
++    if (n8 <= 1024) {
++        const int nth = ((n8 + 31) & ~31);
++        tp_allreduce_wait_add_bf16_kernel<1><<<1, nth > 0 ? nth : 32, 0, (cudaStream_t) stream>>>(
++            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
++    } else if (n8 <= 2048) {
++        tp_allreduce_wait_add_bf16_kernel<2><<<1, 1024, 0, (cudaStream_t) stream>>>(
++            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
++    } else if (n8 <= 3072) {
++        tp_allreduce_wait_add_bf16_kernel<3><<<1, 1024, 0, (cudaStream_t) stream>>>(
++            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
++    } else if (n8 <= 5120) {
++        tp_allreduce_wait_add_bf16_kernel<5><<<1, 1024, 0, (cudaStream_t) stream>>>(
++            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
++    } else {
++        tp_allreduce_wait_add_bf16_kernel<8><<<1, 1024, 0, (cudaStream_t) stream>>>(
++            local_buf, peer_base, peer_flag, n_elems, s_floats, step);
++    }
++}
++
+ void TpComm::allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream) {
+     if (n_elems <= 0 || slot_floats_ == 0) return;
+     // Mode: "bf16" (1), "q8" (2), "fp16"/"half" (3, hardware on sm_75+), "fp32" (0)
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -100,6 +100,9 @@
+     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
+     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
+     int64_t blob = 0;
++    const uint64_t* d_host_blobs = nullptr; ///< TP2 GPU1: [n_layers * n_expert] device ptrs into 1G-HugePage portable arena
++    int tp2_miss_256 = 0;                   ///< TP2: deterministic 0..256 fraction of missed experts offloaded to GPU1 PCIe
++    int tp2_miss_min_t = 1;                 ///< TP2: minimum token count n to enable GPU1 PCIe miss offload
+ };
+ 
+ class Verifier {
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2563,6 +2563,7 @@
+                     int32_t* const r_pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+                     const uint32_t r_ring = (uint32_t) ((l - lb_) * G + grp + 1);
+                     const bool is_rank1 = (tp_ != nullptr && tp_rank_ == 1);
++                    const int r_miss_frac = (n >= hits_.tp2_miss_min_t) ? hits_.tp2_miss_256 : 0;
+                     native_router_fused_bf16_bell_plan(
+                         mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, n,
+                         w_sgi != nullptr ? (const uint16_t*) w_sgi->data : nullptr,
+@@ -2570,10 +2571,12 @@
+                         is_rank1 ? nullptr : (m_x_ + tb * N), ids_ + tb * K, w_ + tb * K,
+                         is_rank1 ? nullptr : (m_ids_ + tb * K), is_rank1 ? nullptr : m_seq_, r_ring,
+                         is_rank1 ? (hits_.d_res + l * NE) : (hits_.d_res_self + l * NE),
+-                        is_rank1 ? nullptr : (hits_.d_res_peer + l * NE),
++                        hits_.d_res_peer != nullptr ? (hits_.d_res_peer + l * NE) : nullptr,
+                         hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                         r_pl, (long long) max_t_ * K, is_rank1 ? nullptr : (skip_ + grp),
+-                        router_ctr_, !is_rank1, cs);
++                        router_ctr_, !is_rank1, cs,
++                        (is_rank1 && hits_.d_host_blobs != nullptr) ? (const unsigned long long*) (hits_.d_host_blobs + l * NE) : nullptr,
++                        (int) l, r_miss_frac);
+                     sg_ready = (w_sgi != nullptr);
+                     tp2_planned_[grp] = true;
+                 } else {
+@@ -2825,20 +2828,34 @@
+             }
+         };
+         bool hits_in_combine = false;
++        bool tp1_sparse_combine = false;
+         const bool use_tp2_dev_plan = tp2_dev_plan_runtime();
+         if (tp_ != nullptr && tp_rank_ == 1) {
++            static const bool tp1_sparse_env = [] {
++                const char* v = std::getenv("STRATA_TP2_GPU1_SPARSE_COMBINE");
++                return v == nullptr || std::atoi(v) != 0;
++            }();
++            tp1_sparse_combine = tp1_sparse_env && !prof_on_ && dec_batch && n >= 1 &&
++                                 native_moe_combine_enabled() && n <= strata::kernels::kVerifyMaxT &&
++                                 native_moe_combine_hits_supported(parts_out, shared_ + tb * N, bo_ + tb * N, N, K, n);
+             if (use_tp2_dev_plan) {
+-                if (!tp2_planned_[grp])
+-                    tp2_resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * NE, nullptr, (int) NE,
++                if (!tp2_planned_[grp]) {
++                    const int p_miss_frac = (n >= hits_.tp2_miss_min_t) ? hits_.tp2_miss_256 : 0;
++                    tp2_resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * NE,
++                                      hits_.d_res_peer != nullptr ? (hits_.d_res_peer + l * NE) : nullptr, (int) NE,
+                                       hits_.cache_base, slot_off_d_, (long long) hits_.blob, pl, (long long) max_t_ * K,
+-                                      nullptr, 0, cs);
++                                      nullptr, 0, cs,
++                                      hits_.d_host_blobs != nullptr ? (const unsigned long long*) (hits_.d_host_blobs + l * NE) : nullptr,
++                                      (int) l, p_miss_frac);
++                }
+             } else if (fuse_wait_on() && !prof_on_ && m_bal_ == nullptr) {
+                 wait_copy_i32_from_mapped(m_flagA_, ring, pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+             } else {
+                 wait_flag_ge(m_flagA_, ring, cs);
+                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+             }
+-            cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs);
++            if (!tp1_sparse_combine)
++                cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs);
+             stamp(l, 19, grp);
+             grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
+             stamp(l, 20, grp);
+@@ -2850,10 +2867,12 @@
+         } else {
+             strata::dispatch::notef("experts layer: partial residency, plan from %ld (1 = device plan, 0 = host pool), pcie_mode=%ld, remote_opt=%ld", (long) (device_plan_ || use_tp2_dev_plan), (long) sink_.pcie_mode, (long) (remote_opt_ != nullptr));
+             if (use_tp2_dev_plan) {
+-                if (!tp2_planned_[grp])
++                if (!tp2_planned_[grp]) {
++                    const int p_miss_frac = (n >= hits_.tp2_miss_min_t) ? hits_.tp2_miss_256 : 0;
+                     tp2_resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res_self + l * NE, hits_.d_res_peer + l * NE,
+                                       (int) NE, hits_.cache_base, slot_off_d_, (long long) hits_.blob, pl, (long long) max_t_ * K,
+-                                      skip_ + grp, ring, cs);
++                                      skip_ + grp, ring, cs, nullptr, (int) l, p_miss_frac);
++                }
+             } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
+                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
+                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
+@@ -2932,15 +2951,53 @@
+             cudaStreamWaitEvent(cs, ev_join_, 0);
+         }
+         strata::dispatch::notef("combine layer: kind %ld (0 per-token, 1 multi, 2 multi+hits, 3 multi+hits gated)", (long) (sg_gated_[grp] ? 3 : hits_in_combine ? 2 : (dec_batch && n >= 1 && native_moe_combine_enabled()) ? 1 : 0));
++        static const bool fuse_moe_push_env = [] {
++            const char* v = std::getenv("STRATA_TP_FUSE_MOE_PUSH");
++            return v == nullptr || std::atoi(v) != 0;
++        }();
++        bool pushed_in_combine = false;
++        TpComm::P2pPushTarget push_tgt;
++        const bool can_fuse_push = tp_ != nullptr && !remote_opt_ && fuse_moe_push_env && (N & 7) == 0 &&
++                                   ((tp_rank_ == 1 && tp1_sparse_combine) ||
++                                    (tp_rank_ == 0 && !ar_on() && (sg_gated_[grp] || hits_in_combine))) &&
++                                   tp_->p2p_push_target((int) (n * N), tp_step + 1, tp_rank_, push_tgt);
++        if (can_fuse_push) {
++            ++tp_step;
++            try {
++                if (tp_rank_ == 1) {
++                    native_moe_combine_multi_sparse_hits_push(
++                        parts_out, p_dst, p_counts + 1, w_ + tb * K, shared_ + tb * N,
++                        sg_gated_[grp] ? (sh_g_ + tb) : nullptr, bo_ + tb * N,
++                        push_tgt.peer_slot_buf, push_tgt.peer_flag, push_tgt.done_ctr, push_tgt.step,
++                        N, K, n, cs);
++                } else {
++                    native_moe_combine_multi_hits_added_push(
++                        parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K, shared_ + tb * N,
++                        sg_gated_[grp] ? (sh_g_ + tb) : nullptr, bo_ + tb * N,
++                        push_tgt.peer_slot_buf, push_tgt.peer_flag, push_tgt.done_ctr, push_tgt.step,
++                        N, K, n, cs);
++                }
++                pushed_in_combine = true;
++            } catch (const std::exception& e) { err = "verify combine+push: " + std::string(e.what()); return false; }
++        } else
+         if (sg_gated_[grp]) {   // STRATA_LFUSE: shared expert's gate deferred into combine
+             try {
+                 if (!ar_on() && !(tp_ != nullptr && tp_rank_ == 1))
+                     native_moe_combine_multi_hits_added_gated(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1,
+                                                               w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
++                else if (tp1_sparse_combine)
++                    native_moe_combine_multi_sparse_hits_gated(parts_out, p_dst, p_counts + 1,
++                                                               w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+                 else
+                     native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+         } else
++        if (tp1_sparse_combine) {
++            try {
++                native_moe_combine_multi_sparse_hits(parts_out, p_dst, p_counts + 1,
++                                                     w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
++            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
++        } else
+         if (hits_in_combine) {
+             try {
+                 native_moe_combine_multi_hits_added(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
+@@ -2959,8 +3016,12 @@
+         }
+         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
+                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
+-        if (tp_ != nullptr)
+-            tp_->allreduce_add(bo_ + tb * N, (int) (n * N), ++tp_step, tp_rank_, cs);
++        if (tp_ != nullptr) {
++            if (pushed_in_combine)
++                tp_->allreduce_wait_add_bf16(bo_ + tb * N, (int) (n * N), tp_step, tp_rank_, cs);
++            else
++                tp_->allreduce_add(bo_ + tb * N, (int) (n * N), ++tp_step, tp_rank_, cs);
++        }
+         stamp(l, 24, grp);
+         if (tap_on_ && (!batch_rec_ || tap_batch_) && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+             // the layer's completed output: R with this FFN half's write applied (the next layer's read would fold it), the mean of
+--- a/include/strata/core/expert_source.hpp
++++ b/include/strata/core/expert_source.hpp
+@@ -621,6 +621,8 @@
+     bool tp2_dev_plan = false;             ///< GPU0 & GPU1 build their own hit plans via tp2_resident_plan
+     const uint8_t* tp_cache_base1 = nullptr;
+     const uint64_t* tp_cache_slot_off1 = nullptr;
++    int tp2_miss_256 = 0;
++    int tp2_miss_min_t = 1;
+     int pcie_num = 0;
+     PcieModel pcie_model;          ///< Verifier::set_pcie_balance: the PCIe count from measured costs
+     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -4989,12 +4989,22 @@
+         const size_t loff = (size_t) d.layers * (size_t) d.n_expert;
+         const int32_t* __restrict__ r0 = d.host_res + loff;
+         const int32_t* __restrict__ r1 = d.tp_res1 + loff;
++        const int miss_frac = (n_tok >= d.tp2_miss_min_t) ? d.tp2_miss_256 : 0;
++        auto gpu1_takes_miss = [miss_frac](int layer, int32_t eid) -> bool {
++            if (miss_frac <= 0) return false;
++            if (miss_frac >= 256) return true;
++            const uint32_t h = (uint32_t) (layer * 512 + eid) * 2654435761u;
++            return (int) (h >> 24) < miss_frac;
++        };
+         for (int64_t i = 0; i < n; ++i) {
+             const int32_t e = ids[i];
+             if (e >= 0 && e < d.n_expert) {
+                 if (r0[e] >= 0) kind[i] = 0;
+                 else if (r1[e] >= 0) kind[i] = 2;
+-                else {
++                else if (gpu1_takes_miss((int) d.layers, e)) {
++                    kind[i] = 2;
++                    if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
++                } else {
+                     kind[i] = -1;
+                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
+                 }
+--- a/include/strata/kernels/native_router.hpp
++++ b/include/strata/kernels/native_router.hpp
+@@ -38,5 +38,6 @@
+     float* x_out, int32_t* ids, float* weights, int32_t* ids_out, uint32_t* d_seq, uint32_t ring,
+     const int32_t* res_self, const int32_t* res_peer,
+     const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+-    int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream);
++    int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream,
++    const unsigned long long* host_blobs = nullptr, int layer_idx = 0, int miss_frac256 = 0);
+ }
+--- a/src/kernels/cuda/native_router.cu
++++ b/src/kernels/cuda/native_router.cu
+@@ -471,7 +471,8 @@
+         const int32_t* __restrict__ res0, const int32_t* __restrict__ res1,
+         int32_t* __restrict__ ids_out, uint32_t* __restrict__ seq, uint32_t ring,
+         const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+-        int32_t* __restrict__ pl, long long capx, uint32_t* __restrict__ skip) {
++        int32_t* __restrict__ pl, long long capx, uint32_t* __restrict__ skip,
++        const unsigned long long* __restrict__ host_blobs, int layer_idx, int miss_frac256) {
+     constexpr int n_out = 512;
+     const int t = threadIdx.x;
+     const int warp = t >> 5, lane = t & 31;
+@@ -638,26 +639,43 @@
+         if (t == 0) *done_ctr = 0u;
+     }
+     if (pl != nullptr) {
++        auto takes_miss = [layer_idx, miss_frac256](int32_t e) -> bool {
++            if (miss_frac256 <= 0) return false;
++            if (miss_frac256 >= 256) return true;
++            const uint32_t h = (uint32_t) (layer_idx * 512 + e) * 2654435761u;
++            return (int) (h >> 24) < miss_frac256;
++        };
+         if (n_ent <= 32) {
+             if (warp == 0) {
+-                int32_t eid = -1, slot = -1; bool hit1 = false;
++                int32_t eid = -1, slot = -1; bool hit1 = false; unsigned long long hblob = 0ull;
+                 if (lane < n_ent) {
+                     eid = s_ids[lane];
+-                    if (eid >= 0 && eid < 512) { slot = res0[eid]; if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true; }
++                    if (eid >= 0 && eid < 512) {
++                        slot = res0[eid];
++                        if (slot < 0) {
++                            if constexpr (BELL) {
++                                if (res1 != nullptr && (res1[eid] >= 0 || takes_miss(eid))) hit1 = true;
++                            } else {
++                                if (host_blobs != nullptr && res1 != nullptr && res1[eid] < 0 && takes_miss(eid))
++                                    hblob = host_blobs[eid];
++                            }
++                        }
++                    }
+                 }
++                const bool is_mine = (lane < n_ent && (slot >= 0 || hblob != 0ull));
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+-                const int32_t key = (lane < n_ent && slot >= 0) ? eid : (-2 - lane);
++                const int32_t key = is_mine ? eid : (-2 - lane);
+                 const uint32_t mask = __match_any_sync(0xffffffffu, key);
+-                const bool act = (lane < n_ent && slot >= 0);
++                const bool act = is_mine;
+                 const int first_j = act ? (__ffs((int) mask) - 1) : lane;
+                 const int rank_in_group = __popc(mask & ((1u << lane) - 1u));
+                 const int count_same = __popc(mask);
+ #else
+                 __shared__ int32_t sm32[32];
+-                sm32[lane] = (lane < n_ent && slot >= 0) ? eid : -1;
++                sm32[lane] = is_mine ? eid : -1;
+                 __syncwarp();
+                 int first_j = lane, rank_in_group = 0, count_same = 0;
+-                const bool act = (lane < n_ent && slot >= 0);
++                const bool act = is_mine;
+                 if (act) for (int j = 0; j < n_ent; ++j) if (sm32[j] == eid) { if (j < first_j) first_j = j; if (j < lane) ++rank_in_group; ++count_same; }
+ #endif
+                 const bool is_first = act && (first_j == lane);
+@@ -681,7 +699,9 @@
+                 int32_t* start2 = pl + ptr_off + 4 * capx;
+                 if (is_first) {
+                     const int g = excl & 0xffff;
+-                    ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
++                    ptr[g] = (slot >= 0)
++                        ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
++                        : hblob;
+                     start[g] = excl >> 16;
+                 }
+                 if (act) { const int oi = (fj_tot >> 16) + rank_in_group; dst[oi] = lane; tok[oi] = lane / 10; }
+@@ -694,20 +714,31 @@
+             }
+         } else {
+             __shared__ int32_t p_ids[160], p_excl[160], p_wsum[8], p_excl1[160], p_wsum1[8];
+-            int32_t eid = -1, slot = -1; bool hit1 = false;
++            int32_t eid = -1, slot = -1; bool hit1 = false; unsigned long long hblob = 0ull;
+             if (t < n_ent) {
+                 eid = s_ids[t];
+-                if (eid >= 0 && eid < 512) { slot = res0[eid]; if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true; }
++                if (eid >= 0 && eid < 512) {
++                    slot = res0[eid];
++                    if (slot < 0) {
++                        if constexpr (BELL) {
++                            if (res1 != nullptr && (res1[eid] >= 0 || takes_miss(eid))) hit1 = true;
++                        } else {
++                            if (host_blobs != nullptr && res1 != nullptr && res1[eid] < 0 && takes_miss(eid))
++                                hblob = host_blobs[eid];
++                        }
++                    }
++                }
+             }
+-            if (t < 160) p_ids[t] = (t < n_ent && slot >= 0) ? eid : -1;
++            const bool is_mine = (t < n_ent && (slot >= 0 || hblob != 0ull));
++            if (t < 160) p_ids[t] = is_mine ? eid : -1;
+             __syncthreads();
+             int first_j = t, rank_in_group = 0, count_same = 0;
+-            if (t < n_ent && slot >= 0) {
++            if (is_mine) {
+                 for (int j = 0; j < n_ent; ++j) {
+                     if (p_ids[j] == eid) { if (j < first_j) first_j = j; if (j < t) ++rank_in_group; ++count_same; }
+                 }
+             }
+-            const bool is_first = (t < n_ent && slot >= 0 && first_j == t);
++            const bool is_first = (is_mine && first_j == t);
+             const int my_pack = ((is_first ? count_same : 0) << 16) | (is_first ? 1 : 0);
+             const int my_h1 = (t < n_ent && hit1) ? 1 : 0;
+             int pref = my_pack, pref1 = my_h1;
+@@ -730,10 +761,12 @@
+             if (is_first) {
+                 int tot = p_excl[t]; for (int w_i = 0; w_i < warp; ++w_i) tot += p_wsum[w_i];
+                 const int g = tot & 0xffff;
+-                ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
++                ptr[g] = (slot >= 0)
++                    ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
++                    : hblob;
+                 start[g] = tot >> 16;
+             }
+-            if (t < n_ent && slot >= 0) {
++            if (is_mine) {
+                 const int fw = first_j >> 5;
+                 int ft = p_excl[first_j]; for (int w_i = 0; w_i < fw; ++w_i) ft += p_wsum[w_i];
+                 const int oi = (ft >> 16) + rank_in_group; dst[oi] = t; tok[oi] = t / 10;
+@@ -757,11 +790,13 @@
+     int32_t* ids, float* weights, const int32_t* res0, const int32_t* res1,
+     int32_t* ids_out, uint32_t* seq, uint32_t ring, const uint8_t* cache_base,
+     const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx,
+-    uint32_t* skip, cudaStream_t st) {
++    uint32_t* skip, cudaStream_t st,
++    const unsigned long long* host_blobs, int layer_idx, int miss_frac256) {
+     const unsigned nb = (unsigned) (512 / RPB + (AUX ? 1 : 0));
+     bf16_2560_router_mega_k<RPB, NT, AUX, BELL><<<nb, 256, 0, st>>>(
+         x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights,
+-        res0, res1, ids_out, seq, ring, cache_base, slot_off, blob, pl, capx, skip);
++        res0, res1, ids_out, seq, ring, cache_base, slot_off, blob, pl, capx, skip,
++        host_blobs, layer_idx, miss_frac256);
+ }
+ }  // namespace
+ 
+@@ -771,7 +806,8 @@
+     float* x_out, int32_t* ids, float* weights, int32_t* ids_out, uint32_t* d_seq, uint32_t ring,
+     const int32_t* res_self, const int32_t* res_peer,
+     const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+-    int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream) {
++    int32_t* pl, long long capx, uint32_t* skip, uint32_t* done_ctr, bool bell, void* stream,
++    const unsigned long long* host_blobs, int layer_idx, int miss_frac256) {
+ #if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+     constexpr int kMegaMaxT = STRATA_VERIFY_MAX_T;
+ #else
+@@ -785,7 +821,7 @@
+         throw std::invalid_argument("native_router_fused_bf16_bell_plan: bad arguments");
+     const cudaStream_t st = static_cast<cudaStream_t>(stream);
+     const bool has_aux = (w_aux != nullptr && y_aux != nullptr);
+-#define STRATA_MEGA_CASE(NT) case NT: {         constexpr int RPB = (NT == 1 || NT > 8) ? 2 : 4;         if (bell) {             if (has_aux) launch_router_mega<RPB, NT, true, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);             else launch_router_mega<RPB, NT, false, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);         } else {             if (has_aux) launch_router_mega<RPB, NT, true, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);             else launch_router_mega<RPB, NT, false, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st);         }     } break
++#define STRATA_MEGA_CASE(NT) case NT: {         constexpr int RPB = (NT == 1 || NT > 8) ? 2 : 4;         if (bell) {             if (has_aux) launch_router_mega<RPB, NT, true, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st, host_blobs, layer_idx, miss_frac256);             else launch_router_mega<RPB, NT, false, true>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st, host_blobs, layer_idx, miss_frac256);         } else {             if (has_aux) launch_router_mega<RPB, NT, true, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st, host_blobs, layer_idx, miss_frac256);             else launch_router_mega<RPB, NT, false, false>(x, ldx, w, logits, ldy, w_aux, y_aux, ldy_aux, x_out, done_ctr, ids, weights, res_self, res_peer, ids_out, d_seq, ring, cache_base, slot_off, blob, pl, capx, skip, st, host_blobs, layer_idx, miss_frac256);         }     } break
+     switch (n_tok) {
+         STRATA_MEGA_CASE(1);
+         STRATA_MEGA_CASE(2);
+--- a/include/strata/kernels/verify_kernels.hpp
++++ b/include/strata/kernels/verify_kernels.hpp
+@@ -129,7 +129,8 @@
+ /// `*skip = (nhits0 + nhits1 == n_entries) ? ring : 0` when `skip != nullptr`. `res_peer` may be null (GPU1).
+ void tp2_resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_self, const int32_t* res_peer,
+                        int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+-                       int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream);
++                       int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream,
++                       const unsigned long long* host_blobs = nullptr, int layer_idx = 0, int miss_frac256 = 0);
+ /// wait_flag_ge that also returns when *skip == value (device memory).
+ void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
+ /// copy_i32_from_mapped unless *skip == value.
+--- a/src/kernels/cuda/verify_kernels.cu
++++ b/src/kernels/cuda/verify_kernels.cu
+@@ -2053,12 +2053,20 @@
+     check("resident_plan");
+ }
+ 
++__device__ __forceinline__ bool tp2_plan_takes_miss(int layer_idx, int32_t eid, int frac256) {
++    if (frac256 <= 0) return false;
++    if (frac256 >= 256) return true;
++    const uint32_t h = (uint32_t) (layer_idx * 512 + eid) * 2654435761u;
++    return (int) (h >> 24) < frac256;
++}
++
+ template<int NT>
+ __global__ void __launch_bounds__(NT) tp2_resident_plan_kernel(
+         const int32_t* __restrict__ ids, int n, int k,
+         const int32_t* __restrict__ res0, const int32_t* __restrict__ res1,
+         int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+-        long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring) {
++        long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring,
++        const unsigned long long* __restrict__ host_blobs, int layer_idx, int miss_frac256) {
+     constexpr int NW = NT / 32;
+     __shared__ int32_t s_ids[NT];
+     __shared__ int32_t s_excl[NT];
+@@ -2072,20 +2080,29 @@
+     int32_t eid = -1;
+     int32_t slot = -1;
+     bool hit1 = false;
++    unsigned long long hblob = 0ull;
+     if (tid < n) {
+         eid = ids[tid];
+         if (eid >= 0 && eid < n_expert) {
+             slot = res0[eid];
+-            if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true;
++            if (slot < 0) {
++                if (host_blobs != nullptr) {
++                    if (res1 != nullptr && res1[eid] < 0 && tp2_plan_takes_miss(layer_idx, eid, miss_frac256))
++                        hblob = host_blobs[eid];
++                } else if (res1 != nullptr && (res1[eid] >= 0 || tp2_plan_takes_miss(layer_idx, eid, miss_frac256))) {
++                    hit1 = true;
++                }
++            }
+         }
+     }
+-    s_ids[tid] = (tid < n && slot >= 0) ? eid : -1;
++    const bool is_mine = (tid < n && (slot >= 0 || hblob != 0ull));
++    s_ids[tid] = is_mine ? eid : -1;
+     __syncthreads();
+ 
+     int first_j = tid;
+     int rank_in_group = 0;
+     int count_same = 0;
+-    if (tid < n && slot >= 0) {
++    if (is_mine) {
+         for (int j = 0; j < n; ++j) {
+             if (s_ids[j] == eid) {
+                 if (j < first_j) first_j = j;
+@@ -2094,7 +2111,7 @@
+             }
+         }
+     }
+-    const bool is_first = (tid < n && slot >= 0 && first_j == tid);
++    const bool is_first = (is_mine && first_j == tid);
+     const int my_cnt = is_first ? count_same : 0;
+     const int my_pack = (my_cnt << 16) | (is_first ? 1 : 0);
+     const int my_h1 = (tid < n && hit1) ? 1 : 0;
+@@ -2138,10 +2155,12 @@
+         for (int w = 0; w < NW; ++w) if (w < warp) tot += s_wsum[w];
+         const int grp_idx = tot & 0xffff;
+         const int ent_start = tot >> 16;
+-        ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
++        ptr[grp_idx] = (slot >= 0)
++            ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
++            : hblob;
+         start[grp_idx] = ent_start;
+     }
+-    if (tid < n && slot >= 0) {
++    if (is_mine) {
+         const int fj_warp = first_j >> 5;
+         int fj_tot = s_excl[first_j];
+ #pragma unroll
+@@ -2173,22 +2192,32 @@
+         const int32_t* __restrict__ ids, int n, int k,
+         const int32_t* __restrict__ res0, const int32_t* __restrict__ res1,
+         int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+-        long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring) {
++        long long blob, int32_t* __restrict__ pl, long long capx, uint32_t* skip, uint32_t ring,
++        const unsigned long long* __restrict__ host_blobs, int layer_idx, int miss_frac256) {
+     const int lane = threadIdx.x;
+     int32_t eid = -1;
+     int32_t slot = -1;
+     bool hit1 = false;
++    unsigned long long hblob = 0ull;
+     if (lane < n) {
+         eid = ids[lane];
+         if (eid >= 0 && eid < n_expert) {
+             slot = res0[eid];
+-            if (slot < 0 && res1 != nullptr && res1[eid] >= 0) hit1 = true;
++            if (slot < 0) {
++                if (host_blobs != nullptr) {
++                    if (res1 != nullptr && res1[eid] < 0 && tp2_plan_takes_miss(layer_idx, eid, miss_frac256))
++                        hblob = host_blobs[eid];
++                } else if (res1 != nullptr && (res1[eid] >= 0 || tp2_plan_takes_miss(layer_idx, eid, miss_frac256))) {
++                    hit1 = true;
++                }
++            }
+         }
+     }
++    const bool is_mine = (lane < n && (slot >= 0 || hblob != 0ull));
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+-    const int32_t key = (lane < n && slot >= 0) ? eid : (-2 - lane);
++    const int32_t key = is_mine ? eid : (-2 - lane);
+     const uint32_t mask = __match_any_sync(0xffffffffu, key);
+-    const bool act = (lane < n && slot >= 0);
++    const bool act = is_mine;
+     const int first_j = act ? (__ffs((int) mask) - 1) : lane;
+     const int rank_in_group = __popc(mask & ((1u << lane) - 1u));
+     const int count_same = __popc(mask);
+@@ -2241,7 +2270,9 @@
+     if (is_first) {
+         const int grp_idx = excl & 0xffff;
+         const int ent_start = excl >> 16;
+-        ptr[grp_idx] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
++        ptr[grp_idx] = (slot >= 0)
++            ? (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob))
++            : hblob;
+         start[grp_idx] = ent_start;
+     }
+     if (act) {
+@@ -2267,21 +2298,25 @@
+ 
+ void tp2_resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_self, const int32_t* res_peer,
+                        int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+-                       int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream) {
++                       int32_t* plan, long long capx, uint32_t* skip, uint32_t ring, void* stream,
++                       const unsigned long long* host_blobs, int layer_idx, int miss_frac256) {
+     if (n_entries <= 32) {
+         tp2_resident_plan_kernel_32<<<1, 32, 0, (cudaStream_t) stream>>>(
+-            ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring);
++            ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring,
++            host_blobs, layer_idx, miss_frac256);
+     } else if (n_entries > kResidentPlanNarrow) {
+         if (n_entries <= kResidentPlanMax) {
+             tp2_resident_plan_kernel<kResidentPlanMax><<<1, kResidentPlanMax, 0, (cudaStream_t) stream>>>(
+-                ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring);
++                ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring,
++                host_blobs, layer_idx, miss_frac256);
+         } else {
+             std::fprintf(stderr, "tp2_resident_plan: %d entries, at most %d\n", n_entries, kResidentPlanMax);
+             std::exit(1);
+         }
+     } else {
+         tp2_resident_plan_kernel<kResidentPlanNarrow><<<1, kResidentPlanNarrow, 0, (cudaStream_t) stream>>>(
+-            ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring);
++            ids, n_entries, k, res_self, res_peer, n_expert, cache_base, slot_off, blob, plan, capx, skip, ring,
++            host_blobs, layer_idx, miss_frac256);
+     }
+     check("tp2_resident_plan");
+ }
+--- a/src/kernels/cpu/kq_avx2.cpp
++++ b/src/kernels/cpu/kq_avx2.cpp
+@@ -123,6 +123,10 @@
+     alignas(16) __m128 acc_m[NT];
+     for (int t = 0; t < NT; ++t) acc_m[t] = _mm_setzero_ps();
+     for (int i = 0; i < nb; ++i) {
++        if (i + 2 < nb) {
++            _mm_prefetch((const char*) &x[i + 2], _MM_HINT_T0);
++            _mm_prefetch((const char*) &x[i + 2] + 64, _MM_HINT_T0);
++        }
+         float xd, xdmin;
+         half_pair(&x[i], xd, xdmin);
+         __m256i scales;
+@@ -205,6 +209,10 @@
+         for (int t = 0; t < NT; ++t) { _mm256_store_ps(acc_mem[t], _mm256_setzero_ps()); summs[t] = 0.0f; }
+     }
+     for (int i = 0; i < nb; ++i) {
++        if (i + 2 < nb) {
++            _mm_prefetch((const char*) &x[i + 2], _MM_HINT_T0);
++            _mm_prefetch((const char*) &x[i + 2] + 64, _MM_HINT_T0);
++        }
+         float xd, xdmin;
+         half_pair(&x[i], xd, xdmin);
+         __m256i scales;
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -7686,14 +7686,26 @@
+         std::vector<std::pair<int32_t, int32_t>> p0;
+         p0.reserve((profile.size() + 1) / 2);
+         tp1_profile.reserve(profile.size() / 2);
+-        // Thue-Morse 4-way partition: avoid systematic even-rank bias onto CUDA0 and give rank-0 edge to CUDA1 (+462 slots, no draft head).
++        // Capacity-weighted Bresenham partition: matches CUDA0:CUDA1 actual VRAM slot ratio (~48:52 with DFlash2 on GPU0)
++        // so 100% of global Top-(slots0+slots1) hottest experts stay resident with zero mid-rank eviction gap.
++        const int w0_env = [] { const char* v = std::getenv("STRATA_TP2_PART_W0"); return v ? std::atoi(v) : 48; }();
++        const int w1_env = [] { const char* v = std::getenv("STRATA_TP2_PART_W1"); return v ? std::atoi(v) : 52; }();
++        const int w0 = std::max(1, w0_env);
++        const int w1 = std::max(1, w1_env);
++        const int wsum = w0 + w1;
++        int acc0 = wsum / 2;
+         for (size_t i = 0; i < profile.size(); ++i) {
+-            if ((i & 3u) == 1u || (i & 3u) == 2u) p0.push_back(profile[i]);
+-            else tp1_profile.push_back(profile[i]);
++            acc0 += w0;
++            if (acc0 >= wsum) {
++                acc0 -= wsum;
++                p0.push_back(profile[i]);
++            } else {
++                tp1_profile.push_back(profile[i]);
++            }
+         }
+         profile.swap(p0);
+-        std::fprintf(stderr, "strata generate: STRATA_TP2=1: partitioned %zu profiled experts into %zu (CUDA0) + %zu (CUDA1) disjoint sets\n",
+-                     profile_all.size(), profile.size(), tp1_profile.size());
++        std::fprintf(stderr, "strata generate: STRATA_TP2=1: capacity-weighted (%d:%d) partitioned %zu profiled experts into %zu (CUDA0) + %zu (CUDA1) disjoint sets\n",
++                     w0, w1, profile_all.size(), profile.size(), tp1_profile.size());
+     }
+     if (multi_gpu) {
+         profile_all = profile;
+@@ -9703,6 +9715,9 @@
+         strata::core::ExpertCache cache;
+         std::vector<int32_t> host_res;
+         int32_t* d_res = nullptr;
++        int32_t* d_res_peer = nullptr;
++        uint64_t* d_host_blobs = nullptr;
++        int64_t host_blobs_mapped = 0;
+         strata::core::Verifier ver;
+         strata::core::TpComm comm;
+         cudaStream_t pf_stream = nullptr;
+@@ -10967,6 +10982,44 @@
+                 std::fprintf(stderr, "strata generate: TP2 CUDA1 residency table failed\n");
+                 return 1;
+             }
++            if (cudaMalloc((void**) &tp1->d_res_peer, host_res.size() * sizeof(int32_t)) == cudaSuccess) {
++                if (cudaMemcpy(tp1->d_res_peer, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
++                    cudaFree(tp1->d_res_peer);
++                    tp1->d_res_peer = nullptr;
++                }
++            } else {
++                (void) cudaGetLastError();
++                tp1->d_res_peer = nullptr;
++            }
++            // Build GPU1 device pointer table into the 72x1GiB portable HugePage expert arena (192 KiB VRAM).
++            {
++                const size_t total_exp = (size_t) (g.n_layers * g.n_expert);
++                std::vector<uint64_t> h_ptrs(total_exp, 0ull);
++                int64_t mapped_cnt = 0;
++                for (int64_t l = 0; l < g.n_layers; ++l) {
++                    for (int64_t e = 0; e < g.n_expert; ++e) {
++                        const uint8_t* hb = arena_src.blob_at(l, e); if (hb == nullptr) hb = src.resident_blob(l, e);
++                        if (hb != nullptr) {
++                            void* dp = nullptr;
++                            if (cudaHostGetDevicePointer(&dp, const_cast<uint8_t*>(hb), 0) == cudaSuccess && dp != nullptr) {
++                                h_ptrs[(size_t) (l * g.n_expert + e)] = (uint64_t) (uintptr_t) dp;
++                                ++mapped_cnt;
++                            } else {
++                                (void) cudaGetLastError();
++                            }
++                        }
++                    }
++                }
++                if (mapped_cnt == (int64_t) total_exp &&
++                    cudaMalloc((void**) &tp1->d_host_blobs, total_exp * sizeof(uint64_t)) == cudaSuccess &&
++                    cudaMemcpy(tp1->d_host_blobs, h_ptrs.data(), total_exp * sizeof(uint64_t), cudaMemcpyHostToDevice) == cudaSuccess) {
++                    tp1->host_blobs_mapped = mapped_cnt;
++                } else {
++                    (void) cudaGetLastError();
++                    if (tp1->d_host_blobs != nullptr) { cudaFree(tp1->d_host_blobs); tp1->d_host_blobs = nullptr; }
++                    tp1->host_blobs_mapped = 0;
++                }
++            }
+             resident += res1;
+         }
+         if (cudaMalloc((void**) &d_res, host_res.size() * sizeof(int32_t)) != cudaSuccess ||
+@@ -13082,6 +13135,8 @@
+                 if (tp1 && tp1->d_res != nullptr) {
+                     const strata::core::OnDevice on1(tp1->dev);
+                     cudaMemcpy(tp1->d_res, tp1->host_res.data(), tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
++                    if (tp1->d_res_peer != nullptr)
++                        cudaMemcpy(tp1->d_res_peer, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                     cudaStreamSynchronize(nullptr);
+                 }
+                 for (auto& st : stages) {
+@@ -13345,8 +13400,15 @@
+             ver.set_tp(&tp1->comm, 0, true, &tp1->ver);
+             if (use_mtp) mtp.set_head_peer(tp1->dev);
+         }
++        const int tp2_miss_256 = (tp1 && tp1->d_res_peer != nullptr && tp1->d_host_blobs != nullptr &&
++                                  tp1->host_blobs_mapped == g.n_layers * g.n_expert)
++            ? [] { const char* v = std::getenv("STRATA_TP2_GPU1_MISS_256"); int x = v ? std::atoi(v) : 0; return x < 0 ? 0 : (x > 256 ? 256 : x); }()
++            : 0;
++        const int tp2_miss_min_t = [] { const char* v = std::getenv("STRATA_TP2_GPU1_MISS_MIN_T"); int x = v ? std::atoi(v) : 1; return x < 1 ? 1 : x; }();
+         vh.d_res_self = d_res_self;
+         vh.d_res_peer = d_res_peer;
++        vh.tp2_miss_256 = tp2_miss_256;
++        vh.tp2_miss_min_t = tp2_miss_min_t;
+         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
+                       batch_max_t(), err) ||
+             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
+@@ -13360,6 +13422,10 @@
+                 const strata::core::OnDevice on1(tp1->dev);
+                 strata::core::VerifyHits vh1;
+                 vh1.d_res = tp1->d_res;
++                vh1.d_res_peer = tp1->d_res_peer;
++                vh1.d_host_blobs = tp1->d_host_blobs;
++                vh1.tp2_miss_256 = tp2_miss_256;
++                vh1.tp2_miss_min_t = tp2_miss_min_t;
+                 vh1.h_res = tp1->host_res.data();
+                 vh1.cache_base = (const uint8_t*) tp1->cache.device_slot(0);
+                 vh1.blob = thits.blob;
+@@ -13378,6 +13444,11 @@
+             drive.d.tp_res1 = tp1->host_res.data();
+             drive.d.tp_cache_base1 = (const uint8_t*) tp1->cache.device_slot(0);
+             drive.d.tp_cache_slot_off1 = tp1->cache.slot_offsets();
++            drive.d.tp2_miss_256 = tp2_miss_256;
++            drive.d.tp2_miss_min_t = tp2_miss_min_t;
++            if (tp2_miss_256 > 0)
++                std::fprintf(stderr, "strata serve: TP2 GPU1 HugePage direct-PCIe miss offload ON (frac=%d/256, min_t=%d, %lld/%lld blobs mapped)\n",
++                             tp2_miss_256, tp2_miss_min_t, (long long) tp1->host_blobs_mapped, (long long) (g.n_layers * g.n_expert));
+             std::fprintf(stderr, "strata serve: STRATA_TP2=1 ready: CUDA0 (%lld experts) + CUDA%d (%lld experts) = %lld total resident experts\n",
+                          (long long) xcache.slots(), tp1->dev, (long long) tp1->cache.slots(),
+                          (long long) (xcache.slots() + tp1->cache.slots()));
+@@ -15107,7 +15178,7 @@
+                 res_pin0 = nullptr; (void) cudaGetLastError();
+             }
+             if (d_res_self != nullptr &&
+-                cudaHostAlloc((void**) &res_pin_self, res_bytes, cudaHostAllocDefault) != cudaSuccess) {
++                cudaHostAlloc((void**) &res_pin_self, res_bytes, cudaHostAllocPortable) != cudaSuccess) {
+                 res_pin_self = nullptr; (void) cudaGetLastError();
+             }
+             if (tp1 && tp1->d_res != nullptr &&
+@@ -15174,6 +15245,16 @@
+                     e1 = e0 != cudaSuccess ? e0 : cudaStreamSynchronize(nullptr);
+                 }
+                 if (r == cudaSuccess) r = e1;
++                if (tp1->d_res_peer != nullptr && !host_res.empty()) {
++                    cudaError_t ep1 = cudaSuccess;
++                    if (async_streams && res_pin_self != nullptr && stages.empty()) {
++                        ep1 = cudaMemcpyAsync(tp1->d_res_peer, res_pin_self, res_bytes, cudaMemcpyHostToDevice, tp1->ver.stream());
++                    } else {
++                        const cudaError_t e0 = cudaMemcpy(tp1->d_res_peer, host_res.data(), res_bytes, cudaMemcpyHostToDevice);
++                        ep1 = e0 != cudaSuccess ? e0 : cudaStreamSynchronize(nullptr);
++                    }
++                    if (r == cudaSuccess) r = ep1;
++                }
+             }
+             for (auto& st : stages) {
+                 const strata::core::OnDevice on(st->dev);
+@@ -15276,7 +15357,7 @@
+         int32_t* res_pairs = (serial_windows && (drive.d.fetch_admit > 0 || drive.d.evict_sync))
+                                  ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
+         int32_t* res_pairs_self = (res_pairs != nullptr && d_res_self != nullptr)
+-                                      ? res_pairs_alloc(kResPatchCap, {-1}) : nullptr;
++                                      ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
+         int32_t* res_pairs_peer = (res_pairs != nullptr && d_res_peer != nullptr && tp1 != nullptr)
+                                       ? res_pairs_alloc(kResPatchCap, res_devs) : nullptr;
+         auto res_sync = [&](bool check, std::string& e) -> bool {
+@@ -15323,6 +15404,8 @@
+                     if (tp1 && tp1->d_res != nullptr && r == cudaSuccess) {
+                         const strata::core::OnDevice on1(tp1->dev);
+                         strata::kernels::res_patch(tp1->d_res, res_pairs_peer ? res_pairs_peer : res_pairs, (int) np, tp1->ver.stream());
++                        if (tp1->d_res_peer != nullptr && res_pairs_self != nullptr)
++                            strata::kernels::res_patch(tp1->d_res_peer, res_pairs_self, (int) np, tp1->ver.stream());
+                         r = cudaGetLastError();
+                     }
+                     for (size_t k = 0; k < stages.size() && r == cudaSuccess; ++k) {
+@@ -23886,6 +23969,8 @@
+             if (tp1 && tp1->d_res != nullptr) {
+                 const strata::core::OnDevice on1(tp1->dev);
+                 cudaMemcpy(tp1->d_res, tp1->host_res.data(), tp1->host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
++                if (tp1->d_res_peer != nullptr)
++                    cudaMemcpy(tp1->d_res_peer, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+                 cudaStreamSynchronize(nullptr);
+             }
+         };

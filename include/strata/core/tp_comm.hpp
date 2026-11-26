@@ -20,7 +20,15 @@ public:
     bool init(int dev0, int dev1, size_t max_floats, std::string& err);
     void release();
     void reset(uint32_t base = 0);
+    struct P2pPushTarget {
+        float* peer_slot_buf = nullptr;
+        volatile uint32_t* peer_flag = nullptr;
+        uint32_t* done_ctr = nullptr;
+        uint32_t step = 0;
+    };
     void allreduce_add(float* local_buf, int n_elems, uint32_t step, int rank, void* stream);
+    bool p2p_push_target(int n_elems, uint32_t step, int rank, P2pPushTarget& out) const;
+    void allreduce_wait_add_bf16(float* local_buf, int n_elems, uint32_t step, int rank, void* stream);
     void allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream);
     size_t max_floats() const { return max_floats_; }
     size_t slot_floats() const { return slot_floats_; }
@@ -42,6 +50,7 @@ private:
     float* d_dec_buf_[2] = {nullptr, nullptr};
     void* d_p2p_tx_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
     uint32_t* d_p2p_flag_[2] = {nullptr, nullptr};
+    uint32_t* d_done_ctr_[2] = {nullptr, nullptr};
     // Optional VMM backing (selective peer BAR1 mapping without process-wide cudaDeviceEnablePeerAccess)
     void* vmm_base_[2] = {nullptr, nullptr};
     uint64_t vmm_handle_[2] = {0, 0};

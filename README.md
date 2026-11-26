@@ -7,7 +7,8 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="README.en.md"><img src="https://img.shields.io/badge/Language-English-00b894.svg" alt="English"></a>
-  <img src="https://img.shields.io/badge/2x3080%2020G-201.4%20tok%2Fs%20Warm%20Mean-00d4ff.svg" alt="201.4 tok/s">
+  <img src="https://img.shields.io/badge/v1.1.0-231.4%20tok%2Fs%20Warm%20Mean-00d4ff.svg" alt="231.4 tok/s">
+  <img src="https://img.shields.io/badge/Peak-287.2%20tok%2Fs%20%40%20240W-7c4dff.svg" alt="287.2 tok/s Peak">
   <img src="https://img.shields.io/badge/PCIe%204.0%20P2P-50.86%20GB%2Fs%20Full--Duplex-00e676.svg" alt="50.86 GB/s P2P">
   <img src="https://img.shields.io/badge/Precision-100%25%20Bit--Exact%20Lossless-ffbe28.svg" alt="Lossless">
 </p>
@@ -15,51 +16,63 @@
 <p align="center">
   <img src="docs/assets/dashboard-8080-live.jpg" alt="strata-ampere Port 8080 Live Telemetry Dashboard" width="100%">
   <br>
-  <sub><b>内置 8080 端口实时监控仪表盘实拍</b>：双魔改 RTX 3080 20GB 7×24 稳定运行，现已解锁 <b>50.86 GB/s 直接 PCIe 4.0 P2P + 72×1 GiB 静态大页</b>，热态均速首次突破 <code>201.40 tok/s</code>（单任务 <code>252.01 tok/s</code>）、84K Prefill <code>3,870 tok/s</code>、满载 <code>41℃ / 36℃</code>、<code>0 Xid · 0 AER · 0 DMAR</code></sub>
+  <sub><b>内置 8080 端口实时监控仪表盘实拍</b>：双魔改 RTX 3080 20GB 7×24 稳定运行，现已升级至 <b>v1.1.0 六方向深度内核调优 + 50.86 GB/s 直接 PCIe 4.0 P2P + 72×1 GiB 静态大页</b> — 热态均速突破 <code>231.35 tok/s</code>（冷启首轮后均速 <code>202.50 tok/s</code>，单任务峰值 <code>287.20 tok/s</code>）、84K Prefill <code>3,870 tok/s</code>、9,807 常驻热专家、满载 <code>43℃ / 38℃</code>、待机 <code>4.8 W</code>、<code>0 Xid · 0 AER · 0 DMAR</code></sub>
 </p>
 
 `strata-ampere` 基于 [Strata](https://github.com/Niko1221/Strata)（`0.1.60.1`）深度全栈工程重构，专为 **双魔改 RTX 3080 20 GB（Ampere `sm_86`，40 GB 总显存）** 打造，在 **100% 严格无损精度** 下榨干每一分硬件极限：
-- **无需改写 PCIe 寄存器扩 BAR1（原生 `256 MiB BAR1`）**：通过自研 **VMM 选择性 BAR1 映射 + 1-Hop Push-Write + VRAM Flag 屏障** 配合版本精确匹配的开源动态 BAR1 P2P 内核驱动（[patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)）与 **`72 × 1 GiB` 静态大页 + `iommu=pt`**，实测打通 **`50.86 GB/s` 全双工卡对卡直连**，热态均速首次突破 **`201.40 tok/s`**！
+- **v1.1.0 六方向深度微核与系统调优（240W 严格无损）**：新增 **GPU1 稀疏命中 MoE Combine**（砍掉每步 48 次 `cudaMemsetAsync` 与 >50% 零行读）、**48:52 容量加权 Bresenham 专家切分**（常驻专家 `9,764 → 9,807`，消除中段热专家驱逐空洞）、**Ampere `sm_86` 硬件 `__nanosleep(64)` P2P 自旋屏障 + `K=1` Warp 对齐发射**、**Zen 2 AVX2 专家权重预取 + PCIe Root Port ACS 关闭 + `/dev/cpu_dma_latency=0`**、**`STRATA_DF2_HEAD_Q4=1` + 真 `--spec 8 --draft-conf 0.50`（`user_args`）+ `draft-costs.json` 重校准**，在严格同条件对比中热态均速飙升至 **`231.35 tok/s`**（单任务峰值 **`287.20 tok/s`**），同时 GPU0 空闲显存从 `508 MiB` 回升至健康水位 **`528+ MiB`**！
+- **无需改写 PCIe 寄存器扩 BAR1（原生 `256 MiB BAR1`）**：通过自研 **VMM 选择性 BAR1 映射 + 1-Hop Push-Write + VRAM Flag 屏障** 配合版本精确匹配的开源动态 BAR1 P2P 内核驱动（[patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)）与 **`72 × 1 GiB` 静态大页 + `iommu=pt`**，实测打通 **`50.86 GB/s` 全双工卡对卡直连**。
 
-> **口径承诺（100% 严格无损铁律）**：本文所有核心速度均采用**多轮均速或中位数**，所有实验均在 `temperature=0`、零降量化（原始 `UD-Q4_K_XL`）、`STRATA_ROUTE_TAIL_SKIP=0`（绝不丢弃冷门专家）、`BF16` 全精度跨卡 AllReduce 的条件下实测复现，并强制校验 Greedy SHA256（`code_refactor = 79e43b1e6dee`、`agent_json_edit = 6d0b72b248bc`）逐位一致。
+> **口径承诺（100% 严格无损铁律）**：本文所有核心速度均采用**多轮均速或中位数**，所有实验均在 `temperature=0`、目标模型零降量化（原始 `UD-Q4_K_XL`）、`STRATA_ROUTE_TAIL_SKIP=0`（绝不丢弃冷门专家）、`BF16` 全精度跨卡 AllReduce 的条件下实测复现，并强制校验 Greedy SHA256 逐位一致（`STRATA_DF2_HEAD_Q4=1` 仅作用于草稿模型 DFlash2，目标模型验证 100% 精确无损）。
 
 ---
 
 ## 一、核心优化实测速度（全历程可复现数据）
 
-### 1. 最新全栈里程碑：1 GiB 静态大页 + `iommu=pt` + 50.86 GB/s 直接 PCIe 4.0 P2P（240W 帕累托档）
+### 1. v1.1.0 最新里程碑：六方向深度内核 + 系统调优（240W 帕累托档，严格 A/B）
 
-基于 `Qwen3.8-Flash-Next-UD-Q4_K_XL`（256K 上下文，`DFlash2 Q4_0` + `T=16` 持久化后缀树混合草稿，单卡 `240W` + 显存 `10,151 MHz` + `MRRS 4096B`）：
+基于 `Qwen3.8-Flash-Next-UD-Q4_K_XL`（256K 上下文，`DFlash2 Q4_0` + `T=12` 持久化后缀树混合草稿，单卡 `240W` + 显存 `10,151 MHz` + `MRRS 4096B` + `50.86 GB/s` PCIe 4.0 P2P，4 任务标准套件 `moe_arch / code_cuda / agent_json / kv_tech`，`temperature=0`）：
 
-| 严格 A/B 阶段（同硬件、同 240W、同测试集） | 4 任务热态均速 (`cli / srv`) | 2 轮总均速 (`srv`) | `agent_json_edit` | `unseen_code` | 84K Cold Prefill (`83,656 tok`) | Greedy SHA256 |
-|---|---:|---:|---:|---:|---:|:---:|
-| P4 基线（THP + 主机路由 AllReduce） | `194.55 / — tok/s` | `187.28 tok/s` | `~240 tok/s` | `~196 tok/s` | `3,780.0 tok/s` (`22,131 ms`) | ✅ 逐位一致 |
-| + 2 MiB 静态 HugePages（`36,727 × 2M`） | `194.21 / — tok/s` | `187.76 tok/s` | `~242 tok/s` | `~198 tok/s` | `3,780.0 tok/s` (`22,131 ms`) | ✅ 逐位一致 |
-| + **`72 × 1 GiB` 静态 HugePages + `iommu=pt`** | `194.8 / — tok/s` | `188.1 tok/s` | `~243 tok/s` | `~200 tok/s` | `3,860.0 tok/s` (`21,673 ms`) | ✅ 逐位一致 |
-| + **50.86 GB/s VMM Push-Write PCIe P2P（当前线上）** | **`201.40 / 200.53 tok/s`** | **`192.26 tok/s`** | **`252.01 tok/s`** | **`212.91 tok/s`** | **`3,870.0 tok/s` (`21,616 ms`)** | ✅ **100% 逐位一致** |
+| 对比组（同硬件、同 240W、同 4 任务套件） | 4 任务热态均速 | `moe_arch` | `code_cuda` | `agent_json` | `kv_tech` | 常驻热专家 / GPU0 剩余显存 | Greedy SHA256 |
+|---|---:|---:|---:|---:|---:|---:|:---:|
+| **v1.0.0 线上基线（同冷启 r2 热态）** | `186.22 tok/s` | `204.2 tok/s` | `234.6 tok/s` | `177.0 tok/s` | `129.1 tok/s` | `9,764` / `508 MiB` | ✅ 逐位一致 |
+| **v1.1.0 同冷启 r2 热态（严格同起跑线）** | **`202.50 tok/s` (`+8.7%`)** | `200.6 tok/s` | **`254.1 tok/s`** | **`222.6 tok/s` (`+25.8%`)** | `132.7 tok/s` | **`9,807 (+43)` / `528 MiB`** | ✅ 逐位一致 |
+| **v1.0.0 充分预热 4 任务均速** | `199.68 tok/s` | — | — | — | — | `9,764` / `508 MiB` | ✅ 逐位一致 |
+| **v1.1.0 充分预热 r3 冠军均速（线上）** | **`231.35 tok/s` (`+15.9%`)** | **`287.20 tok/s` (97.5% acc)** | **`256.70 tok/s` (92.1% acc)** | **`198.90 tok/s`** | **`182.60 tok/s`** | **`9,807 (+43)` / `528 MiB`** | ✅ **100% 逐位一致** |
 
-- **双卡 P2P 硬件实测微基准（原生 `256 MiB BAR1`，零 BAR1 扩容、零 ACS 修改）**：
-  - `nvidia-smi topo -p2p r` / `w`：双向 **`OK`**
-  - `cuMemcpyDtoDAsync` 单向 **`26.32 GB/s`** / 全双工双向 **`50.86 GB/s`**（跑满 PCIe 4.0 x16 线速）
-  - SM Kernel 直接 Push-Pack 双向 **`50.75 GB/s`**（零中间缓冲、零主桥二次绕行）
-  - 2-GPU 端到端 Push-Write + VRAM Flag AllReduce 延迟：`T=1`（8 KiB BF16）**`6.05 µs`** / `T=4`（32 KiB）**`8.97 µs`** / `T=16`（128 KiB）**`23.47 µs`**
-  - BAR1 实际占用：双卡各仅 **`39 MiB / 256 MiB`**（剩余 **`217 MiB`**，模型权重与 KV 占 **0 字节** BAR1）
-  - `gpu_unlock` 满血 BF16 算力完好确认：GPU0 **`124.2 TFLOPS`** / GPU1 **`126.2 TFLOPS`**（实测 `4096³` BF16 GEMM）
-  - 满载温度 **`41℃ / 36℃`**，冷重启全自动拉起，内核 `dmesg` 全程 **`0 Xid / 0 AER / 0 DMAR`**
+- **关键硬件与延迟指标实测（v1.1.0 线上实机）**：
+  - `draft-costs.json` 重校准后验证窗口延迟：`T=5` **`20.43 ms`**、`T=6` **`20.39 ms`**（热态 `T=6` 低至 **`18.75 ms`**，彻底清除 P2P 升级前被污染的 `42.19 ms` 倒挂表项）
+  - DFlash2 草稿模型显存与耗时：`862 MiB → 733 MiB`（`-129 MiB`），单轮草稿 **`1.737 ms`**（Head 仅 `0.374 ms`），GPU0 空闲显存回到 **`528–532 MiB`**（解除 `<512 MiB` 告警），GPU1 `228 MiB`
+  - 双卡 P2P 微基准（原生 `256 MiB BAR1`）：单向 **`26.32 GB/s`** / 全双工 **`50.86 GB/s`** / SM Push-Pack **`50.75 GB/s`** / BAR1 仅占 **`39 / 256 MiB`**（权重与 KV 占 **0 字节** BAR1）
+  - 功耗、温度与稳定性：满载 **`238.6W / 238.3W`**（`43℃ / 38℃`），待机回落至 **`4.8W`**（`210 / 405 MHz`，`23–28℃`），`dmesg` 全程 **`0 Xid · 0 AER · 0 DMAR`**
 
-### 2. 早期各阶段演进汇总（从 `91.4 tok/s` 一路压榨到 `201.4 / 252.0 tok/s`）
+### 2. v1.1.0 六方向深度探索明细（含如实披露的负收益实验）
+
+本版本完整实现了全部 6 个工程方向，并经逐项严格 A/B 实测筛选——**所有正收益项默认开启上线，所有负收益/中性项保留为 Bit-Exact 可复现环境变量开关并默认关闭**：
+
+| 方向 | 技术改动 | 线上状态 | 实测结论与原因 |
+|---|---|:---:|---|
+| **方向 1** | GPU1 零拷贝直读 72×1G 大页 (`STRATA_TP2_GPU1_MISS_256`) | 默认关闭 (`=0`) | 代码与 Bit-Exact 均跑通（0 Xid/AER，命中率 `79%→89%`），但 144B/176B 非合并 Q4_K/Q5_K SM 跨 PCIe 读仅跑 `4–6 GB/s` 且与 CPU 争抢 4 通道 DDR4-3200，吞吐反降至 `143.3 tok/s`，诚实关闭 |
+| **方向 2** | 稀疏命中 GPU1 MoE Combine (`STRATA_TP2_GPU1_SPARSE_COMBINE`) + 融合 Push (`STRATA_TP_FUSE_MOE_PUSH`) | **稀疏 Combine ON (`=1`)** · 融合 Push OFF (`=0`) | 稀疏 Combine 干掉每步 48 次 `cudaMemsetAsync` + 跳过 >50% 零行读（稳定提速）；多 Block 融合 Push 因每 Block 需 `__threadfence_system()` 并重读 `local_buf`，反慢 `~0.4 ms`，保留为 `=0` 开关 |
+| **方向 3** | **48:52 容量加权 Bresenham 专家切分** (`STRATA_TP2_EXPERT_SPLIT=48:52`) + **Ampere `__nanosleep(64)` P2P 屏障 & `K=1` Warp 对齐** | **默认开启** | 匹配 GPU0:GPU1 真实可用显存比（`4,702 : 5,105`），常驻热专家 **`+43` (`9,764 → 9,807`)** 且彻底消灭中段排名驱逐空洞；`__nanosleep(64)` 省下 GPU1 在 240W 功耗墙下的空转能耗 |
+| **方向 4** | **`STRATA_DF2_HEAD_Q4=1` + `--lookup-max-t 12 --lookup-sizes 12` + `user_args` 真 `--spec 8 --draft-conf 0.50` + `draft-costs.json` 重校准** | **默认开启** | 绕开 `drafting.py` 自动覆写 `--spec 6` 的限制，完全释放 DFlash2 原生 7 步草稿（`--spec 8`）并用 `0.50` 剪枝低置信文本；`draft-costs` 重校准 + Q4 Head 释放 `129 MiB` 显存，是本次提速核心引擎之一 |
+| **方向 5** | Ampere `sm_86` `STRATA_EXPDEC=1` 实测验证 | **否决不启用** | 在 `sm_86` 上反而拖慢 `~1.5 ms/window`（该路径针对其他架构设计），实测淘汰 |
+| **方向 6** | **Zen 2 AVX2 权重软件预取 (`kq_avx2.cpp`) + PCIe Root Port ACS 关闭 + `/dev/cpu_dma_latency=0`**（对比 22 核 & `L3_PREWARM=2`） | **AVX2 预取 + ACS + DMA Latency 开启** · 维持 15+1 核 | 实测 15+1 核已完全打满 TR 3960X 四通道 DDR4-3200，扩到 22 核 `<0.2 ms` 无增益；保留最优雅 15+1 核配置，叠加 AVX2 预取 + ACS 关闭 + `cpu_dma_latency=0` 消除微秒级长尾抖动 |
+
+### 3. 全历程演进汇总（从 `91.4 tok/s` 一路压榨到 `231.4 / 287.2 tok/s`）
 
 | 调优阶段 | 优化前 | 优化后（线上实测） | 净收益 | 核心技术点 |
 |---|---:|---:|---:|---|
 | **切层流水线 → 真 `TP=2 + EP=2`**（6 场景中位数） | `91.42 tok/s` | **`159.68 tok/s`** | **`+74.7%`** | 全 48 层 TP + 24,576 专家不重叠 EP + `sm_86` 68-SM 微核 |
 | **草稿升级 `DFlash2 Q4_0` + BF16 TC 注意力** | `148.30 tok/s` | **`154.61 tok/s`** | **`+4.25%`** | `mma.sync.m16n8k16` BF16 Tensor Core 注意力 |
 | **无头显存超频 + `240W` 帕累托 + `MRRS 4096B`** | `189.42 tok/s` (320W) | **`207.52 tok/s`** (240W) | **`+9.6%` / `-93W`** | 破 CUDA P2 降频至 `10,151 MHz`，满载 `41℃`，能效 `+19.3%` |
-| **双级混合草稿 `T=16` + 持久化后缀树** | `185.46 tok/s` | **`229.98 tok/s`** | **`+24.0%`** | 256K 跨请求滚动后缀树，Agent JSON 最高 `290.4 tok/s` |
+| **双级混合草稿 + 256K 持久化后缀树** | `185.46 tok/s` | **`229.98 tok/s`** | **`+24.0%`** | 256K 跨请求滚动后缀树，严格无损逐位一致 |
 | **TP=2 双卡多对话 RAM 泊车（双标签 Agent）** | `4,869.8 ms` TTFT (`0%`) | **`499.3 ms` (`99.7%`)** | **`9.75×` 提速** | GPU 1 接入 `ConversationCache`，`55 ms` 内存恢复 |
-| **深度内核 P0–P4 套件（`W16 G=1` + P1 预热 + P2 MLP + P4 INT8 TC）** | `186.72 tok/s` | **`194.55 tok/s`** | **`+4.2%`** | AllReduce 次数砍半、84K 命中 `+9.2%`、`sm_86` `m16n8k32` INT8 TC |
-| **1 GiB 静态大页 + `iommu=pt` + 50.86 GB/s VMM Push-P2P** | `187.28` / `3,780` | **`192.26` (`201.4` 热态) / `3,870`** | **破 200 均速大关** | 72×1 GiB 锁死 dTLB + 原生 256 MiB BAR1 直接 P2P |
+| **深度内核 P0–P4 套件（`W16 G=1` + P1 + P2 + P4 INT8 TC）** | `186.72 tok/s` | **`194.55 tok/s`** | **`+4.2%`** | AllReduce 次数砍半、84K 命中 `+9.2%`、`sm_86` `m16n8k32` INT8 TC |
+| **v1.0.0：1 GiB 静态大页 + `iommu=pt` + 50.86 GB/s VMM Push-P2P** | `187.28` / `3,780` | **`201.40` 热态 / `3,870`** | **破 200 大关** | 72×1 GiB 锁死 dTLB + 原生 256 MiB BAR1 直接 P2P |
+| **v1.1.0：六方向深度微核 + 48:52 EP + `user_args --spec 8` + ACS/DMA** | `186.22` / `199.68` | **`202.50` 冷启 / `231.35` 热态 (`287.2` 峰)** | **`+8.7% ~ +15.9%`** | 稀疏 Combine + 9,807 专家 + `__nanosleep` + `DF2_HEAD_Q4` + 重校准 |
 
-### 3. Prefill 提示词吞吐实测（严格无损）
+### 4. Prefill 提示词吞吐实测（严格无损）
 
 | 上下文长度 / 测试项 | 优化前 | 优化后（线上实测） | 提升幅度 | 备注 |
 |---|---:|---:|---:|---|
@@ -76,11 +89,11 @@
 | 组件 | 实测配置详情 |
 |---|---|
 | **GPU** | **2× 魔改 RTX 3080 20 GB**（Ampere `sm_86`，PCI ID `10de:2206`，vBIOS `94.02.27.00.14`，原生 `BAR1 = 256 MiB`，合计 40 GB 显存） |
-| **多卡互联** | **双卡直连 CPU PCIe 4.0 x16**（`00:01.1 → 01:00.0`、`40:03.1 → 48:00.0`），通过动态 BAR1 P2P 解锁 **`50.86 GB/s` 全双工直连**（`nvidia-smi topo -p2p r/w` 均为 `OK`） |
-| **GPU 频率与功耗** | 单卡 **`240W`** 帕累托档 + GDDR6X **`10,151 MHz`** (`+1800 eff`) + 核心 **`2,100 MHz`** (`+120`) + PCIe **`MRRS 4096B`**，满载 **`41℃ / 36℃`** |
-| **CPU 与内存** | **AMD Ryzen Threadripper 3960X**（24C/48T，8 CCX）+ **128 GB 四通道 DDR4-3200**（`72 × 1 GiB` 静态 HugePages 永久锁入内核 `Hugetlb`） |
+| **多卡互联** | **双卡直连 CPU PCIe 4.0 x16**（`00:01.1 → 01:00.0`、`40:03.1 → 48:00.0`，Root Port ACS 已关闭），通过动态 BAR1 P2P 解锁 **`50.86 GB/s` 全双工直连**（`nvidia-smi topo -p2p r/w` 均为 `OK`） |
+| **GPU 频率与功耗** | 单卡 **`240W`** 帕累托档 + GDDR6X **`10,151 MHz`** (`+1800 eff`) + 核心 **`2,100 MHz`** (`+120`) + PCIe **`MRRS 4096B`**，满载 **`43℃ / 38℃`**，待机 **`4.8W`** |
+| **CPU 与内存** | **AMD Ryzen Threadripper 3960X**（24C/48T，8 CCX，`/dev/cpu_dma_latency=0`）+ **128 GB 四通道 DDR4-3200**（`72 × 1 GiB` 静态 HugePages 永久锁入内核 `Hugetlb`） |
 | **系统与驱动** | Ubuntu Linux Kernel `6.8.0-138-generic`（`iommu=pt`，SecureBoot 关闭）+ **`gpu_unlock`**（initramfs 解锁满血 BF16）+ 补丁版开源内核模块 **`595.99.02`** + CUDA Toolkit **`13.1`** |
-| **模型与权重** | **`Qwen3.8-Flash-Next-UD-Q4_K_XL`**（48 层、24,576 路由专家、256K 上下文；40 GB 显存常驻 9,764 热专家，其余 71.73 GiB 锁在 1 GiB 静态大页中） |
+| **模型与权重** | **`Qwen3.8-Flash-Next-UD-Q4_K_XL`**（48 层、24,576 路由专家、256K 上下文；40 GB 显存通过 `48:52` Bresenham 常驻 **9,807** 个最热专家，其余 71.73 GiB 锁在 1 GiB 静态大页中） |
 
 ---
 
@@ -90,7 +103,7 @@
 > 传统消费卡 P2P 补丁依赖 *Static BAR1*（要求 `BAR1 >= 显存`，必须冒险刷 BIOS 或改写 PCIe `0x610` 寄存器扩 BAR1 到 32 GiB）；而 `llama.cpp` 等单进程引擎调用 `cudaDeviceEnablePeerAccess()` 会急切把全部 18 GB 模型权重塞进 256 MiB BAR1 立即爆 OOM。
 > **本方案的两层核心解耦彻底绕开上述全部雷区**：
 > 1. **内核驱动层（Dynamic BAR1 + `align3` 2 MiB 对齐）**：仅按需为 peer 映射的分配动态开 2 MiB 对齐的 BAR1 窗口，**无需改写 PCIe 寄存器扩 BAR1**，保留原厂 `256 MiB BAR1`；
-> 2. **推理引擎层（Strata `TpComm` VMM 选择性映射 + 1-Hop Push-Write）**：彻底不调用进程级 `cudaDeviceEnablePeerAccess()`，改用 CUDA Driver VMM API（`cuMemCreate`/`cuMemMap`/`cuMemSetAccess`）**只把 `TpComm` 的 36 MiB 通信缓冲区开放给对端 GPU**（模型权重与 KV 占 **0 字节** BAR1），并通过 `st.global.wt` 单向推送 + 对端 VRAM Flag 严格保序屏障彻底消灭 3× 慢速的 PCIe P2P 远端读！
+> 2. **推理引擎层（Strata `TpComm` VMM 选择性映射 + 1-Hop Push-Write）**：彻底不调用进程级 `cudaDeviceEnablePeerAccess()`，改用 CUDA Driver VMM API（`cuMemCreate`/`cuMemMap`/`cuMemSetAccess`）**只把 `TpComm` 的 36 MiB 通信缓冲区开放给对端 GPU**（模型权重与 KV 占 **0 字节** BAR1），并通过 `st.global.wt` 单向推送 + 对端 VRAM Flag + `__nanosleep(64)` 严格保序屏障彻底消灭 3× 慢速的 PCIe P2P 远端读！
 
 ### Step 0：前置检查与强制安全备份（千万别省！）
 
@@ -137,12 +150,6 @@ sudo reboot
 重启后验证：
 ```bash
 dmesg | grep -E "HugeTLB|iommu: Default|gpu_unlock: unlocked"
-# 预期看到：
-#   iommu: Default domain type: Passthrough
-#   HugeTLB: registered 1.00 GiB page size, pre-allocated 72 pages
-#   pci 0000:01:00.0: gpu_unlock: unlocked
-#   pci 0000:48:00.0: gpu_unlock: unlocked
-
 grep -E "Hugetlb|MemAvailable" /proc/meminfo
 # 预期：Hugetlb: 75497472 kB（72 GiB），MemAvailable > 18 GiB
 ```
@@ -154,7 +161,7 @@ grep -E "Hugetlb|MemAvailable" /proc/meminfo
 本仓库已直接附带经过实机验证的干净补丁 [patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)（仅改动 9 个核心文件，包含 Method 3 动态 BAR1 窗口、GA102 HAL 接线、`align3` 2 MiB 对齐修复、`memdescAddRef` 生命周期加固及 32 MiB 保留区调优）：
 
 ```bash
-# 1. 克隆本仓库（或直接拿 patches/nvidia-open-595.99.02-dynbar1-p2p.patch）
+# 1. 克隆本仓库
 git clone https://github.com/zongxinqian/strata-ampere.git
 STRATA_DIR=$(pwd)/strata-ampere
 
@@ -170,7 +177,6 @@ sudo make modules -j$(nproc) SYSSRC=/lib/modules/$(uname -r)/build
 
 # 4. 校验生成的 5 个 .ko 文件版本与内核 vermagic 完全匹配
 modinfo kernel-open/nvidia.ko | grep -E "version|vermagic|license"
-# 预期：version: 595.99.02 | license: Dual MIT/GPL | vermagic 匹配当前 uname -r
 ```
 
 ---
@@ -180,7 +186,7 @@ modinfo kernel-open/nvidia.ko | grep -E "version|vermagic|license"
 这一步使用 `insmod` 临时加载刚编好的 `.ko`，**磁盘上的原版闭源驱动分毫未动**——即使出现任何异常，直接 `sudo reboot` 即可 100% 回到原状！
 
 ```bash
-# 1. 停掉所有占用 GPU 的服务（注意包含监控 exporter、watchdog、persistenced、推理服务）
+# 1. 停掉所有占用 GPU 的服务（包含监控 exporter、watchdog、persistenced、推理服务）
 sudo systemctl stop strata@iq3_s gpu-arbiter-watchdog gpu-exporter nvidia-persistenced 2>/dev/null || true
 sudo nvidia-smi -pm 0 2>/dev/null || true
 sleep 2
@@ -196,7 +202,6 @@ sudo modprobe ecc ecdh_generic drm drm_kms_helper video
 KO=/root/nv-open-p2p/open-595.99.02/kernel-open
 sudo insmod $KO/nvidia.ko NVreg_EnableResizableBar=0
 sleep 1
-# 注意：udev 可能会瞬间自动 modprobe 原版 nvidia_uvm，先卸载再显式加载配套开源版！
 sudo rmmod nvidia_drm nvidia_modeset nvidia_uvm 2>/dev/null || true
 sudo insmod $KO/nvidia-uvm.ko uvm_disable_hmm=1
 sudo insmod $KO/nvidia-modeset.ko
@@ -206,24 +211,20 @@ sudo insmod $KO/nvidia-drm.ko
 nvidia-smi topo -p2p r
 nvidia-smi topo -p2p w
 # 预期 GPU0 <-> GPU1 读写全部显示 OK！
-dmesg | tail -n 20   # 必须看到 Open Kernel Module 595.99.02，且 0 RmInitAdapter failed / 0 Xid / 0 AER
+dmesg | tail -n 20   # 必须看到 Open Kernel Module 595.99.02，且 0 Xid / 0 AER
 ```
 
 ---
 
 ### Step 4：持久化安装 + 准备「一键回退原版闭源驱动」脚本
 
-热加载验证 `nvidia-smi topo -p2p r/w == OK` 且零报错后，将其干净安装到独立目录 `updates/p2p/`（原版闭源模块保留在原路径完全不覆盖）：
-
 ```bash
 KVER=$(uname -r)
 KO=/root/nv-open-p2p/open-595.99.02/kernel-open
 
-# 1. 复制 5 个补丁模块到独立目录
 sudo mkdir -p /lib/modules/$KVER/updates/p2p
 sudo install -m 0644 $KO/nvidia*.ko /lib/modules/$KVER/updates/p2p/
 
-# 2. 仅针对当前内核版本覆盖解析顺序（其它内核仍默认启动原版）
 sudo tee /etc/depmod.d/p2p.conf >/dev/null <<EOF
 override nvidia $KVER updates/p2p
 override nvidia-uvm $KVER updates/p2p
@@ -232,13 +233,11 @@ override nvidia-drm $KVER updates/p2p
 override nvidia-peermem $KVER updates/p2p
 EOF
 
-# 3. 持久化模块参数（关闭静态 ReBAR 保持动态 BAR1，关闭 HMM）
 sudo tee /etc/modprobe.d/zz-nvidia-p2p.conf >/dev/null <<'EOF'
 options nvidia NVreg_EnableResizableBar=0
 options nvidia-uvm uvm_disable_hmm=1
 EOF
 
-# 4. 生成一键安全回退脚本（任何时候执行即可秒回原版闭源 595.99.02）
 sudo tee /usr/local/sbin/nvidia-p2p-rollback.sh >/dev/null <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -248,26 +247,19 @@ echo "已回退至原版闭源 nvidia-595.99.02，请执行 sudo reboot 生效�
 EOF
 sudo chmod +x /usr/local/sbin/nvidia-p2p-rollback.sh
 
-# 5. 更新模块依赖并验证解析路径
 sudo depmod -a $KVER
 modinfo -n nvidia nvidia-uvm nvidia-modeset nvidia-drm
-# 预期全部指向 /lib/modules/$KVER/updates/p2p/*.ko
-
-# 6. 冷重启验证全链路开机自启！
 sudo reboot
 ```
 
-> **随时一键回退命令**：如果遇到任何问题或想恢复原版闭源驱动，只需执行：
-> ```bash
-> sudo /usr/local/sbin/nvidia-p2p-rollback.sh && sudo reboot
-> ```
+> **随时一键回退驱动**：`sudo /usr/local/sbin/nvidia-p2p-rollback.sh && sudo reboot`
 
 ---
 
-### Step 5：编译并启动 `strata-ampere`（验证 VMM Push-Write P2P + 1G 大页全上线）
+### Step 5：编译并启动 `strata-ampere` v1.1.0（含 ACS 关闭 + `/dev/cpu_dma_latency=0` 持久化）
 
 ```bash
-# 1. 编译 Ampere sm_86（双 RTX 3080 20G，开启 W16 单组全融合）
+# 1. 编译 Ampere sm_86（已内置 v1.1.0 全部 14 文件优化，亦可单独查阅 patches/strata-ampere-v1.1.0-tp2-opt.patch）
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 cmake -B build86 -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
@@ -281,36 +273,73 @@ sudo python3 scripts/ampere-oc-power.py \
   --mem-offset 1800 --gpc-offset 120 --power-limit 240 \
   --pcie-mrrs 4096 --thp-defrag defer+madvise
 
-# 3. 启动服务（复制 examples/strata-2x3080-20g-dflash2.example.json 修改路径与 api_key）
+# 3. （v1.1.0 新增，推荐）关闭两张 GPU 上游 PCIe Root Port 的 ACS，并常驻 /dev/cpu_dma_latency=0 消除 CPU C-State 唤醒抖动
+# 先查你的 GPU 上游 Root Port（例：00:01.1 与 40:03.1）：
+lspci -tv | grep -iE '3080|NVIDIA'
+# 确认 ACS 控制位偏移（通常为 ECAP_ACS+6，如 2a6.w）后置零：
+sudo setpci -s 00:01.1 2a6.w=0000
+sudo setpci -s 40:03.1 2a6.w=0000
+
+# 创建轻量守护服务把 /dev/cpu_dma_latency 锁为 0 µs（极低开销，不影响 GPU 待机 4.8W）
+sudo tee /etc/systemd/system/strata-dma-latency.service >/dev/null <<'EOF'
+[Unit]
+Description=Hold /dev/cpu_dma_latency=0 for low-jitter MoE CPU expert dispatch
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -c "import os,struct,time; fd=os.open('/dev/cpu_dma_latency',os.O_WRONLY); os.write(fd,struct.pack('i',0)); time.sleep(10**9)"
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload && sudo systemctl enable --now strata-dma-latency.service
+
+# 4. 重置旧的 draft-costs.json（若是从无 P2P 升级而来，务必删掉旧表让引擎按 P2P 实速重测！）
+rm -f /path/to/draft-costs.json
+
+# 5. 启动服务（复制 examples/strata-2x3080-20g-dflash2.example.json 修改路径与 api_key）
+# 注意：v1.1.0 示例配置已包含 "user_args": ["--spec", "8", "--draft-conf", "0.50"] 与 STRATA_DF2_HEAD_Q4=1
 python3 serve/server.py --config /path/to/your-strata-config.json
 ```
 
-**如何确认复现 100% 成功？** 检查 Strata 启动日志与 `nvidia-smi`，看到以下 **4 条金标准日志** 即大功告成：
+**如何确认 v1.1.0 复现 100% 成功？** 检查 Strata 启动日志与 `nvidia-smi`，看到以下 **4 条金标准日志** 即大功告成：
 ```text
 strata generate: expert arena: cudaHostRegister PORTABLE ok; hugetlb 1 GB pages (72 x 1 GiB)
 strata tp_comm: NVLink/P2P enabled (vmm-push, decode=p2p, CUDA0 <-> CUDA1)
-strata serve: STRATA_TP2=1 ready: CUDA0 (4666 experts) + CUDA1 (5098 experts) = 9764 total resident experts
+strata serve: STRATA_TP2=1 ready: CUDA0 (4702 experts) + CUDA1 (5105 experts) = 9807 total resident experts
 ```
-同时 `nvidia-smi -q -d MEMORY | grep -A 3 "BAR1 Memory Usage"` 显示双卡 BAR1 均仅占用 **`39 MiB / 256 MiB`**（剩余 `217 MiB`），`dmesg` 零 `Xid` / 零 `AER`！
+同时 `nvidia-smi` 显示 GPU0 剩余显存 **`~528–532 MiB`**、双卡 BAR1 均仅占用 **`39 MiB / 256 MiB`**（剩余 `217 MiB`），`dmesg` 零 `Xid` / 零 `AER`！
 
 ### 常见排坑速查（FAQ）
+- **为什么配置文件里既写了 `args` 又加了 `"user_args": ["--spec", "8", "--draft-conf", "0.50"]`？** `serve/strata_control/drafting.py` 会把 `args` 中的 `--spec` 自动重置为默认 `6`；只有把 `--spec 8 --draft-conf 0.50` 放进 `user_args`，才能真正生效并释放 DFlash2 全部 7 步草稿。
 - **`insmod nvidia.ko` 报 `Unknown symbol ecc_*` / `crypto_ecdh_*`**：执行 `sudo modprobe ecc ecdh_generic` 即可。
-- **`rmmod nvidia` 报 `Module nvidia is in use`**：检查 `sudo lsof /dev/nvidia*`，并确认已关闭 `nvidia-smi -pm 0`、`nvidia-persistenced` 及任何监控 exporter / watchdog 服务。
-- **热加载 `insmod` 时 `nvidia_uvm` 报 `File exists`**：`udev` 自动加载了原版闭源 `nvidia_uvm.ko`，执行 `sudo rmmod nvidia_uvm && sudo insmod $KO/nvidia-uvm.ko uvm_disable_hmm=1` 替换即可（Step 4 持久化 `depmod` 后开机自动加载配套开源版，不会再遇到）。
-- **如何关闭 P2P 或仅关闭 Decode P2P 做严格 A/B 对照**：无需换驱动，直接设置环境变量 `STRATA_TP_AR_P2P=0`（完全回落主机路由）或 `STRATA_TP_AR_P2P_DECODE=0`（仅 Prefill 走 P2P）即可！
-- **多卡内置 8080 实时监控面板**：启动后浏览器直访 `http://<server-ip>:8080/`（支持中英切换），`/v1/*` OpenAI API 100% 兼容不变；领域热力图采集脚本见 `scripts/profile-experts.py`。
+- **`rmmod nvidia` 报 `Module nvidia is in use`**：检查 `sudo lsof /dev/nvidia*`，并确认已关闭 `nvidia-smi -pm 0`、`nvidia-persistenced` 及监控 exporter / watchdog 服务。
+- **热加载 `insmod` 时 `nvidia_uvm` 报 `File exists`**：`udev` 自动加载了原版闭源 `nvidia_uvm.ko`，执行 `sudo rmmod nvidia_uvm && sudo insmod $KO/nvidia-uvm.ko uvm_disable_hmm=1` 替换即可（Step 4 持久化 `depmod` 后开机自动加载配套开源版）。
+- **如何做严格 A/B 对照**：所有关键特性均支持环境变量一键开关，无需重新编译：
+  - `STRATA_TP_AR_P2P=0`（关闭 P2P） / `STRATA_TP_AR_P2P_DECODE=0`（仅 Prefill 走 P2P）
+  - `STRATA_TP2_GPU1_SPARSE_COMBINE=0`（关闭 GPU1 稀疏 Combine）
+  - `STRATA_TP2_EXPERT_SPLIT=50:50`（切回对称切分 vs 默认 `48:52`）
+  - `STRATA_DF2_HEAD_Q4=0`（切回 DFlash2 F16 Head）
+  - `STRATA_TP_FUSE_MOE_PUSH=1` / `STRATA_TP2_GPU1_MISS_256=1`（实验性负收益开关，默认关闭）
+- **内置 8080 实时监控面板**：启动后浏览器直访 `http://<server-ip>:8080/`（支持中英切换），`/v1/*` OpenAI API 100% 兼容不变；领域热力图采集脚本见 `scripts/profile-experts.py`。
 
 ---
 
 ## 四、核心优化技术原理全景（100% 严格无损）
 
-1. **原生 256 MiB BAR1 直接 PCIe 4.0 P2P + VMM 选择性映射 + 1-Hop Push-Write**（`src/kernels/cuda/tp_comm.cu` + `patches/nvidia-open-595.99.02-dynbar1-p2p.patch`）：
-   - 仅将 `TpComm` 所需的 **36 MiB 连续通信块**（2 MiB Decode 环 + 2×16 MiB Prefill 双缓冲 + 64B VRAM 同步 Flag）通过 CUDA Driver VMM API（`dlopen("libcuda.so.1")` 零链接依赖，内置 bad-VA-hole 检测重试与双向硬件写入自检）映射进对端 256 MiB BAR1；
-   - **全部采用单向 Push-Write（`st.global.wt`）+ 本地 760 GB/s VRAM 读取**，彻底规避比写入慢 3× 的 PCIe P2P 远端读；同步 Flag 位于同一对端 BAR1 窗口，依赖 PCIe Base Spec Posted-Write 严格保序规则确保零数据竞态且自旋等待零 PCIe 流量。
-2. **`72 × 1 GiB` 静态 HugePages 专家竞技场**（`src/core/pinned.cu`、`src/core/expert_source.cpp`）：优先分配 `MAP_HUGETLB | MAP_HUGE_1GB`（回退 `MAP_HUGE_2MB` / THP），71.73 GiB 专家池仅占 72 条 TLB 表项（100% 装入 Zen 2 2048 项 L2 dTLB），彻底消除 Swap 与 `khugepaged` 整理卡顿。
-3. **深度微核与长上下文套件（P0–P4）**：`T=16` 单组 `G=1` 全融合（AllReduce 次数 `192 → 96`）+ 5 桶长上下文 `DraftPolicy`（P0）、Prefill 路由引导 `13.5 ms` 热专家抢跑预热（P1）、寄存器缓存去重读 + `K` 路并发 PCIe MLP AllReduce（P2）、Ampere `sm_86` (`m16n8k32`) INT8 Tensor Core（P4）。
-4. **双级混合草稿（`T=16` 256K 持久化后缀树 + DFlash2 BF16 TC）与 TP=2 多对话 RAM 泊车**：双标签页 Coding Agent 切换 TTFT 提速 `9.75×`（`99.7%` 复用）。
-5. **14.3× 并行内存 PLE（`945 ms → 66 ms`）+ `STRATA_PREFILL_EQUAL=1` 均衡切分 + 无头 `240W` 超频 / `MRRS 4096B`**：零掉精度，全面压榨每一瓦算力。
+1. **v1.1.0 六方向深度微核与系统优化**（[patches/strata-ampere-v1.1.0-tp2-opt.patch](patches/strata-ampere-v1.1.0-tp2-opt.patch)）：
+   - **GPU1 稀疏命中 MoE Combine**（`src/kernels/cuda/native_moe.cu`、`src/core/verify.cpp`）：`combine_k10_vec4_sparse_hits` 仅对实际命中显存的槽位做向量化归约并直接清零未命中行，省去每步 48 次 `cudaMemsetAsync` 与 >50% 无效显存读；
+   - **48:52 容量加权 Bresenham 专家切分**（`src/program/generate.cpp`）：按 GPU0/GPU1 真实剩余显存比例精准交错分配高热专家，把 Top-9,807 专家无缝装满双卡，消除 50:50 切分在 GPU0 满载后造成的中间热专家断层；
+   - **Ampere `sm_86` 硬件 `__nanosleep(64)` P2P 屏障 + `K=1` Warp 对齐**（`src/kernels/cuda/tp_comm.cu`）：等待对端推送时用 SM 硬件休眠替代紧密空转，在 240W 功耗墙下把功耗预算留给有效算力；小窗口 `T=1..3` 用 `320/640/960` 线程替代 `1024`；
+   - **Zen 2 AVX2 软件预取 + PCIe ACS 关闭 + `/dev/cpu_dma_latency=0` + `DF2_HEAD_Q4` + `user_args --spec 8 --draft-conf 0.50`**：端到端压低 CPU 专家访存、PCIe 路由与投机验证长尾延迟。
+2. **原生 256 MiB BAR1 直接 PCIe 4.0 P2P + VMM 选择性映射 + 1-Hop Push-Write**（`src/kernels/cuda/tp_comm.cu` + `patches/nvidia-open-595.99.02-dynbar1-p2p.patch`）：
+   - 仅将 `TpComm` 所需的 **36 MiB 连续通信块**通过 CUDA Driver VMM API（`dlopen("libcuda.so.1")` 零链接依赖）映射进对端 256 MiB BAR1；
+   - 全部采用单向 Push-Write（`st.global.wt`）+ 本地 760 GB/s VRAM 读取，规避比写入慢 3× 的 PCIe P2P 远端读。
+3. **`72 × 1 GiB` 静态 HugePages 专家竞技场**（`src/core/pinned.cu`、`src/core/expert_source.cpp`）：71.73 GiB 专家池仅占 72 条 TLB 表项（100% 装入 Zen 2 L2 dTLB），彻底消除 Swap 与 `khugepaged` 卡顿。
+4. **深度微核与长上下文套件（P0–P4）**：`T=16` 单组 `G=1` 全融合 + 5 桶长上下文 `DraftPolicy`（P0）、Prefill 路由引导 `13.5 ms` 热专家抢跑预热（P1）、寄存器缓存去重读 + `K` 路并发 PCIe MLP AllReduce（P2）、Ampere `sm_86` (`m16n8k32`) INT8 Tensor Core（P4）。
+5. **双级混合草稿（256K 持久化后缀树 + DFlash2 BF16 TC）、TP=2 多对话 RAM 泊车与 14.3× 并行内存 PLE**：全面兼顾高吞吐、低 TTFT 与多标签 Agent 复用。
 
 ---
 

@@ -4989,12 +4989,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const size_t loff = (size_t) d.layers * (size_t) d.n_expert;
         const int32_t* __restrict__ r0 = d.host_res + loff;
         const int32_t* __restrict__ r1 = d.tp_res1 + loff;
+        const int miss_frac = (n_tok >= d.tp2_miss_min_t) ? d.tp2_miss_256 : 0;
+        auto gpu1_takes_miss = [miss_frac](int layer, int32_t eid) -> bool {
+            if (miss_frac <= 0) return false;
+            if (miss_frac >= 256) return true;
+            const uint32_t h = (uint32_t) (layer * 512 + eid) * 2654435761u;
+            return (int) (h >> 24) < miss_frac;
+        };
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
             if (e >= 0 && e < d.n_expert) {
                 if (r0[e] >= 0) kind[i] = 0;
                 else if (r1[e] >= 0) kind[i] = 2;
-                else {
+                else if (gpu1_takes_miss((int) d.layers, e)) {
+                    kind[i] = 2;
+                    if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
+                } else {
                     kind[i] = -1;
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
                 }

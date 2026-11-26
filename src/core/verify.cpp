@@ -2563,6 +2563,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     int32_t* const r_pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
                     const uint32_t r_ring = (uint32_t) ((l - lb_) * G + grp + 1);
                     const bool is_rank1 = (tp_ != nullptr && tp_rank_ == 1);
+                    const int r_miss_frac = (n >= hits_.tp2_miss_min_t) ? hits_.tp2_miss_256 : 0;
                     native_router_fused_bf16_bell_plan(
                         mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, n,
                         w_sgi != nullptr ? (const uint16_t*) w_sgi->data : nullptr,
@@ -2570,10 +2571,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         is_rank1 ? nullptr : (m_x_ + tb * N), ids_ + tb * K, w_ + tb * K,
                         is_rank1 ? nullptr : (m_ids_ + tb * K), is_rank1 ? nullptr : m_seq_, r_ring,
                         is_rank1 ? (hits_.d_res + l * NE) : (hits_.d_res_self + l * NE),
-                        is_rank1 ? nullptr : (hits_.d_res_peer + l * NE),
+                        hits_.d_res_peer != nullptr ? (hits_.d_res_peer + l * NE) : nullptr,
                         hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                         r_pl, (long long) max_t_ * K, is_rank1 ? nullptr : (skip_ + grp),
-                        router_ctr_, !is_rank1, cs);
+                        router_ctr_, !is_rank1, cs,
+                        (is_rank1 && hits_.d_host_blobs != nullptr) ? (const unsigned long long*) (hits_.d_host_blobs + l * NE) : nullptr,
+                        (int) l, r_miss_frac);
                     sg_ready = (w_sgi != nullptr);
                     tp2_planned_[grp] = true;
                 } else {
@@ -2825,20 +2828,34 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
+        bool tp1_sparse_combine = false;
         const bool use_tp2_dev_plan = tp2_dev_plan_runtime();
         if (tp_ != nullptr && tp_rank_ == 1) {
+            static const bool tp1_sparse_env = [] {
+                const char* v = std::getenv("STRATA_TP2_GPU1_SPARSE_COMBINE");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            tp1_sparse_combine = tp1_sparse_env && !prof_on_ && dec_batch && n >= 1 &&
+                                 native_moe_combine_enabled() && n <= strata::kernels::kVerifyMaxT &&
+                                 native_moe_combine_hits_supported(parts_out, shared_ + tb * N, bo_ + tb * N, N, K, n);
             if (use_tp2_dev_plan) {
-                if (!tp2_planned_[grp])
-                    tp2_resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * NE, nullptr, (int) NE,
+                if (!tp2_planned_[grp]) {
+                    const int p_miss_frac = (n >= hits_.tp2_miss_min_t) ? hits_.tp2_miss_256 : 0;
+                    tp2_resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * NE,
+                                      hits_.d_res_peer != nullptr ? (hits_.d_res_peer + l * NE) : nullptr, (int) NE,
                                       hits_.cache_base, slot_off_d_, (long long) hits_.blob, pl, (long long) max_t_ * K,
-                                      nullptr, 0, cs);
+                                      nullptr, 0, cs,
+                                      hits_.d_host_blobs != nullptr ? (const unsigned long long*) (hits_.d_host_blobs + l * NE) : nullptr,
+                                      (int) l, p_miss_frac);
+                }
             } else if (fuse_wait_on() && !prof_on_ && m_bal_ == nullptr) {
                 wait_copy_i32_from_mapped(m_flagA_, ring, pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             } else {
                 wait_flag_ge(m_flagA_, ring, cs);
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
-            cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs);
+            if (!tp1_sparse_combine)
+                cudaMemsetAsync(parts_out, 0, (size_t) n * K * N * sizeof(float), cs);
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
             stamp(l, 20, grp);
@@ -2850,10 +2867,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else {
             strata::dispatch::notef("experts layer: partial residency, plan from %ld (1 = device plan, 0 = host pool), pcie_mode=%ld, remote_opt=%ld", (long) (device_plan_ || use_tp2_dev_plan), (long) sink_.pcie_mode, (long) (remote_opt_ != nullptr));
             if (use_tp2_dev_plan) {
-                if (!tp2_planned_[grp])
+                if (!tp2_planned_[grp]) {
+                    const int p_miss_frac = (n >= hits_.tp2_miss_min_t) ? hits_.tp2_miss_256 : 0;
                     tp2_resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res_self + l * NE, hits_.d_res_peer + l * NE,
                                       (int) NE, hits_.cache_base, slot_off_d_, (long long) hits_.blob, pl, (long long) max_t_ * K,
-                                      skip_ + grp, ring, cs);
+                                      skip_ + grp, ring, cs, nullptr, (int) l, p_miss_frac);
+                }
             } else if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
                 wait_flag_ge_or(m_flagA_, ring, skip_ + grp, cs);
                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring, cs);
@@ -2932,13 +2951,51 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
         strata::dispatch::notef("combine layer: kind %ld (0 per-token, 1 multi, 2 multi+hits, 3 multi+hits gated)", (long) (sg_gated_[grp] ? 3 : hits_in_combine ? 2 : (dec_batch && n >= 1 && native_moe_combine_enabled()) ? 1 : 0));
+        static const bool fuse_moe_push_env = [] {
+            const char* v = std::getenv("STRATA_TP_FUSE_MOE_PUSH");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        bool pushed_in_combine = false;
+        TpComm::P2pPushTarget push_tgt;
+        const bool can_fuse_push = tp_ != nullptr && !remote_opt_ && fuse_moe_push_env && (N & 7) == 0 &&
+                                   ((tp_rank_ == 1 && tp1_sparse_combine) ||
+                                    (tp_rank_ == 0 && !ar_on() && (sg_gated_[grp] || hits_in_combine))) &&
+                                   tp_->p2p_push_target((int) (n * N), tp_step + 1, tp_rank_, push_tgt);
+        if (can_fuse_push) {
+            ++tp_step;
+            try {
+                if (tp_rank_ == 1) {
+                    native_moe_combine_multi_sparse_hits_push(
+                        parts_out, p_dst, p_counts + 1, w_ + tb * K, shared_ + tb * N,
+                        sg_gated_[grp] ? (sh_g_ + tb) : nullptr, bo_ + tb * N,
+                        push_tgt.peer_slot_buf, push_tgt.peer_flag, push_tgt.done_ctr, push_tgt.step,
+                        N, K, n, cs);
+                } else {
+                    native_moe_combine_multi_hits_added_push(
+                        parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K, shared_ + tb * N,
+                        sg_gated_[grp] ? (sh_g_ + tb) : nullptr, bo_ + tb * N,
+                        push_tgt.peer_slot_buf, push_tgt.peer_flag, push_tgt.done_ctr, push_tgt.step,
+                        N, K, n, cs);
+                }
+                pushed_in_combine = true;
+            } catch (const std::exception& e) { err = "verify combine+push: " + std::string(e.what()); return false; }
+        } else
         if (sg_gated_[grp]) {   // STRATA_LFUSE: shared expert's gate deferred into combine
             try {
                 if (!ar_on() && !(tp_ != nullptr && tp_rank_ == 1))
                     native_moe_combine_multi_hits_added_gated(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1,
                                                               w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+                else if (tp1_sparse_combine)
+                    native_moe_combine_multi_sparse_hits_gated(parts_out, p_dst, p_counts + 1,
+                                                               w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
                 else
                     native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else
+        if (tp1_sparse_combine) {
+            try {
+                native_moe_combine_multi_sparse_hits(parts_out, p_dst, p_counts + 1,
+                                                     w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         if (hits_in_combine) {
@@ -2959,8 +3016,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
-        if (tp_ != nullptr)
-            tp_->allreduce_add(bo_ + tb * N, (int) (n * N), ++tp_step, tp_rank_, cs);
+        if (tp_ != nullptr) {
+            if (pushed_in_combine)
+                tp_->allreduce_wait_add_bf16(bo_ + tb * N, (int) (n * N), tp_step, tp_rank_, cs);
+            else
+                tp_->allreduce_add(bo_ + tb * N, (int) (n * N), ++tp_step, tp_rank_, cs);
+        }
         stamp(l, 24, grp);
         if (tap_on_ && (!batch_rec_ || tap_batch_) && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
             // the layer's completed output: R with this FFN half's write applied (the next layer's read would fold it), the mean of

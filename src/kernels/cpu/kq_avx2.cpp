@@ -123,6 +123,10 @@ void q4k_dot_nt(const block_q4_K* x, int nb, const void* const* act,
     alignas(16) __m128 acc_m[NT];
     for (int t = 0; t < NT; ++t) acc_m[t] = _mm_setzero_ps();
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*) &x[i + 2], _MM_HINT_T0);
+            _mm_prefetch((const char*) &x[i + 2] + 64, _MM_HINT_T0);
+        }
         float xd, xdmin;
         half_pair(&x[i], xd, xdmin);
         __m256i scales;
@@ -205,6 +209,10 @@ void q5k_dot_nt(const block_q5_K* x, int nb, const void* const* act,
         for (int t = 0; t < NT; ++t) { _mm256_store_ps(acc_mem[t], _mm256_setzero_ps()); summs[t] = 0.0f; }
     }
     for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*) &x[i + 2], _MM_HINT_T0);
+            _mm_prefetch((const char*) &x[i + 2] + 64, _MM_HINT_T0);
+        }
         float xd, xdmin;
         half_pair(&x[i], xd, xdmin);
         __m256i scales;

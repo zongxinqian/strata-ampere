@@ -100,6 +100,9 @@ struct VerifyHits {
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
+    const uint64_t* d_host_blobs = nullptr; ///< TP2 GPU1: [n_layers * n_expert] device ptrs into 1G-HugePage portable arena
+    int tp2_miss_256 = 0;                   ///< TP2: deterministic 0..256 fraction of missed experts offloaded to GPU1 PCIe
+    int tp2_miss_min_t = 1;                 ///< TP2: minimum token count n to enable GPU1 PCIe miss offload
 };
 
 class Verifier {
