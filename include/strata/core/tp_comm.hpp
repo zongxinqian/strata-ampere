@@ -11,6 +11,7 @@ public:
     static constexpr size_t kRingSlots = 8;
     static constexpr size_t kP2pDecSlotFloats = 65536;
     static constexpr int64_t kP2pPipeElems = 8LL << 20;
+    static constexpr int kP2pPipeSlots = 8;
 
     TpComm() = default;
     ~TpComm();
@@ -27,15 +28,30 @@ public:
         uint32_t step = 0;
     };
     void allreduce_add(float* local_buf, int n_elems, uint32_t step, int rank, void* stream);
+    bool allreduce_add_gr_norm(float* local_buf, float* R_base, const float* inj_base,
+                               const float* w_norm, float* xn_out, float* rs_out,
+                               float eps, int n_tok, int N, int HC,
+                               uint32_t step, int rank, void* stream, bool also_write_bo = false);
     bool p2p_push_target(int n_elems, uint32_t step, int rank, P2pPushTarget& out) const;
     void allreduce_wait_add_bf16(float* local_buf, int n_elems, uint32_t step, int rank, void* stream);
     void allreduce_add_large(float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream);
+    void* p2p_head_arg(int dst_rank) const { return (p2p_dec_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_head_arg_[dst_rank] : nullptr; }
+    uint32_t* p2p_head_flag(int dst_rank) const { return (p2p_dec_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_head_flag_[dst_rank] : nullptr; }
+    void* p2p_df2_buf(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_tx_[dst_rank][0] : nullptr; }
+    uint32_t* p2p_df2_flag(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_df2_flag_[dst_rank] : nullptr; }
+    bool p2p_gather_logits_rank0(const float* logits0_dev, const float* logits1_dev,
+                                 int T, int64_t half0, int64_t half1, int64_t full_vocab,
+                                 float* full_logits_dev0, void* stream0, void* stream1);
+    bool p2p_swap_expert_blobs(void* slot0_dev, void* slot1_dev, size_t bytes,
+                               void* stream0, void* stream1);
     size_t max_floats() const { return max_floats_; }
     size_t slot_floats() const { return slot_floats_; }
     bool p2p() const { return p2p_; }
+    bool p2p_vmm() const { return p2p_vmm_; }
 
 private:
     bool ensure_pipe(int rank);
+    bool ensure_p2p_pipe(int rank);
     void release_pipe();
 
     int dev_[2] = {0, 1};
@@ -51,6 +67,13 @@ private:
     void* d_p2p_tx_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
     uint32_t* d_p2p_flag_[2] = {nullptr, nullptr};
     uint32_t* d_done_ctr_[2] = {nullptr, nullptr};
+    void* d_p2p_head_arg_[2] = {nullptr, nullptr};
+    uint32_t* d_p2p_head_flag_[2] = {nullptr, nullptr};
+    uint32_t* d_p2p_logits_flag_[2] = {nullptr, nullptr};
+    uint32_t* d_p2p_swap_flag_[2] = {nullptr, nullptr};
+    uint32_t* d_p2p_df2_flag_[2] = {nullptr, nullptr};
+    uint32_t logits_step_ = 0;
+    uint32_t swap_step_ = 0;
     // Optional VMM backing (selective peer BAR1 mapping without process-wide cudaDeviceEnablePeerAccess)
     void* vmm_base_[2] = {nullptr, nullptr};
     uint64_t vmm_handle_[2] = {0, 0};
@@ -63,8 +86,10 @@ private:
     void* ev_bar_[2] = {nullptr, nullptr};
     void* ev_done_[2] = {nullptr, nullptr};
     void* ev_rx_[2][2] = {{nullptr, nullptr}, {nullptr, nullptr}};
+    void* ev_p2p_rx_[2][kP2pPipeSlots] = {};
     size_t pipe_bytes_ = 0;
     bool pipe_init_[2] = {false, false};
+    bool p2p_pipe_init_[2] = {false, false};
     bool p2p_ = false;
     bool p2p_dec_ = false;
 };

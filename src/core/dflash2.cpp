@@ -3,6 +3,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/tp_comm.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -70,12 +71,30 @@ bool df2_head_q4_enabled() {
     return on;
 }
 
+bool df2_head_tp2_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DF2_HEAD_TP2");
+        return !(v != nullptr && std::atoi(v) == 0);
+    }();
+    return on;
+}
+
 }  // namespace
 
 Dflash2Drafter::~Dflash2Drafter() {
     if (device_ < 0) return;
     prof_report();
     prof_free();
+    if (peer_dev_ >= 0 && (peer_cs_ || peer_exec_ || peer_dhead_ || peer_dvocab_ || peer_xil_ ||
+                           peer_logits_ || peer_topval_ || peer_toptok_ || peer_topscratch_)) {
+        const OnDevice on_peer(peer_dev_);
+        if (peer_cs_) cudaStreamSynchronize(peer_cs_);
+        if (peer_exec_) cudaGraphExecDestroy(peer_exec_);
+        auto frp = [](void* p) { if (p) cudaFree(p); };
+        frp(peer_dhead_); frp(peer_dvocab_); frp(peer_xil_); frp(peer_logits_);
+        frp(peer_topval_); frp(peer_toptok_); frp(peer_topscratch_);
+        if (peer_cs_) cudaStreamDestroy(peer_cs_);
+    }
     const OnDevice on_device(device_);
     if (cs_) cudaStreamSynchronize(cs_);
     for (cudaGraphExec_t& e : exec_)
@@ -478,6 +497,62 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         head_rows = (int64_t) vocab.size();
     }
     if (!bind_raw(embed, hw, bind_head_type, head_rows, vocab, err)) return false;
+    // Wave 2B: P2P TP=2 Vocab-Parallel Draft Head (split 32K draft head 50/50 across GPU0 & GPU1)
+    if (df2_head_tp2_enabled() && tp_comm_ != nullptr && tp_comm_->p2p_vmm() && peer_dev_ >= 0 && peer_dev_ != device_ &&
+        !vocab.empty() && dhead_ != nullptr && !dhead_shared_ && !blob_shared_ && !head_native &&
+        (head_device < 0 || head_device == device_) && n_dvocab_ >= 256) {
+        const int64_t h0 = ((n_dvocab_ / 2) + 31) & ~31LL;
+        const int64_t h1 = n_dvocab_ - h0;
+        if (h0 >= 64 && h1 >= 64) {
+            const size_t bytes0 = (size_t) (h0 * bind_row_bytes);
+            const size_t bytes1 = (size_t) (h1 * bind_row_bytes);
+            std::vector<uint8_t> h_tail(bytes1);
+            bool ok_tp = (cudaMemcpy(h_tail.data(), dhead_ + bytes0, bytes1, cudaMemcpyDeviceToHost) == cudaSuccess);
+            if (ok_tp) {
+                const OnDevice on_peer(peer_dev_);
+                int plo = 0, phi = 0;
+                cudaDeviceGetStreamPriorityRange(&plo, &phi);
+                static const bool hi_prio = [] { const char* e = std::getenv("STRATA_DF2_PRIO"); return !(e && e[0] == '0'); }();
+                ok_tp = (cudaStreamCreateWithPriority(&peer_cs_, cudaStreamNonBlocking, hi_prio ? phi : 0) == cudaSuccess) &&
+                        (cudaMalloc((void**) &peer_dhead_, bytes1) == cudaSuccess) &&
+                        (cudaMalloc((void**) &peer_dvocab_, (size_t) h1 * sizeof(int32_t)) == cudaSuccess) &&
+                        (cudaMalloc((void**) &peer_xil_, kernels::native_q8_1_il_bytes(N_, kRows) + 4096) == cudaSuccess) &&
+                        (cudaMalloc((void**) &peer_logits_, (size_t) kDrafts * (size_t) h1 * sizeof(float)) == cudaSuccess) &&
+                        (cudaMalloc((void**) &peer_topval_, (size_t) kDrafts * 16 * sizeof(float)) == cudaSuccess) &&
+                        (cudaMalloc((void**) &peer_toptok_, (size_t) kDrafts * 16 * sizeof(int32_t)) == cudaSuccess) &&
+                        (cudaMalloc((void**) &peer_topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2 * sizeof(uint32_t)) == cudaSuccess) &&
+                        (cudaMemcpy(peer_dhead_, h_tail.data(), bytes1, cudaMemcpyHostToDevice) == cudaSuccess) &&
+                        (cudaMemcpy(peer_dvocab_, vocab.data() + h0, (size_t) h1 * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess);
+                if (!ok_tp) {
+                    (void) cudaGetLastError();
+                    auto frp = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
+                    frp(peer_dhead_); frp(peer_dvocab_); frp(peer_xil_); frp(peer_logits_);
+                    frp(peer_topval_); frp(peer_toptok_); frp(peer_topscratch_);
+                    if (peer_cs_) { cudaStreamDestroy(peer_cs_); peer_cs_ = nullptr; }
+                }
+            } else {
+                (void) cudaGetLastError();
+            }
+            if (ok_tp) {
+                uint8_t* shrunk = nullptr;
+                if (cudaMalloc((void**) &shrunk, bytes0) == cudaSuccess &&
+                    cudaMemcpy(shrunk, dhead_, bytes0, cudaMemcpyDeviceToDevice) == cudaSuccess) {
+                    cudaFree(dhead_);
+                    dhead_ = shrunk;
+                    head_w_ = dhead_;
+                    vram_ -= bytes1;
+                } else {
+                    if (shrunk) cudaFree(shrunk);
+                    (void) cudaGetLastError();
+                }
+                h0_rows_ = h0;
+                h1_rows_ = h1;
+                tp_head_on_ = true;
+                std::fprintf(stderr, "strata dflash2: P2P TP=2 draft head ON (GPU%d %lld rows + GPU%d %lld rows, %.1f MiB/GPU)\n",
+                             device_, (long long) h0, peer_dev_, (long long) h1, (double) bytes1 / 1048576.0);
+            }
+        }
+    }
     std::fprintf(stderr, "strata dflash2: %lld-token draft head%s (%.1f MiB%s), drafter %.0f MiB of VRAM (%s weights)\n", (long long) n_dvocab_,
                  bind_head_type == GGML_Q4_0 ? " as Q4_0" : "",
                  (double) (n_dvocab_ * bind_row_bytes) / 1048576.0,
@@ -598,6 +673,11 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
             stamp("df2_conv_rms_quant");
         }
         native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
+        const bool use_tp_head = tp_head_on_ && !skip_part("head");
+        if (use_tp_head) {
+            df2_p2p_push_bytes_signal(xq_, tp_comm_->p2p_df2_buf(1), kernels::native_q8_1_bytes(N_, ndraft_),
+                                      tp_comm_->p2p_df2_flag(1), cs);
+        }
         df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_, xdp_, cs);   // and the selector projection's
         const bool hs_fork = fork_ && cs2_ != nullptr && ev_hs_[0] != nullptr;   // the selector's projection beside the head, the top-k and their launches
         if (hs_fork) {
@@ -606,17 +686,21 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
             gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs2_, xqp_, xdp_);
             cudaEventRecord(ev_hs_[1], cs2_);
         }
+        const int head_n = use_tp_head ? (int) h0_rows_ : (int) n_dvocab_;
         if (!skip_part("head")) {
             // the verify window's head kernel (interleaved activations, rows a warp by the card's table): bitwise native_mmvq's output, so the drafts are the same
             static const bool il_on = [] { const char* e = std::getenv("STRATA_DF2_HEAD_IL"); return !(e && e[0] == '0'); }();
-            if (il_on && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
+            if (il_on && native_mmvq_il_supported(head_type_, ndraft_, head_n)) {
                 native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
-                native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+                native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, head_n, ndraft_, cs);
             } else
-                native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+                native_mmvq(head_type_, head_w_, xq_, logits_, N_, head_n, ndraft_, cs);
         }
         stamp("native_mmvq");
-        df2_topk(logits_, (int) n_dvocab_, dvocab_, ndraft_, topscratch_, topval_, toptok_, cs);
+        df2_topk(logits_, head_n, dvocab_, ndraft_, topscratch_, topval_, toptok_, cs);
+        if (use_tp_head) {
+            df2_p2p_wait_merge_top16(tp_comm_->p2p_df2_flag(0), tp_comm_->p2p_df2_buf(0), topval_, toptok_, ndraft_, cs);
+        }
         stamp("df2_topk");
         if (hs_fork) cudaStreamWaitEvent(cs, ev_hs_[1], 0);
         else gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs, xqp_, xdp_);
@@ -665,6 +749,44 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     cudaGraphDestroy(graph);
     cudaGraphUpload(exec_[n], cs_);
     cudaStreamSynchronize(cs_);
+    if (tp_head_on_ && !capture_peer_head(err)) return false;
+    return true;
+}
+
+void Dflash2Drafter::launch_peer_head_direct() {
+    if (!tp_head_on_) return;
+    const OnDevice on_peer(peer_dev_);
+    const uint8_t* pxq = static_cast<const uint8_t*>(tp_comm_->p2p_df2_buf(1));
+    kernels::df2_p2p_wait_reset(tp_comm_->p2p_df2_flag(1), peer_cs_);
+    static const bool il_on = [] { const char* e = std::getenv("STRATA_DF2_HEAD_IL"); return !(e && e[0] == '0'); }();
+    if (il_on && kernels::native_mmvq_il_supported(head_type_, ndraft_, (int) h1_rows_)) {
+        kernels::native_q8_1_interleave(pxq, peer_xil_, N_, ndraft_, peer_cs_);
+        kernels::native_mmvq_il(head_type_, peer_dhead_, pxq, peer_xil_, peer_logits_, N_, (int) h1_rows_, ndraft_, peer_cs_);
+    } else {
+        kernels::native_mmvq(head_type_, peer_dhead_, pxq, peer_logits_, N_, (int) h1_rows_, ndraft_, peer_cs_);
+    }
+    kernels::df2_topk(peer_logits_, (int) h1_rows_, peer_dvocab_, ndraft_, peer_topscratch_, peer_topval_, peer_toptok_, peer_cs_);
+    kernels::df2_p2p_push_top16_signal(peer_topval_, peer_toptok_, ndraft_, tp_comm_->p2p_df2_buf(0), tp_comm_->p2p_df2_flag(0), peer_cs_);
+}
+
+bool Dflash2Drafter::capture_peer_head(std::string& err) {
+    if (!tp_head_on_ || peer_exec_ != nullptr) return true;
+    const OnDevice on_peer(peer_dev_);
+    if (cudaStreamBeginCapture(peer_cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "dflash2: peer head begin capture";
+        return false;
+    }
+    launch_peer_head_direct();
+    cudaGraph_t g = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(peer_cs_, &g);
+    if (ce != cudaSuccess || cudaGraphInstantiate(&peer_exec_, g, 0) != cudaSuccess) {
+        if (g) cudaGraphDestroy(g);
+        err = std::string("dflash2: peer head capture: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    cudaGraphDestroy(g);
+    cudaGraphUpload(peer_exec_, peer_cs_);
+    cudaStreamSynchronize(peer_cs_);
     return true;
 }
 
@@ -758,6 +880,12 @@ void Dflash2Drafter::set_max_drafts(int n) {
     cudaDeviceSynchronize();
     for (auto& e : exec_)
         if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    if (peer_exec_ && peer_dev_ >= 0) {
+        const OnDevice on_peer(peer_dev_);
+        cudaDeviceSynchronize();
+        cudaGraphExecDestroy(peer_exec_);
+        peer_exec_ = nullptr;
+    }
     graph_taps_ = nullptr;
     ndraft_ = n;
 }
@@ -1127,6 +1255,12 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
         if (!record_block(cs_, err)) return false;
         if (timing_) cudaEventRecord(ev_b_, cs_);
         (void) cudaStreamQuery(cs_);
+        if (tp_head_on_ && !skip_part("head")) {
+            if (!peer_exec_ && !capture_peer_head(err)) return false;
+            const OnDevice on_peer(peer_dev_);
+            if (cudaGraphLaunch(peer_exec_, peer_cs_) != cudaSuccess) { err = std::string("dflash2 peer head: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+            (void) cudaStreamQuery(peer_cs_);
+        }
         launch_t0_ = t0;
         launch_n_ = n_new;
         launch_pos0_ = pos0;
@@ -1160,12 +1294,25 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
         prof_->name.clear();
         kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
         stamp("start");
+        if (tp_head_on_ && !skip_part("head")) {
+            launch_peer_head_direct();
+            const OnDevice on_peer(peer_dev_);
+            (void) cudaStreamQuery(peer_cs_);
+        }
         if (!record_context(taps, n_new, cs_, err) || !record_block(cs_, err)) return false;
         prof_collect();
-    } else
-    if (cudaGraphLaunch(exec_[n_new], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
-    if (timing_) cudaEventRecord(ev_b_, cs_);
-    (void) cudaStreamQuery(cs_);
+    } else {
+        if (cudaGraphLaunch(exec_[n_new], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+        if (timing_) cudaEventRecord(ev_b_, cs_);
+        (void) cudaStreamQuery(cs_);
+        if (tp_head_on_ && !skip_part("head")) {
+            if (!peer_exec_ && !capture_peer_head(err)) return false;
+            const OnDevice on_peer(peer_dev_);
+            if (cudaGraphLaunch(peer_exec_, peer_cs_) != cudaSuccess) { err = std::string("dflash2 peer head: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+            (void) cudaStreamQuery(peer_cs_);
+        }
+    }
+    if (prof_ && timing_) cudaEventRecord(ev_b_, cs_);
     launch_t0_ = t0;
     launch_n_ = n_new;
     launch_pos0_ = pos0;

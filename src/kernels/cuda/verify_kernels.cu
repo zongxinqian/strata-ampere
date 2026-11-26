@@ -1311,31 +1311,63 @@ __global__ void argmax_rows_val_kernel(const float* __restrict__ logits, int n, 
 
 __global__ void publish_argmax_half_kernel(const ArgHalf* __restrict__ dev_half, ArgHalf* __restrict__ mapped_half,
                                            volatile uint32_t* __restrict__ mapped_flag, int n_rows) {
-    if ((int) threadIdx.x < n_rows) mapped_half[threadIdx.x] = dev_half[threadIdx.x];
-    __threadfence_system();
+    if ((int) threadIdx.x < n_rows) {
+        const ArgHalf a = dev_half[threadIdx.x];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        uint2 v;
+        v.x = __float_as_uint(a.v);
+        v.y = (uint32_t) a.i;
+        asm volatile("st.global.wt.v2.u32 [%0], {%1, %2};" :: "l"(mapped_half + threadIdx.x), "r"(v.x), "r"(v.y) : "memory");
+#else
+        mapped_half[threadIdx.x] = a;
+#endif
+    }
     __syncthreads();
-    if (threadIdx.x == 0) *mapped_flag = 1u;
+    if (threadIdx.x == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(mapped_flag), "r"(1u) : "memory");
+#else
+        __threadfence_system();
+        *mapped_flag = 1u;
+#endif
+    }
 }
 
 __global__ void merge_argmax_half_kernel(const ArgHalf* __restrict__ dev_half0, const ArgHalf* __restrict__ mapped_half1,
                                          const volatile uint32_t* __restrict__ mapped_flag1, int n_rows,
                                          int32_t* __restrict__ out) {
     if (threadIdx.x == 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        uint32_t pf = 0;
+        for (;;) {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(pf) : "l"(mapped_flag1) : "memory");
+            if (pf >= 1u) break;
+            __nanosleep(32);
+        }
+#else
         while (*mapped_flag1 < 1u) {
-#if __CUDA_ARCH__ >= 700
-            __nanosleep(12);
-#endif
         }
         __threadfence_system();
+#endif
     }
     __syncthreads();
     if ((int) threadIdx.x < n_rows) {
         ArgHalf a0 = dev_half0[threadIdx.x];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
+        uint2 v;
+        asm volatile("ld.global.cv.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(mapped_half1 + threadIdx.x) : "memory");
+        ArgHalf a1{__uint_as_float(v.x), (int) v.y};
+#else
         const ArgHalf a1 = mapped_half1[threadIdx.x];
+#endif
         float bv = a0.v;
         int bi = a0.i;
         arg_take(a1.v, a1.i, bv, bi);
         out[threadIdx.x] = bi;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *const_cast<volatile uint32_t*>(mapped_flag1) = 0u;
     }
 }
 }  // namespace

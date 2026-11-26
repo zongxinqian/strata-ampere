@@ -1606,20 +1606,24 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     const int n_tok = m.T;
     const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
 #if STRATA_GR_FAST_BUILD
-    // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
-    // they replace (gr_parity checks the multi-token read against single-token calls bitwise)
     const bool fast = gr_fast();
-    if (variant >= kHcSplit) {
-        if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
-        else gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
-    } else if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
-    else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
-#else
-    if (variant >= kHcSplit) {
-        if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
-        else gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
-    } else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
 #endif
+    if (!m.a[0].norm_done) {
+#if STRATA_GR_FAST_BUILD
+        // gfx906: the latency-hidden norm/up (STRATA_GR_FAST=0: off) - the same sums in the same order as the kernels
+        // they replace (gr_parity checks the multi-token read against single-token calls bitwise)
+        if (variant >= kHcSplit) {
+            if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+            else gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        } else if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
+        else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+#else
+        if (variant >= kHcSplit) {
+            if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+            else gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        } else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
+#endif
+    }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     // STRATA_HC_Q8: the staged down kernel reads bf16 only, so Q8 weights take split's down kernel (the plain one)
     const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;

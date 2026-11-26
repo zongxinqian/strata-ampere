@@ -1166,6 +1166,103 @@ __global__ void tap_gr_kernel(const float* __restrict__ R, int64_t R_stride, con
     out[(size_t) r * out_stride + i] = (rs + bo[(size_t) r * bo_stride + i] * wsum) / (float) hc;
 }
 
+// ---- Wave 2B: P2P TP=2 Draft Head kernels (Zero-Host-Sync GPU0 <-> GPU1 BAR1 push + exact 1-warp bitonic top-16 merge)
+__global__ void df2_p2p_push_bytes_signal_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ peer_dst,
+                                                 size_t bytes, uint32_t* __restrict__ peer_flag) {
+    const size_t n4 = bytes >> 2;
+    const uint32_t* s4 = reinterpret_cast<const uint32_t*>(src);
+    uint32_t* d4 = reinterpret_cast<uint32_t*>(peer_dst);
+    for (size_t i = threadIdx.x; i < n4; i += blockDim.x) d4[i] = s4[i];
+    for (size_t i = (n4 << 2) + threadIdx.x; i < bytes; i += blockDim.x) peer_dst[i] = src[i];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *reinterpret_cast<volatile uint32_t*>(peer_flag) = 1u;
+    }
+}
+
+__global__ void df2_p2p_wait_reset_kernel(uint32_t* __restrict__ local_flag) {
+    if (threadIdx.x != 0) return;
+    while (true) {
+        uint32_t v = 0u;
+#if !defined(__HIPCC__)
+        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(local_flag));
+#else
+        v = *reinterpret_cast<volatile uint32_t*>(local_flag);
+#endif
+        if (v != 0u) break;
+#if !defined(__HIPCC__) && __CUDA_ARCH__ >= 700
+        __nanosleep(64);
+#endif
+    }
+    *reinterpret_cast<volatile uint32_t*>(local_flag) = 0u;
+    __threadfence();
+}
+
+__global__ void df2_p2p_push_top16_signal_kernel(const float* __restrict__ val, const int32_t* __restrict__ tok,
+                                                 int rows, uint8_t* __restrict__ peer_dst, uint32_t* __restrict__ peer_flag) {
+    const int n = rows * kDf2TopK;
+    float* dst_v = reinterpret_cast<float*>(peer_dst);
+    int32_t* dst_t = reinterpret_cast<int32_t*>(peer_dst + (size_t) n * sizeof(float));
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        dst_v[i] = val[i];
+        dst_t[i] = tok[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *reinterpret_cast<volatile uint32_t*>(peer_flag) = 1u;
+    }
+}
+
+__global__ void df2_p2p_wait_merge_top16_kernel(uint32_t* __restrict__ local_flag, const uint8_t* __restrict__ local_peer_buf,
+                                                float* __restrict__ val0, int32_t* __restrict__ tok0, int rows) {
+    if (threadIdx.x == 0) {
+        while (true) {
+            uint32_t v = 0u;
+#if !defined(__HIPCC__)
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(local_flag));
+#else
+            v = *reinterpret_cast<volatile uint32_t*>(local_flag);
+#endif
+            if (v != 0u) break;
+#if !defined(__HIPCC__) && __CUDA_ARCH__ >= 700
+            __nanosleep(64);
+#endif
+        }
+        *reinterpret_cast<volatile uint32_t*>(local_flag) = 0u;
+        __threadfence();
+    }
+    __syncthreads();
+    const int r = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    if (r >= rows) return;
+    const int n = rows * kDf2TopK;
+    const float* val1 = reinterpret_cast<const float*>(local_peer_buf);
+    const int32_t* tok1 = reinterpret_cast<const int32_t*>(local_peer_buf + (size_t) n * sizeof(float));
+    float v = (lane < kDf2TopK) ? val0[r * kDf2TopK + lane] : val1[r * kDf2TopK + (lane - kDf2TopK)];
+    int32_t t = (lane < kDf2TopK) ? tok0[r * kDf2TopK + lane] : tok1[r * kDf2TopK + (lane - kDf2TopK)];
+    int rk = lane;   // 0..15 (GPU0, cols < h0) strictly beat 16..31 (GPU1, cols >= h0) on exact ties
+#pragma unroll
+    for (int size = 2; size <= 32; size <<= 1) {
+        const bool dir = ((lane & size) == 0);
+#pragma unroll
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, v, stride);
+            const int32_t ot = __shfl_xor_sync(0xffffffffu, t, stride);
+            const int ork = __shfl_xor_sync(0xffffffffu, rk, stride);
+            const bool is_lo = (lane & stride) == 0;
+            const bool other_better = better(ov, ork, v, rk);
+            const bool do_swap = (is_lo == dir) ? other_better : !other_better;
+            if (do_swap) { v = ov; t = ot; rk = ork; }
+        }
+    }
+    if (lane < kDf2TopK) {
+        val0[r * kDf2TopK + lane] = v;
+        tok0[r * kDf2TopK + lane] = t;
+    }
+}
+
 }  // namespace
 
 void df2_tap_gr(const float* R, int64_t R_stride, const float* bo, int64_t bo_stride, const float* inject, int64_t inj_stride, float* out, int64_t out_stride,
@@ -1269,6 +1366,16 @@ static int df2_q4_auto(int rows) {
         return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
     }();
     if (gfx12) return rows <= 640 ? 31 : 26;
+#else
+    // Ampere sm_86 (68 SMs, e.g. RTX 3080 20GB): unroll-1 variant 26 lowers register pressure and improves DFlash2 Q4_0 GEMM occupancy
+    static const bool sm86 = [] {
+        int dev = 0, maj = 0, min = 0;
+        return cudaGetDevice(&dev) == cudaSuccess &&
+               cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+               cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+               maj == 8 && min == 6;
+    }();
+    if (sm86) { (void) rows; return 26; }
 #endif
     (void) rows;
     return 17;
@@ -1428,6 +1535,27 @@ void df2_select(const float* hp, const float* unary, const int32_t* tok, const u
 void df2_tap_rows(const float* R, float* out, int64_t out_stride, int64_t n_embd, int hc, int rows, void* stream) {
     tap_rows_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), rows), 256, 0, (cudaStream_t) stream>>>(R, out, out_stride, n_embd, hc);
     check("tap_rows");
+}
+
+void df2_p2p_push_bytes_signal(const void* src, void* peer_dst, size_t bytes, uint32_t* peer_flag, void* stream) {
+    df2_p2p_push_bytes_signal_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(static_cast<const uint8_t*>(src), static_cast<uint8_t*>(peer_dst), bytes, peer_flag);
+    check("df2_p2p_push_bytes_signal");
+}
+
+void df2_p2p_wait_reset(uint32_t* local_flag, void* stream) {
+    df2_p2p_wait_reset_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(local_flag);
+    check("df2_p2p_wait_reset");
+}
+
+void df2_p2p_push_top16_signal(const float* val, const int32_t* tok, int rows, void* peer_dst, uint32_t* peer_flag, void* stream) {
+    df2_p2p_push_top16_signal_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(val, tok, rows, static_cast<uint8_t*>(peer_dst), peer_flag);
+    check("df2_p2p_push_top16_signal");
+}
+
+void df2_p2p_wait_merge_top16(uint32_t* local_flag, const void* local_peer_buf, float* val0, int32_t* tok0, int rows, void* stream) {
+    const int threads = (rows > 0 ? rows : 1) * 32;
+    df2_p2p_wait_merge_top16_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(local_flag, static_cast<const uint8_t*>(local_peer_buf), val0, tok0, rows);
+    check("df2_p2p_wait_merge_top16");
 }
 
 }  // namespace strata::kernels

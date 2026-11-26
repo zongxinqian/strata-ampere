@@ -7,8 +7,8 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
   <a href="README.md"><img src="https://img.shields.io/badge/语言-简体中文-00b894.svg" alt="简体中文"></a>
-  <img src="https://img.shields.io/badge/v1.1.0-231.4%20tok%2Fs%20Warm%20Mean-00d4ff.svg" alt="231.4 tok/s">
-  <img src="https://img.shields.io/badge/Peak-287.2%20tok%2Fs%20%40%20240W-7c4dff.svg" alt="287.2 tok/s Peak">
+  <img src="https://img.shields.io/badge/v1.2.0-203.2%20tok%2Fs%20Warm%20%7C%20185.5%20Chat-00d4ff.svg" alt="v1.2.0 Decode">
+  <img src="https://img.shields.io/badge/Peak-273%E2%80%93287%20tok%2Fs%20%40%20240W-7c4dff.svg" alt="Peak 273-287 tok/s">
   <img src="https://img.shields.io/badge/PCIe%204.0%20P2P-50.86%20GB%2Fs%20Full--Duplex-00e676.svg" alt="50.86 GB/s P2P">
   <img src="https://img.shields.io/badge/Precision-100%25%20Bit--Exact%20Lossless-ffbe28.svg" alt="Lossless">
 </p>
@@ -16,11 +16,12 @@
 <p align="center">
   <img src="docs/assets/dashboard-8080-live.jpg" alt="strata-ampere Port 8080 Live Telemetry Dashboard" width="100%">
   <br>
-  <sub><b>Built-in Port 8080 Live Telemetry Dashboard</b>: 2× Modded RTX 3080 20GB now running <b>v1.1.0 6-direction kernel & system optimizations + 50.86 GB/s direct PCIe 4.0 x16 P2P + 72×1 GiB Static HugePages</b> — hitting <code>231.35 tok/s</code> warm mean (<code>202.50 tok/s</code> fresh-start warm mean, <code>287.20 tok/s</code> peak), <code>3,870 tok/s</code> 84K prefill, <code>9,807</code> resident experts, <code>43 °C / 38 °C</code> load, <code>4.8 W</code> idle, <code>0 Xid · 0 AER · 0 DMAR</code></sub>
+  <sub><b>Built-in Port 8080 Live Telemetry Dashboard</b>: 2× Modded RTX 3080 20GB now running <b>v1.2.0 P2P-Native Deep Architecture Optimizations + 50.86 GB/s direct PCIe 4.0 x16 P2P + 72×1 GiB Static HugePages</b> — hitting <code>185.50 tok/s</code> real-chat sampling (<code>temp=0.6</code>, <code>+12.7%</code>), <code>203.22–208.27 tok/s</code> canonical warm mean (<code>273–287 tok/s</code> peak), <code>3,836–3,870 tok/s</code> 84K prefill, <b><code>9,831</code> resident experts</b>, <code>43 °C / 39 °C</code> load, <code>4.8 W</code> idle, <code>0 Xid · 0 AER · 0 DMAR</code></sub>
 </p>
 
 `strata-ampere` is a systems-engineered fork of [Strata](https://github.com/Niko1221/Strata) (`0.1.60.1`) built specifically for **2× Modded RTX 3080 20 GB (`sm_86`, 40 GB total VRAM)** to deliver **100% strictly lossless** MoE **Decode & Prefill** performance:
-- **v1.1.0 6-Direction Deep Optimization Campaign (`240W` cap, 100% strictly lossless)**: Adds **GPU1 Sparse-Hit MoE Combine** (eliminating 48× `cudaMemsetAsync` + >50% zero-row reads per step), **Capacity-Weighted `48:52` Bresenham Expert Partitioning** (`9,764 → 9,807` resident experts, eliminating mid-rank eviction gaps), **Ampere `sm_86` Hardware `__nanosleep(64)` P2P Spin-Barrier + Warp-Rounded `K=1` Blocks**, **Zen 2 AVX2 Weight Prefetch + PCIe Root Port ACS Disable + `/dev/cpu_dma_latency=0`**, and **`STRATA_DF2_HEAD_Q4=1` + true `--spec 8 --draft-conf 0.50` (`user_args`) + recalibrated `draft-costs.json`** — pushing hot-warm 4-task mean to **`231.35 tok/s`** (`287.20 tok/s` peak) while restoring GPU0 free VRAM from `508 MiB` to **`528+ MiB`**.
+- **v1.2.0 P2P-Native Deep Architecture Campaign (`240W` cap, 4/4 Bit-Exact Greedy SHA256 verified)**: Exploits our 50.86 GB/s VMM Push-Write P2P link beyond MoE AllReduce — **① Direct P2P ArgHalf & Full-Logits Gather (`STRATA_TP_HEAD_P2P=1`)**: eliminates the `16 MiB` GPU1→Host→GPU0 PCIe bounce per verify step on `temp > 0`, boosting 4-task real-chat sampling (`temp=0.6`) from `164.57 → 185.50 tok/s` (**`+20.93 tok/s / +12.7%`**); **② DFlash2 106K CJK Vocab-Parallel P2P Draft Head (`STRATA_DF2_HEAD_TP2=1`)**: shards the `146.0 MiB` (`106,299`-row) Q4_0 draft head 50/50 across GPU0 & GPU1 (`53,152 + 53,147` rows, `73.0 MiB/GPU`), pushing `20 KiB` `xq_` over BAR1 to wake GPU1's captured graph and merging `896 B` peer Top-16 in a single 32-lane bitonic warp — **freeing `73.0 MiB` on GPU0** (`--vram-reserve-mib 608` adds **`+24` resident experts → `9,831`**); **③ Ampere `sm_86` `STRATA_DF2_GEMM4=26`** (auto-selected on `sm_86`), raising canonical 4-task warm mean to **`203.22–208.27 tok/s`** (`+8.4% ~ +11.1%`) with **4/4 100% bit-exact SHA256** across 2,560 tokens!
+- **v1.1.0 6-Direction Deep Optimization Campaign**: Adds **GPU1 Sparse-Hit MoE Combine**, **Capacity-Weighted `48:52` Bresenham Expert Partitioning**, **Ampere `sm_86` Hardware `__nanosleep(64)` P2P Spin-Barrier + Warp-Rounded `K=1` Blocks**, **Zen 2 AVX2 Weight Prefetch + PCIe Root Port ACS Disable + `/dev/cpu_dma_latency=0`**, and **`STRATA_DF2_HEAD_Q4=1` + true `--spec 8 --draft-conf 0.50` (`user_args`) + recalibrated `draft-costs.json`**.
 - **50.86 GB/s full-duplex card-to-card PCIe 4.0 x16 P2P on the card's native `256 MiB BAR1` (ZERO BAR1 resize / ZERO PCI `0x610` hacking!)** via our version-matched dynamic BAR1 open-gpu kernel patch ([patches/nvidia-open-595.99.02-dynbar1-p2p.patch](patches/nvidia-open-595.99.02-dynbar1-p2p.patch)), CUDA Driver VMM selective peer mapping (`39 / 256 MiB` BAR1 used), 1-hop Push-Write + VRAM-Flag AllReduce, and `72 × 1 GiB` Static HugePages + `iommu=pt`.
 
 > **Strict Losslessness Guarantee**: Every headline number below is a multi-run average or median under `temperature=0`, original target `UD-Q4_K_XL` quantization, `STRATA_ROUTE_TAIL_SKIP=0` (zero dropped experts), full `BF16` AllReduce, and bit-exact greedy SHA256 verification (`STRATA_DF2_HEAD_Q4=1` applies only to the DFlash2 drafter; target model verification remains 100% lossless).
@@ -29,7 +30,24 @@
 
 ## 1. Verified Benchmarks (Strictly Lossless, `Qwen3.8-Flash-Next-UD-Q4_K_XL`)
 
-### Latest Milestone — v1.1.0 6-Direction Deep Kernel & System Suite (`240W` Pareto, Strict A/B)
+### Latest Milestone — v1.2.0 P2P-Native Deep Architecture Suite (`240W` Pareto, Strict Controlled A/B)
+
+Same `build86_w16` (`STRATA_VERIFY_MAX_T=16`) binary, canonical 4-task suite (`moe_arch`, `code_cuda`, `agent_json`, `kv_tech`, 640 tok, `enable_thinking=False`), `240W` cap, `10,151 MHz` GDDR6X, `MRRS 4096B`, `50.86 GB/s` PCIe 4.0 P2P:
+
+| Controlled A/B Arm (Same Binary, 240W) | Greedy r1 Mean | Greedy Warm Mean | **Real-Chat `temp=0.6` Mean** | Resident Experts / Free VRAM | 84K / 28K Cold Prefill | Parity |
+|---|---:|---:|---:|---:|---:|:---:|
+| **v1.1.0 Reference (all v1.2 flags OFF)** | `175.10 tok/s` | `187.45 tok/s` | **`164.57 tok/s`** | `9,807` (`548 / 230 MiB`) | `3,692.9 tok/s` (28K) | Baseline |
+| **+ #1 `STRATA_TP_HEAD_P2P=1` (P2P Logits)** | `177.80 tok/s` | `189.45 tok/s` | **`180.78 tok/s` (`+9.9%`)** | `9,807` (`548 / 230 MiB`) | `3,699.5 tok/s` (28K) | ✅ Bit-Exact |
+| **+ #1 + #2 `STRATA_DF2_HEAD_TP2=1` (TP=2 Draft)** | `178.68 tok/s` | **`203.03 tok/s` (`+8.3%`)** | **`179.43 tok/s` (`+9.0%`)** | `9,807` (**`620 / 152 MiB`**, -73M GPU0) | `3,705.9 tok/s` (28K) | ✅ **4/4 SHA256** |
+| **v1.2.0 Champion (+`GEMM4=26` +`reserve=608`, Live)** | **`179.20–185.82`** | **`203.22–208.27` (`+8.4% ~ +11.1%`)** | **`185.50 tok/s` (`+12.7%`!!)** | **`9,831 (+24)`** (`530 / 152 MiB`) | **`3,836.2 tok/s` (84K, 0 OOM)** | ✅ **4/4 100% Exact** |
+
+- **Strict 4/4 Bit-Exact Greedy SHA256 Proof (`--adapt-every 999999`, 2,560 tokens across all 4 tasks)**:
+  - `moe_arch` (`+3.6%`), `code_cuda` (`+3.4%`), `agent_json` (`+2.5%`), `kv_tech` (`+4.1%`) — **4/4 IDENTICAL SHA256** against v1.1.0.
+- **Honest 6-Direction Disclosure**:
+  - ✅ **Shipped ON by default**: `#1 STRATA_TP_HEAD_P2P=1`, `#2 STRATA_DF2_HEAD_TP2=1`, and Ampere `sm_86` `STRATA_DF2_GEMM4=26`.
+  - ❌ **Gated OFF by default (opt-in env vars)**: `#3 STRATA_TP_AR_GR_NORM=0` (`-17~30 tok/s` due to low CTA count `n_tok<=8` vs split `gr_norm`), `#4 STRATA_TP2_GPU1_CPU_MISS=0` / `HEAT_W0=0.96` (GPU1 CPU-miss sync regression + `0.82` bias regressed `temp=0.6`), `#5 STRATA_TP_P2P_PIPE=0` (4 MiB prefill micro-chunks `-165 ms` vs 16 MiB double-buffered P2P), `#6 STRATA_TP2_P2P_REBALANCE=0` (neutral/noisy in short runs).
+
+### v1.1.0 Milestone — 6-Direction Deep Kernel & System Suite (`240W` Pareto, Strict A/B)
 
 Canonical 4-task suite (`moe_arch`, `code_cuda`, `agent_json`, `kv_tech`), `temperature=0`, `240W` power cap, `10,151 MHz` GDDR6X, `MRRS 4096B`, `50.86 GB/s` PCIe 4.0 P2P:
 
@@ -71,6 +89,7 @@ All 6 directions were implemented, verified bit-exact, and A/B benchmarked. Winn
 | Deep Kernel Suite P0–P4 (`W16 G=1`, P1, P2, P4 INT8 TC) | `186.72 tok/s` | **`194.55 tok/s`** | **`+4.2%`** | Halved AR barriers, 84K cold hit `+9.2%`, `m16n8k32` INT8 TC |
 | **v1.0.0: 1G HugePages + `iommu=pt` + 50.86 GB/s VMM Push-P2P** | `187.28` / `3,780` | **`201.40` warm / `3,870`** | **Breaks 200 tok/s** | 72×1 GiB dTLB fit + native 256 MiB BAR1 direct P2P |
 | **v1.1.0: 6-Dir Deep Opt + 48:52 EP + `user_args --spec 8` + ACS/DMA** | `186.22` / `199.68` | **`202.50` fresh / `231.35` warm (`287.2` peak)** | **`+8.7% ~ +15.9%`** | Sparse Combine + 9,807 experts + `__nanosleep` + `DF2_HEAD_Q4` |
+| **v1.2.0: P2P Logits + DFlash2 106K Head TP=2 + `sm_86` GEMM4=26** | `164.6` chat / `187.5` greedy | **`185.5` real chat / `203.2–208.3` warm (`273` peak)** | **`+12.7%` chat / `+8.4%~11.1%` greedy** | Zero 16M host bounce + 73M GPU0 saved (`9,831` experts) + 4/4 SHA256 exact |
 
 ---
 
@@ -170,7 +189,7 @@ sudo reboot
 ```
 > **1-Command Rollback Anytime**: `sudo /usr/local/sbin/nvidia-p2p-rollback.sh && sudo reboot`
 
-### Step 5: Build & Run `strata-ampere` v1.1.0 (Including ACS Disable & `/dev/cpu_dma_latency=0`)
+### Step 5: Build & Run `strata-ampere` v1.2.0 (Including ACS Disable & `/dev/cpu_dma_latency=0`)
 ```bash
 export PATH=/usr/local/cuda-13.1/bin:$PATH
 cmake -B build86 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_WINDOW_MAX_T=16 -DCMAKE_CUDA_ARCHITECTURES=86
@@ -209,8 +228,9 @@ python3 serve/server.py --config examples/strata-2x3080-20g-dflash2.example.json
 Verify success in logs:
 - `strata generate: expert arena: cudaHostRegister PORTABLE ok; hugetlb 1 GB pages (72 x 1 GiB)`
 - `strata tp_comm: NVLink/P2P enabled (vmm-push, decode=p2p, CUDA0 <-> CUDA1)`
-- `strata serve: STRATA_TP2=1 ready: CUDA0 (4702 experts) + CUDA1 (5105 experts) = 9807 total resident experts`
-- GPU0 free VRAM **`~528–532 MiB`**, `BAR1 Memory Usage: Used 39 MiB / Total 256 MiB` on both GPUs, `0 Xid / 0 AER`.
+- `strata dflash2: P2P TP=2 draft head ON (GPU0 53152 rows + GPU1 53147 rows, 73.0 MiB/GPU)`
+- `strata serve: STRATA_TP2=1 ready: CUDA0 (4726 experts) + CUDA1 (5105 experts) = 9831 total resident experts`
+- GPU0 free VRAM **`~530–550 MiB`** (GPU1 `~152 MiB`, verified 0 OOM at 84K prefill), `BAR1 Memory Usage: Used 39 MiB / Total 256 MiB` on both GPUs, `0 Xid / 0 AER`.
 - Open `http://<server-ip>:8080/` for the built-in bilingual live telemetry dashboard (with all `/v1/*` OpenAI endpoints intact).
 
 ---

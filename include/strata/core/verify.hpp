@@ -245,8 +245,11 @@ public:
     }
     bool tp2_dev_plan_runtime() const;
     bool set_tp_head_peer(strata::kernels::ArgHalf* h_arg, uint32_t* h_flag);
+    bool set_tp_miss_peer(uint32_t* h_flag, float* h_ymiss);
     strata::kernels::ArgHalf* h_head_arg() const { return h_head_arg_; }
     uint32_t* h_head_flag() const { return h_head_flag_; }
+    uint32_t* h_flag() const { return h_flag_; }
+    float* h_ymiss() const { return h_ymiss_; }
     /// #2-B: optional abortable L->L+1 CPU L3 cache pre-warming hook called right after `*flag = want`
     /// while GPUs run layer L combine/allreduce and layer L+1 attention/GDN/router.
     using IdlePrewarmFn = void (*)(void* user, const float* x_f, const int32_t* ids, int n_tok, int k,
@@ -866,6 +869,8 @@ private:
     uint32_t* m_head_flag_ = nullptr;
     strata::kernels::ArgHalf* m_head_arg_peer_ = nullptr;
     uint32_t* m_head_flag_peer_ = nullptr;
+    uint32_t* m_flag_peer_ = nullptr;
+    float* m_ymiss_peer_ = nullptr;
     strata::kernels::ArgHalf* arg_half_dev_ = nullptr;
     float* full_logits_dev_ = nullptr;
     mutable std::vector<float> full_logits_host_;

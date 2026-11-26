@@ -775,8 +775,12 @@ void tp2_plan_balanced_swaps(
         std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         std::sort(v0.begin(), v0.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
         std::sort(v1.begin(), v1.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-        // Balance active heat ~47% CUDA0 / ~53% CUDA1 per layer (slot share plus CUDA0 shared/dense work)
-        const float w0 = 0.96f * (float) v0.size();
+        // Balance active heat ~47% CUDA0 / ~53% CUDA1 per layer (tunable via STRATA_TP2_HEAT_W0)
+        static const float heat_w0 = [] {
+            const char* v = std::getenv("STRATA_TP2_HEAT_W0");
+            return (v != nullptr && v[0] != '\0') ? (float) std::atof(v) : 0.96f;
+        }();
+        const float w0 = heat_w0 * (float) v0.size();
         const float w1 = (float) v1.size();
         const float target0 = (w0 + w1 > 0.0f) ? (w0 / (w0 + w1)) : 0.47f;
         size_t i0 = 0, i1 = 0;
@@ -893,6 +897,92 @@ bool tp2_peer_adapt(
     }
     cudaEventRecord(ev1, st1);
     return true;
+}
+
+// Wave 2C (#6): Zero-DDR4 direct 50.86 GB/s P2P hot<->cold expert rebalancing between GPU0 and GPU1.
+// Runs after H2D adapt swaps when any layer's active heat becomes skewed across GPUs (eliminates MoE barrier bubbles).
+int64_t tp2_p2p_rebalance(
+        strata::core::TpComm* tp_comm,
+        strata::core::ExpertCache& cache0, std::vector<int32_t>& res0,
+        cudaStream_t st0, cudaEvent_t ev0, std::vector<std::pair<int32_t, int32_t>>& pend0,
+        int dev1, strata::core::ExpertCache& cache1, std::vector<int32_t>& res1,
+        cudaStream_t st1, cudaEvent_t ev1, std::vector<std::pair<int32_t, int32_t>>& pend1,
+        const std::vector<float>& usage, int64_t n_layers, int64_t n_expert,
+        bool evict_sync, bool& res_dirty, std::vector<int32_t>& res_dirty_idx) {
+    static const int max_rebal = [] {
+        const char* v = std::getenv("STRATA_TP2_P2P_REBALANCE");
+        if (v == nullptr) return 0;   // opt-in experimental P2P hot<->cold expert rebalance
+        return std::max(0, std::atoi(v));
+    }();
+    if (max_rebal <= 0 || tp_comm == nullptr || !tp_comm->p2p() || !tp_comm->p2p_vmm() ||
+        st0 == nullptr || st1 == nullptr || res1.empty())
+        return 0;
+    static const float heat_w0 = [] {
+        const char* v = std::getenv("STRATA_TP2_HEAT_W0");
+        return (v != nullptr && v[0] != '\0') ? (float) std::atof(v) : 0.96f;
+    }();
+    struct RebalCand { float skew_gain; int32_t layer, e0, e1; };
+    std::vector<RebalCand> cands;
+    for (int64_t l = 0; l < n_layers; ++l) {
+        const float* u = usage.data() + l * n_expert;
+        const int32_t* r0 = res0.data() + l * n_expert;
+        const int32_t* r1 = res1.data() + l * n_expert;
+        float h0 = 0.0f, h1 = 0.0f;
+        int n0 = 0, n1 = 0;
+        int32_t hot0 = -1, cold0 = -1, hot1 = -1, cold1 = -1;
+        float u_hot0 = -1.0f, u_cold0 = 1e30f, u_hot1 = -1.0f, u_cold1 = 1e30f;
+        for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
+            if (r0[e] >= 0) {
+                ++n0; h0 += u[e];
+                if (u[e] > u_hot0) { u_hot0 = u[e]; hot0 = e; }
+                if (u[e] < u_cold0) { u_cold0 = u[e]; cold0 = e; }
+            } else if (r1[e] >= 0) {
+                ++n1; h1 += u[e];
+                if (u[e] > u_hot1) { u_hot1 = u[e]; hot1 = e; }
+                if (u[e] < u_cold1) { u_cold1 = u[e]; cold1 = e; }
+            }
+        }
+        if (n0 == 0 || n1 == 0 || (h0 + h1) < 10.0f) continue;
+        const float w0 = heat_w0 * (float) n0;
+        const float target0 = w0 / (w0 + (float) n1);
+        const float frac0 = h0 / (h0 + h1);
+        const float diff = frac0 - target0;
+        if (diff > 0.14f && hot0 >= 0 && cold1 >= 0 && u_hot0 > u_cold1 + 2.5f) {
+            cands.push_back({diff * (u_hot0 - u_cold1), (int32_t) l, hot0, cold1});
+        } else if (diff < -0.14f && hot1 >= 0 && cold0 >= 0 && u_hot1 > u_cold0 + 2.5f) {
+            cands.push_back({(-diff) * (u_hot1 - u_cold0), (int32_t) l, cold0, hot1});
+        }
+    }
+    if (cands.empty()) return 0;
+    std::sort(cands.begin(), cands.end(), [](const RebalCand& a, const RebalCand& b) { return a.skew_gain > b.skew_gain; });
+    if ((int) cands.size() > max_rebal) cands.resize((size_t) max_rebal);
+    int64_t done = 0;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (const RebalCand& c : cands) {
+        const size_t idx0 = (size_t) c.layer * (size_t) n_expert + (size_t) c.e0;
+        const size_t idx1 = (size_t) c.layer * (size_t) n_expert + (size_t) c.e1;
+        const int32_t slot0 = res0[idx0];
+        const int32_t slot1 = res1[idx1];
+        if (slot0 < 0 || slot1 < 0) continue;
+        const size_t bytes = (size_t) lay.blob_bytes(c.layer);
+        if (!tp_comm->p2p_swap_expert_blobs(cache0.device_slot(slot0), cache1.device_slot(slot1), bytes, st0, st1))
+            break;
+        res0[idx0] = strata::core::kNotResident;
+        res1[idx1] = strata::core::kNotResident;
+        pend0.emplace_back((int32_t) idx1, slot0);
+        pend1.emplace_back((int32_t) idx0, slot1);
+        if (evict_sync) {
+            res_dirty_idx.push_back((int32_t) idx0);
+            res_dirty_idx.push_back((int32_t) idx1);
+            res_dirty = true;
+        }
+        ++done;
+    }
+    if (done > 0) {
+        { const strata::core::OnDevice on0(0); cudaEventRecord(ev0, st0); }
+        { const strata::core::OnDevice on1(dev1); cudaEventRecord(ev1, st1); }
+    }
+    return done;
 }
 
 struct Options {
@@ -13439,6 +13529,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: TP2 CUDA%d head peer mapping failed\n", tp1->dev);
                     return 1;
                 }
+                if (!tp1->ver.set_tp_miss_peer(ver.h_flag(), ver.h_ymiss())) {
+                    std::fprintf(stderr, "strata serve: TP2 CUDA%d CPU-miss peer mapping unavailable (falling back to GPU0 receive)\n", tp1->dev);
+                }
             }
             drive.d.tp_plan1 = tp1->ver.plan_sink();
             drive.d.tp_res1 = tp1->host_res.data();
@@ -13748,6 +13841,8 @@ int main(int argc, char** argv) {
             std::string why_not;
             df2.set_max_drafts((o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec) - 1);   // the widest window - 1: the head and the walk run for that many rows
             df2_offer_head();
+            if (tp1 && tp1->comm.p2p_vmm() && !batch_df2 && df2.device() == 0)
+                df2.set_tp_head_peer(&tp1->comm, tp1->dev);
             // where the drafter's weights come from: the last stage's card by default (its head rows and embedding path), as the MTP's
             const bool df2_on_last = multi_gpu && last_st != nullptr && !df2_first;
             const bool df2_chain = n_stages > 1;   // the taps come from several verifiers (gather_taps lands them on the drafter's card)
@@ -15659,6 +15754,14 @@ int main(int argc, char** argv) {
                                     tp2_balanced ? &tp1_pre_swaps : nullptr))
                     return false;
                 adapt_nswaps += nsw1;
+                if (tp1->comm.p2p_vmm() && pending.empty() && tp1->adapt_pending.empty()) {
+                    const int64_t nreb = tp2_p2p_rebalance(
+                        &tp1->comm, xcache, host_res, adapt_stream, adapt_ev, pending,
+                        tp1->dev, tp1->cache, tp1->host_res, tp1->adapt_stream, tp1->adapt_ev, tp1->adapt_pending,
+                        drive.d.usage, g.n_layers, g.n_expert,
+                        drive.d.evict_sync, drive.d.res_dirty, drive.d.res_dirty_idx);
+                    adapt_nswaps += nreb;
+                }
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             return true;
@@ -23791,6 +23894,8 @@ int main(int argc, char** argv) {
             use_df2 = false;
         }
         if (use_df2) df2_offer_head();
+        if (use_df2 && tp1 && tp1->comm.p2p_vmm() && df2.device() == 0)
+            df2.set_tp_head_peer(&tp1->comm, tp1->dev);
         if (use_df2 && !df2.bind(wt, &native_head, df2_vocab_path(), err)) {
             std::fprintf(stderr, "strata generate: --draft dflash2: %s. It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring "
                                  "0.25 GiB, a draft head 0.2 GiB); --vram-reserve-mib 1900 keeps it (the expert cache gives up about 2.5%% of its experts "
@@ -24094,6 +24199,13 @@ int main(int argc, char** argv) {
                                     tp2_balanced ? &tp1_pre_swaps : nullptr))
                     return false;
                 swaps_total += nsw1;
+                if (tp1->comm.p2p_vmm() && pending.empty() && tp1->adapt_pending.empty()) {
+                    swaps_total += tp2_p2p_rebalance(
+                        &tp1->comm, xcache, host_res, adapt_stream, adapt_ev, pending,
+                        tp1->dev, tp1->cache, tp1->host_res, tp1->adapt_stream, tp1->adapt_ev, tp1->adapt_pending,
+                        drive.d.usage, g.n_layers, g.n_expert,
+                        drive.d.evict_sync, drive.d.res_dirty, drive.d.res_dirty_idx);
+                }
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             swaps_total += (int64_t) swaps.size();

@@ -110,4 +110,10 @@ void df2_tap_gr(const float* R, int64_t R_stride, const float* bo, int64_t bo_st
 /// out[r][:n_embd] = the mean of the hc streams of row r of R ([rows][hc][n_embd]) written to out + r * out_stride (a tap slot).
 void df2_tap_rows(const float* R, float* out, int64_t out_stride, int64_t n_embd, int hc, int rows, void* stream);
 
+/// Wave 2B: P2P TP=2 Draft Head helpers (Zero-Host-Sync BAR1 push + 1-warp bitonic exact top-16 merge).
+void df2_p2p_push_bytes_signal(const void* src, void* peer_dst, size_t bytes, uint32_t* peer_flag, void* stream);
+void df2_p2p_wait_reset(uint32_t* local_flag, void* stream);
+void df2_p2p_push_top16_signal(const float* val, const int32_t* tok, int rows, void* peer_dst, uint32_t* peer_flag, void* stream);
+void df2_p2p_wait_merge_top16(uint32_t* local_flag, const void* local_peer_buf, float* val0, int32_t* tok0, int rows, void* stream);
+
 }  // namespace strata::kernels

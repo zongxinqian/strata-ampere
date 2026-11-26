@@ -33,6 +33,7 @@
 namespace strata::core {
 
 class NativeHead;
+class TpComm;
 
 class Dflash2Drafter {
 public:
@@ -59,6 +60,9 @@ public:
     struct SharedHead { const uint8_t* rows = nullptr; const int32_t* vocab_dev = nullptr; const std::vector<int32_t>* vocab_host = nullptr; int64_t n = 0; int type = -1; };
     void share_head(const SharedHead& s) { shared_ = s; }
     bool head_shared() const { return dhead_shared_; }
+    /// Wave 2B: configure TP=2 P2P peer GPU for vocab-parallel draft head (call before bind()).
+    void set_tp_head_peer(TpComm* tp, int peer_dev) { tp_comm_ = tp; peer_dev_ = peer_dev; }
+    bool tp_head_active() const { return tp_head_on_; }
     /// Tests: an embedding callback and a head given as raw rows of `head_type` (a native_mmvq type).
     using EmbedFn = std::function<void(const int32_t* tokens_dev, int n, float* out, cudaStream_t)>;
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);
@@ -279,6 +283,23 @@ private:
     int launch_n_ = 0;
     int64_t launch_pos0_ = 0;
     std::chrono::steady_clock::time_point launch_t0_{};
+
+    // Wave 2B: P2P TP=2 Vocab-Parallel Draft Head (GPU0 holds h0_rows_, GPU1 holds h1_rows_)
+    TpComm* tp_comm_ = nullptr;
+    int peer_dev_ = -1;
+    bool tp_head_on_ = false;
+    int64_t h0_rows_ = 0, h1_rows_ = 0;
+    cudaStream_t peer_cs_ = nullptr;
+    cudaGraphExec_t peer_exec_ = nullptr;
+    uint8_t* peer_dhead_ = nullptr;
+    int32_t* peer_dvocab_ = nullptr;
+    uint8_t* peer_xil_ = nullptr;
+    float* peer_logits_ = nullptr;
+    float* peer_topval_ = nullptr;
+    int32_t* peer_toptok_ = nullptr;
+    uint32_t* peer_topscratch_ = nullptr;
+    bool capture_peer_head(std::string& err);
+    void launch_peer_head_direct();
 };
 
 }  // namespace strata::core

@@ -51,6 +51,8 @@ struct FusedGrArgs {
     /// 32 contiguous values here ([row][col / 32]).  w_inject stays bf16.
     const float* s_down = nullptr;
     const float* s_up = nullptr;
+    /// Wave 2A (#3): when true, tp_allreduce_bf16_gr_norm already updated R in place and wrote rs + xn.
+    bool norm_done = false;
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
