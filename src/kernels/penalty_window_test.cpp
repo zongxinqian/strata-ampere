@@ -11,6 +11,7 @@
 
 using strata::kernels::penalty_counts_prompt;
 using strata::kernels::penalty_rows;
+using strata::kernels::penalty_rows_tree;
 using strata::kernels::penalty_window_from;
 
 namespace {
@@ -118,6 +119,47 @@ int main() {
         next.insert(next.end(), {900, 901, 902, 99});
         const std::vector<int32_t> r2 = row_after(next, {}, false);
         check(filled(r2) == 1 && r2[kH - 1] == 99, "turn 2 default: turn 1's reply tokens in the prompt are not counted");
+    }
+
+    // ---- 2-branch speculative tree window (`penalty_rows_tree`):
+    // Branch A [0..fork) follows window[0..t]; Branch B [fork..T) follows window[0..parent] + window[fork..t].
+    {
+        const std::vector<int32_t> tail = {500, 501, 502};
+        // T=8, fork=5, parent=1:
+        // Branch A: [10, 11, 12, 13, 14]
+        // Branch B: starts after window[1]=11 -> [22, 23, 24]
+        const std::vector<int32_t> win = {10, 11, 12, 13, 14, 22, 23, 24};
+        constexpr int T = 8, fork = 5, parent = 1, H = 6;
+        std::vector<int32_t> tree_rows((size_t) T * H, -99);
+        penalty_rows_tree(tail.data(), (int64_t) tail.size(), win.data(), T, fork, parent, H, tree_rows.data());
+
+        // Compare Branch A rows 0..4 against linear penalty_rows on [10, 11, 12, 13, 14]
+        std::vector<int32_t> lin_a((size_t) fork * H, -99);
+        penalty_rows(tail.data(), (int64_t) tail.size(), win.data(), fork, H, lin_a.data());
+        for (int t = 0; t < fork; ++t) {
+            std::vector<int32_t> got(tree_rows.begin() + t * H, tree_rows.begin() + (t + 1) * H);
+            std::vector<int32_t> exp(lin_a.begin() + t * H, lin_a.begin() + (t + 1) * H);
+            check(got == exp, "tree penalty rows: Branch A matches linear penalty_rows");
+        }
+
+        // Compare Branch B rows 5..7 against linear penalty_rows on [10, 11, 22, 23, 24]
+        const std::vector<int32_t> win_b = {10, 11, 22, 23, 24};
+        std::vector<int32_t> lin_b(win_b.size() * H, -99);
+        penalty_rows(tail.data(), (int64_t) tail.size(), win_b.data(), (int) win_b.size(), H, lin_b.data());
+        for (int t = fork; t < T; ++t) {
+            const int b_idx = (parent + 1) + (t - fork);
+            std::vector<int32_t> got(tree_rows.begin() + t * H, tree_rows.begin() + (t + 1) * H);
+            std::vector<int32_t> exp(lin_b.begin() + b_idx * H, lin_b.begin() + (b_idx + 1) * H);
+            check(got == exp, "tree penalty rows: Branch B matches linear path from parent without Branch A leakage");
+            check(count_of(got, 12) == 0 && count_of(got, 13) == 0 && count_of(got, 14) == 0,
+                  "tree penalty rows: Branch B excludes unshared Branch A siblings");
+        }
+
+        // Degenerate fork=0 falls back cleanly to linear penalty_rows
+        std::vector<int32_t> deg((size_t) T * H, -99), lin_all((size_t) T * H, -99);
+        penalty_rows_tree(tail.data(), (int64_t) tail.size(), win.data(), T, 0, -1, H, deg.data());
+        penalty_rows(tail.data(), (int64_t) tail.size(), win.data(), T, H, lin_all.data());
+        check(deg == lin_all, "tree penalty rows: fork=0 falls back to linear penalty_rows");
     }
 
     std::printf("penalty_window_test: %d checks passed\n", checks);

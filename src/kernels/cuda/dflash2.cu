@@ -1222,31 +1222,71 @@ __global__ void df2_p2p_push_bytes_signal_kernel(const uint8_t* __restrict__ src
     const size_t n4 = bytes >> 2;
     const uint32_t* s4 = reinterpret_cast<const uint32_t*>(src);
     uint32_t* d4 = reinterpret_cast<uint32_t*>(peer_dst);
-    for (size_t i = threadIdx.x; i < n4; i += blockDim.x) d4[i] = s4[i];
-    for (size_t i = (n4 << 2) + threadIdx.x; i < bytes; i += blockDim.x) peer_dst[i] = src[i];
+    for (size_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const uint32_t v = s4[i];
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(d4 + i), "r"(v) : "memory");
+#else
+        *reinterpret_cast<volatile uint32_t*>(d4 + i) = v;
+#endif
+    }
+    for (size_t i = (n4 << 2) + threadIdx.x; i < bytes; i += blockDim.x) {
+        *reinterpret_cast<volatile uint8_t*>(peer_dst + i) = src[i];
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.release.sys.global.u32 [%0], 1;" :: "l"(peer_flag) : "memory");
+#else
         __threadfence_system();
         *reinterpret_cast<volatile uint32_t*>(peer_flag) = 1u;
+#endif
     }
 }
 
-__global__ void df2_p2p_wait_reset_kernel(uint32_t* __restrict__ local_flag) {
-    if (threadIdx.x != 0) return;
-    while (true) {
-        uint32_t v = 0u;
-#if !defined(__HIPCC__)
-        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(local_flag));
+__global__ void df2_p2p_wait_reset_kernel(uint32_t* __restrict__ local_flag, const uint8_t* __restrict__ vmm_src,
+                                          uint8_t* __restrict__ local_dst, size_t bytes) {
+    if (threadIdx.x == 0) {
+        while (true) {
+            uint32_t v = 0u;
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(local_flag) : "memory");
 #else
-        v = *reinterpret_cast<volatile uint32_t*>(local_flag);
+            v = *reinterpret_cast<volatile uint32_t*>(local_flag);
 #endif
-        if (v != 0u) break;
-#if !defined(__HIPCC__) && __CUDA_ARCH__ >= 700
-        __nanosleep(64);
+            if (v != 0u) break;
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(64);
+#endif
+        }
+    }
+    __syncthreads();
+    if (vmm_src != nullptr && local_dst != nullptr && bytes > 0) {
+        const size_t n4 = bytes >> 2;
+        const uint32_t* s4 = reinterpret_cast<const uint32_t*>(vmm_src);
+        uint32_t* d4 = reinterpret_cast<uint32_t*>(local_dst);
+        for (size_t i = threadIdx.x; i < n4; i += blockDim.x) {
+            uint32_t w;
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(w) : "l"(s4 + i) : "memory");
+#else
+            w = *reinterpret_cast<const volatile uint32_t*>(s4 + i);
+#endif
+            d4[i] = w;
+        }
+        for (size_t i = (n4 << 2) + threadIdx.x; i < bytes; i += blockDim.x) {
+            local_dst[i] = *reinterpret_cast<const volatile uint8_t*>(vmm_src + i);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.release.sys.global.u32 [%0], 0;" :: "l"(local_flag) : "memory");
+#else
+        *reinterpret_cast<volatile uint32_t*>(local_flag) = 0u;
+        __threadfence_system();
 #endif
     }
-    *reinterpret_cast<volatile uint32_t*>(local_flag) = 0u;
-    __threadfence();
 }
 
 __global__ void df2_p2p_push_top16_signal_kernel(const float* __restrict__ val, const int32_t* __restrict__ tok,
@@ -1255,13 +1295,24 @@ __global__ void df2_p2p_push_top16_signal_kernel(const float* __restrict__ val, 
     float* dst_v = reinterpret_cast<float*>(peer_dst);
     int32_t* dst_t = reinterpret_cast<int32_t*>(peer_dst + (size_t) n * sizeof(float));
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        dst_v[i] = val[i];
-        dst_t[i] = tok[i];
+        const float vf = val[i];
+        const int32_t vt = tok[i];
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(dst_v + i), "f"(vf) : "memory");
+        asm volatile("st.global.wt.s32 [%0], %1;" :: "l"(dst_t + i), "r"(vt) : "memory");
+#else
+        *reinterpret_cast<volatile float*>(dst_v + i) = vf;
+        *reinterpret_cast<volatile int32_t*>(dst_t + i) = vt;
+#endif
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.release.sys.global.u32 [%0], 1;" :: "l"(peer_flag) : "memory");
+#else
         __threadfence_system();
         *reinterpret_cast<volatile uint32_t*>(peer_flag) = 1u;
+#endif
     }
 }
 
@@ -1270,28 +1321,50 @@ __global__ void df2_p2p_wait_merge_top16_kernel(uint32_t* __restrict__ local_fla
     if (threadIdx.x == 0) {
         while (true) {
             uint32_t v = 0u;
-#if !defined(__HIPCC__)
-            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(local_flag));
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(local_flag) : "memory");
 #else
             v = *reinterpret_cast<volatile uint32_t*>(local_flag);
 #endif
             if (v != 0u) break;
-#if !defined(__HIPCC__) && __CUDA_ARCH__ >= 700
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             __nanosleep(64);
 #endif
         }
-        *reinterpret_cast<volatile uint32_t*>(local_flag) = 0u;
-        __threadfence();
     }
     __syncthreads();
     const int r = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    if (r >= rows) return;
     const int n = rows * kDf2TopK;
     const float* val1 = reinterpret_cast<const float*>(local_peer_buf);
     const int32_t* tok1 = reinterpret_cast<const int32_t*>(local_peer_buf + (size_t) n * sizeof(float));
-    float v = (lane < kDf2TopK) ? val0[r * kDf2TopK + lane] : val1[r * kDf2TopK + (lane - kDf2TopK)];
-    int32_t t = (lane < kDf2TopK) ? tok0[r * kDf2TopK + lane] : tok1[r * kDf2TopK + (lane - kDf2TopK)];
+    float v = 0.0f;
+    int32_t t = 0;
+    if (r < rows) {
+        if (lane < kDf2TopK) {
+            v = val0[r * kDf2TopK + lane];
+            t = tok0[r * kDf2TopK + lane];
+        } else {
+            const int idx = r * kDf2TopK + (lane - kDf2TopK);
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(v) : "l"(val1 + idx) : "memory");
+            asm volatile("ld.global.cv.s32 %0, [%1];" : "=r"(t) : "l"(tok1 + idx) : "memory");
+#else
+            v = *reinterpret_cast<const volatile float*>(val1 + idx);
+            t = *reinterpret_cast<const volatile int32_t*>(tok1 + idx);
+#endif
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+#if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.release.sys.global.u32 [%0], 0;" :: "l"(local_flag) : "memory");
+#else
+        *reinterpret_cast<volatile uint32_t*>(local_flag) = 0u;
+        __threadfence_system();
+#endif
+    }
+    if (r >= rows) return;
     int rk = lane;   // 0..15 (GPU0, cols < h0) strictly beat 16..31 (GPU1, cols >= h0) on exact ties
 #pragma unroll
     for (int size = 2; size <= 32; size <<= 1) {
@@ -1640,8 +1713,10 @@ void df2_p2p_push_bytes_signal(const void* src, void* peer_dst, size_t bytes, ui
     check("df2_p2p_push_bytes_signal");
 }
 
-void df2_p2p_wait_reset(uint32_t* local_flag, void* stream) {
-    df2_p2p_wait_reset_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(local_flag);
+void df2_p2p_wait_reset(uint32_t* local_flag, void* stream, const void* vmm_src, void* local_dst, size_t bytes) {
+    const int threads = (vmm_src != nullptr && local_dst != nullptr && bytes > 0) ? 256 : 1;
+    df2_p2p_wait_reset_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(
+        local_flag, static_cast<const uint8_t*>(vmm_src), static_cast<uint8_t*>(local_dst), bytes);
     check("df2_p2p_wait_reset");
 }
 

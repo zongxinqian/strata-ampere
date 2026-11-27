@@ -92,7 +92,7 @@ bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, cons
                         void* stream);
 
 // ---- TP=2 VOCAB-PARALLEL BAR1 P2P HEAD PICK (in-graph greedy + penalized + Top-64 shortlist sampler, and post-graph P2P).
-constexpr int kTpHeadMaxHistLen = 128;
+constexpr int kTpHeadMaxHistLen = 512;
 struct TpHeadSampleCfg {
     SamplerParams sp0;
     SamplerParams sp1;
@@ -148,6 +148,36 @@ inline void penalty_rows(const int32_t* tail, int64_t n_tail, const int32_t* win
         for (int j = 0; j < take; ++j) {
             const int64_t i = avail - take + j;                     // index into (tail, window)
             row[h - take + j] = i < n_tail ? tail[i] : window[i - n_tail];
+        }
+    }
+}
+
+/// Branch-exact penalty-history rows for a 2-branch speculative tree verify window:
+///   - Branch A rows t in [0, fork): `tail[0..n_tail)` + `window[0..t]`
+///   - Branch B rows t in [fork, T): `tail[0..n_tail)` + `window[0..parent]` + `window[fork..t]`
+/// Every row sees byte-for-byte the exact history linear autoregressive decoding would see along its branch.
+inline void penalty_rows_tree(const int32_t* tail, int64_t n_tail, const int32_t* window, int T, int fork, int parent,
+                              int h, int32_t* out) {
+    if (fork <= 0 || fork >= T || parent < 0 || parent >= fork) {
+        penalty_rows(tail, n_tail, window, T, h, out);
+        return;
+    }
+    penalty_rows(tail, n_tail, window, fork, h, out);
+    const int64_t prefix_n = parent + 1;                            // window[0..parent]
+    for (int t = fork; t < T; ++t) {
+        int32_t* row = out + (size_t) t * (size_t) h;
+        const int64_t br_n = (t - fork) + 1;                        // window[fork..t]
+        const int64_t avail = n_tail + prefix_n + br_n;
+        const int take = (int) std::min<int64_t>(h, avail);
+        std::fill(row, row + (h - take), -1);
+        for (int j = 0; j < take; ++j) {
+            const int64_t i = avail - take + j;
+            if (i < n_tail) {
+                row[h - take + j] = tail[i];
+            } else {
+                const int64_t w = i - n_tail;
+                row[h - take + j] = w < prefix_n ? window[w] : window[fork + (w - prefix_n)];
+            }
         }
     }
 }

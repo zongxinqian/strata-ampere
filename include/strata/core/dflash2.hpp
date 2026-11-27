@@ -241,6 +241,7 @@ private:
     uint8_t* xqc_ = nullptr;        ///< the same for the context update, which runs beside the block
     float* xdc_ = nullptr;
     cudaStream_t cs2_ = nullptr;    ///< the context update's branch of the round graph
+    cudaStream_t ctx_pre_cs_ = nullptr; ///< low-priority stream for Layer-45 overlapped context update (never preempts Verifier)
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr, ev_ctx_[8] = {};
     bool fork_ = false;             ///< recording the forked graph: layer l's attention waits for ev_ctx_[l]
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
@@ -316,6 +317,7 @@ private:
     cudaGraphExec_t peer_exec_ = nullptr;
     uint8_t* peer_dhead_ = nullptr;
     int32_t* peer_dvocab_ = nullptr;
+    uint8_t* peer_xq_ = nullptr;
     uint8_t* peer_xil_ = nullptr;
     float* peer_logits_ = nullptr;
     float* peer_topval_ = nullptr;

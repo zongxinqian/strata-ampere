@@ -36,6 +36,7 @@
 namespace strata::core {
 
 class NativeHead;
+class TpComm;
 
 class MtpDrafter {
 public:
@@ -167,7 +168,7 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     void set_ple_session(SessionState* s) { ple_ss_ = s; }
-    void set_head_peer(int peer_dev) { head_peer_dev_ = peer_dev; }
+    void set_head_peer(int peer_dev, TpComm* tp = nullptr) { head_peer_dev_ = peer_dev; tp_comm_ = tp; }
     std::function<bool(int, float)> chain_rule_;
     std::function<strata::kernels::MtpCondChainRule()> chain_snap_fn_;
     bool coupled() const { return coupled_active_; }
@@ -412,7 +413,9 @@ private:
 
     // Surgery 6.20: TP2 split draft head across device_ (GPU0) and head_peer_dev_ (GPU1)
     int head_peer_dev_ = -1;
+    TpComm* tp_comm_ = nullptr;
     bool tp2_head_ = false;
+    bool tp2_vmm_p2p_ = false;
     int64_t n_dhead0_ = 0, n_dhead1_ = 0, n_dhead1_pad_ = 0;
     int tp2_step_ = 0;
     uint8_t* dhead1_ = nullptr;

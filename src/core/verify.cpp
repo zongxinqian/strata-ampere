@@ -831,8 +831,13 @@ Verifier::~Verifier() {
     if (hcount_d_) cudaFree(hcount_d_);
     if (full_logits_dev_) cudaFree(full_logits_dev_);
     if (tp2_peer_hist_d_) cudaFree(tp2_peer_hist_d_);
-    void* hosts[] = {h_tok_, h_step_, h_step_tree_, h_pos_, h_commit_, shared_ple_ ? nullptr : h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_ple_flag_, h_emb_raw_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_head_arg_, h_head_flag_, shared_ple_ ? nullptr : h_igs_};
+    void* hosts[] = {shared_inputs_ ? nullptr : h_tok_, shared_inputs_ ? nullptr : h_step_,
+                     shared_inputs_ ? nullptr : h_step_tree_, shared_inputs_ ? nullptr : h_pos_,
+                     shared_inputs_ ? nullptr : h_commit_, shared_ple_ ? nullptr : h_ple_,
+                     h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_ple_flag_,
+                     shared_inputs_ ? nullptr : h_emb_raw_, h_nf_, herr_h_, hdrop_h_, h_bal_,
+                     h_head_arg_, h_head_flag_, shared_ple_ ? nullptr : h_igs_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -1106,11 +1111,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
     // ---- mapped staging
-    bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
-              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
-              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_tree_, (void**) &m_step_tree_) &&
-              mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
-              mapped((2 + 2 * T + 4) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
+    bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_, tp_ != nullptr) &&
+              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_, tp_ != nullptr) &&
+              mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_tree_, (void**) &m_step_tree_, tp_ != nullptr) &&
+              mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_, tp_ != nullptr) &&
+              mapped((2 + 2 * T + 4) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_, tp_ != nullptr) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_, tp_ != nullptr) &&
               mapped(sizeof(strata::kernels::TpHeadSampleCfg) + (size_t) T * strata::kernels::kTpHeadMaxHistLen * sizeof(int32_t) + 64,
                      (void**) &h_igs_, (void**) &m_igs_, tp_ != nullptr) &&
@@ -1131,7 +1136,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (const NativeEmbed* ne = native_embed(); ne != nullptr && ne->host() != nullptr && ne->row_bytes() > 0) {
             emb_row_bytes_ = ne->row_bytes();
             emb_raw_cap_ = ((size_t) T * emb_row_bytes_ + 15ull) & ~15ull;
-            ok = mapped(emb_raw_cap_ + 64, (void**) &h_emb_raw_, (void**) &m_emb_raw_);
+            ok = mapped(emb_raw_cap_ + 64, (void**) &h_emb_raw_, (void**) &m_emb_raw_, tp_ != nullptr);
         }
     }
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
@@ -1269,7 +1274,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        static const bool keep_staging_env = [] {
+            const char* v = std::getenv("STRATA_VERIFY_KEEP_STAGING");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        const bool need_staging = keep_staging_env || !(no_pcie_ || (tp_ != nullptr && tp_rank_ == 1));
+        staging_ = need_staging ? b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob) : nullptr;
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
@@ -1361,7 +1371,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         had_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_ff), (int) g.n_ff);
     }
     sink_.staging = (unsigned long long) staging_;
-    sink_.staging_cap = kStagingBlobs;
+    sink_.staging_cap = staging_ != nullptr ? kStagingBlobs : 0;
     (void) TS;
     // STRATA_GRAPH_PRIO=1 (opt-in): the window's streams carry priorities that their captured kernel
     // nodes keep (the window graph is instantiated with cudaGraphInstantiateFlagUseNodePriority): the GDN gates / QSA
@@ -1579,6 +1589,50 @@ bool Verifier::set_tp_shared_ple(float* h_ple, strata::kernels::TpHeadSampleCfg*
     h_igs_ = h_igs;
     m_igs_ = m_igs_new;
     shared_ple_ = true;
+    return true;
+}
+
+bool Verifier::set_tp_shared_inputs(int32_t* h_tok, int32_t* h_step, int32_t* h_step_tree,
+                                    int32_t* h_pos, int32_t* h_commit, uint8_t* h_emb_raw) {
+    static const bool share_in_env = [] {
+        const char* v = std::getenv("STRATA_TP_SHARE_INPUTS");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (!share_in_env || h_tok == nullptr || h_step == nullptr || h_step_tree == nullptr ||
+        h_pos == nullptr || h_commit == nullptr)
+        return false;
+    if (emb_raw_cap_ > 0 && h_emb_raw == nullptr) return false;
+    const OnDevice on_device(device_);
+    int32_t *m_tok_new = nullptr, *m_step_new = nullptr, *m_step_tree_new = nullptr;
+    int32_t *m_pos_new = nullptr, *m_commit_new = nullptr;
+    uint8_t* m_emb_new = nullptr;
+    if (cudaHostGetDevicePointer((void**) &m_tok_new, h_tok, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &m_step_new, h_step, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &m_step_tree_new, h_step_tree, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &m_pos_new, h_pos, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer((void**) &m_commit_new, h_commit, 0) != cudaSuccess ||
+        (emb_raw_cap_ > 0 && cudaHostGetDevicePointer((void**) &m_emb_new, h_emb_raw, 0) != cudaSuccess)) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (!shared_inputs_) {
+        if (h_tok_) cudaFreeHost(h_tok_);
+        if (h_step_) cudaFreeHost(h_step_);
+        if (h_step_tree_) cudaFreeHost(h_step_tree_);
+        if (h_pos_) cudaFreeHost(h_pos_);
+        if (h_commit_) cudaFreeHost(h_commit_);
+        if (h_emb_raw_) cudaFreeHost(h_emb_raw_);
+    }
+    h_tok_ = h_tok; m_tok_ = m_tok_new;
+    h_step_ = h_step; m_step_ = m_step_new;
+    h_step_tree_ = h_step_tree; m_step_tree_ = m_step_tree_new;
+    h_pos_ = h_pos; m_pos_ = m_pos_new;
+    h_commit_ = h_commit; m_commit_ = m_commit_new;
+    if (emb_raw_cap_ > 0) {
+        h_emb_raw_ = h_emb_raw;
+        m_emb_raw_ = m_emb_new;
+    }
+    shared_inputs_ = true;
     return true;
 }
 
@@ -4032,21 +4086,23 @@ void Verifier::stage_emb_raw(int T, const int32_t* tokens) {
 
 void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0, int fork, int parent) {
     using namespace strata::kernels;
-    const ModelGeometry& g = *g_;
-    const QsaShapes s = shapes_of(g);
-    int32_t* const pk = h_pos_ + (size_t) max_t_ * g.n_head;
-    int32_t* const pi = pk + (size_t) max_t_ * g.n_head_kv;
-    for (int t = 0; t < T; ++t) {
-        const int depth_t = (fork > 0 && t >= fork) ? (parent + 1 + (t - fork)) : t;
-        h_tok_[t] = tokens[t];
-        qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        if (fork > 0) qsa_step_fill(h_step_tree_ + t * kStepCount, pos0 + depth_t, s);
-        const int32_t pos_t = (int32_t) (pos0 + depth_t);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
+    if (!(shared_inputs_ && tp_rank_ == 1)) {
+        const ModelGeometry& g = *g_;
+        const QsaShapes s = shapes_of(g);
+        int32_t* const pk = h_pos_ + (size_t) max_t_ * g.n_head;
+        int32_t* const pi = pk + (size_t) max_t_ * g.n_head_kv;
+        for (int t = 0; t < T; ++t) {
+            const int depth_t = (fork > 0 && t >= fork) ? (parent + 1 + (t - fork)) : t;
+            h_tok_[t] = tokens[t];
+            qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
+            if (fork > 0) qsa_step_fill(h_step_tree_ + t * kStepCount, pos0 + depth_t, s);
+            const int32_t pos_t = (int32_t) (pos0 + depth_t);
+            for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
+            for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
+            for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
+        }
+        stage_emb_raw(T, tokens);
     }
-    stage_emb_raw(T, tokens);
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
@@ -4235,8 +4291,9 @@ bool Verifier::run_tree(int T, int fork, int parent, const int32_t* tokens, int6
         err = "verify: run_tree parameters out of range";
         return false;
     }
-    if (hist_d_ != nullptr || sampling_.logit_bias != nullptr || spec_measure_) {
-        err = "verify: run_tree requires penalty/bias-free decoding";
+    const bool greedy_tree = sampling_.greedy || sampling_.temperature <= 0.0f;
+    if ((hist_d_ != nullptr && !greedy_tree) || sampling_.logit_bias != nullptr || spec_measure_) {
+        err = "verify: run_tree requires greedy/penalty-compatible decoding";
         return false;
     }
     for (const Verifier* v = this; v != nullptr; v = v->next_) {
@@ -4844,17 +4901,29 @@ bool Verifier::run_common(int T, int fork, int parent, const int32_t* tokens, in
             const int32_t* h1_dev = nullptr;
             if (sp.penalty_last_n > 0 && hist_d_ != nullptr && hist_len_ > 0) {
                 const size_t hbytes = (size_t) T * (size_t) hist_len_ * sizeof(int32_t);
-                const OnDevice on1(tp_peer_->device_);
-                if (tp2_peer_hist_cap_ < hbytes) {
-                    if (tp2_peer_hist_d_) cudaFree(tp2_peer_hist_d_);
-                    tp2_peer_hist_d_ = nullptr;
-                    tp2_peer_hist_cap_ = 0;
-                    if (cudaMalloc((void**) &tp2_peer_hist_d_, hbytes) == cudaSuccess) tp2_peer_hist_cap_ = hbytes;
-                    else (void) cudaGetLastError();
+                const size_t hbytes_aligned = (hbytes + 15u) & ~size_t(15u);
+                if (tp_->p2p_vmm() && tp_->p2p_hist_buf(1) != nullptr && hbytes_aligned <= TpComm::kP2pHistBytes &&
+                    ((((uintptr_t) hist_d_) & 15u) == 0) && ev_fork_ != nullptr &&
+                    tp_->p2p_push_bytes_async(hist_d_, tp_->p2p_hist_buf(1), hbytes_aligned, 0, cs_) &&
+                    cudaEventRecord(ev_fork_, cs_) == cudaSuccess) {
+                    const OnDevice on1(tp_peer_->device_);
+                    if (cudaStreamWaitEvent(tp_peer_->cs_, ev_fork_, 0) == cudaSuccess) {
+                        h1_dev = tp_->p2p_hist_buf(1);
+                    }
                 }
-                if (tp2_peer_hist_d_ != nullptr &&
-                    cudaMemcpyPeerAsync(tp2_peer_hist_d_, tp_peer_->device_, hist_d_, device_, hbytes, tp_peer_->cs_) == cudaSuccess) {
-                    h1_dev = tp2_peer_hist_d_;
+                if (h1_dev == nullptr) {
+                    const OnDevice on1(tp_peer_->device_);
+                    if (tp2_peer_hist_cap_ < hbytes) {
+                        if (tp2_peer_hist_d_) cudaFree(tp2_peer_hist_d_);
+                        tp2_peer_hist_d_ = nullptr;
+                        tp2_peer_hist_cap_ = 0;
+                        if (cudaMalloc((void**) &tp2_peer_hist_d_, hbytes) == cudaSuccess) tp2_peer_hist_cap_ = hbytes;
+                        else (void) cudaGetLastError();
+                    }
+                    if (tp2_peer_hist_d_ != nullptr &&
+                        cudaMemcpyPeerAsync(tp2_peer_hist_d_, tp_peer_->device_, hist_d_, device_, hbytes, tp_peer_->cs_) == cudaSuccess) {
+                        h1_dev = tp2_peer_hist_d_;
+                    }
                 }
             }
             if (sp.penalty_last_n <= 0 || h1_dev != nullptr) {
@@ -4870,6 +4939,7 @@ bool Verifier::run_common(int T, int fork, int parent, const int32_t* tokens, in
         if (tp2_shortlist_done) {
             spec_q_ = nullptr;
             spec_nq_ = 0;
+            (void) cudaStreamQuery(cs_);
             if (cudaStreamSynchronize(cs_) != cudaSuccess) {
                 err = "verify: the TP2 head sampling failed";
                 return false;
@@ -4918,8 +4988,9 @@ bool Verifier::run_common(int T, int fork, int parent, const int32_t* tokens, in
         else if (fork > 0) {
             // Phase 2B: position-exact Philox sampling for both branches of a tree verify window (100% bit-exact lossless)
             sample_tokens(full_hl, fork, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+            const int32_t* hist_b = hist_d_ != nullptr ? (hist_d_ + (size_t) fork * (size_t) hist_len_) : nullptr;
             sample_tokens(full_hl + (size_t) fork * (size_t) n_vocab_, T - fork, (int) n_vocab_,
-                          hist_d_, hist_len_, sp_b, m_out_ + fork, cs_);
+                          hist_b, hist_len_, sp_b, m_out_ + fork, cs_);
         } else sample_tokens(full_hl, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
@@ -5018,8 +5089,10 @@ void Verifier::set_plan_slot(int grp) {
     sink_.dst2 = (unsigned long long*) (base + dst2_off_);
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-    sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
-    sink_.staging_cap = per;
+    sink_.staging = staging_ != nullptr
+                        ? (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob)
+                        : 0ull;
+    sink_.staging_cap = staging_ != nullptr ? per : 0;
 }
 
 // Flag B only rises: a host function of an earlier layer may run after a later layer already raised it directly.
@@ -5197,15 +5270,17 @@ bool Verifier::commit_common(int n_keep, const int32_t* win_rows, std::string& e
         }
     }
     const Clock::time_point t0 = Clock::now();
-    h_commit_[0] = n_keep;
-    h_commit_[1] = win_rows != nullptr ? win_rows[n_keep - 1] : (n_keep - 1);
-    for (int t = 0; t < max_t_; ++t) {
-        h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-        h_commit_[2 + max_t_ + t] = (win_rows != nullptr && t < n_keep) ? win_rows[t] : t;
+    if (!(shared_inputs_ && tp_rank_ == 1)) {
+        h_commit_[0] = n_keep;
+        h_commit_[1] = win_rows != nullptr ? win_rows[n_keep - 1] : (n_keep - 1);
+        for (int t = 0; t < max_t_; ++t) {
+            h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+            h_commit_[2 + max_t_ + t] = (win_rows != nullptr && t < n_keep) ? win_rows[t] : t;
+        }
+        const uint64_t p0u = (uint64_t) last_pos0_;
+        h_commit_[2 + 2 * max_t_] = (int32_t) (uint32_t) (p0u & 0xffffffffu);
+        h_commit_[2 + 2 * max_t_ + 1] = (int32_t) (uint32_t) (p0u >> 32);
     }
-    const uint64_t p0u = (uint64_t) last_pos0_;
-    h_commit_[2 + 2 * max_t_] = (int32_t) (uint32_t) (p0u & 0xffffffffu);
-    h_commit_[2 + 2 * max_t_ + 1] = (int32_t) (uint32_t) (p0u >> 32);
     if (last_t_ == 1 && !always_publish_ && one_token_self_commit() && !g_qfuse()) {
         // a one-token window has advanced the state itself (record_window): no commit graph. (Not with STRATA_QFUSE: its windows
         // do not self-commit, see `self_commit` there - skipping the commit here left the GDN state and the indexer tail one token behind.)

@@ -7980,10 +7980,10 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> p0;
         p0.reserve((profile.size() + 1) / 2);
         tp1_profile.reserve(profile.size() / 2);
-        // Capacity-weighted Bresenham partition: matches CUDA0:CUDA1 actual VRAM slot ratio (~48:52 with DFlash2 on GPU0)
+        // Capacity-weighted Bresenham partition: matches CUDA0:CUDA1 actual VRAM slot ratio (~49:51 with P2P DFlash2 + trimmed Verifier)
         // so 100% of global Top-(slots0+slots1) hottest experts stay resident with zero mid-rank eviction gap.
-        const int w0_env = [] { const char* v = std::getenv("STRATA_TP2_PART_W0"); return v ? std::atoi(v) : 48; }();
-        const int w1_env = [] { const char* v = std::getenv("STRATA_TP2_PART_W1"); return v ? std::atoi(v) : 52; }();
+        const int w0_env = [] { const char* v = std::getenv("STRATA_TP2_PART_W0"); return v ? std::atoi(v) : 49; }();
+        const int w1_env = [] { const char* v = std::getenv("STRATA_TP2_PART_W1"); return v ? std::atoi(v) : 51; }();
         const int w0 = std::max(1, w0_env);
         const int w1 = std::max(1, w1_env);
         const int wsum = w0 + w1;
@@ -9028,7 +9028,14 @@ int main(int argc, char** argv) {
                         int64_t mtp_b = (!o.mtp.empty() && native_head.loaded())
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
-                        if (use_df2 && native_head.loaded()) mtp_b += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);   // DFlash2's own draft head and logits (serve: and the prompt staging)
+                        static const bool tp2_vram_trim_pre = [] {
+                            const char* v = std::getenv("STRATA_TP2_VRAM_TRIM");
+                            return !(v != nullptr && v[0] == '0');
+                        }();
+                        const int64_t df2_extra_pre = (tp2_on && tp2_vram_trim_pre && !df2_expect_share && df2_solo && pf_borrow)
+                                                          ? (16ll << 20)
+                                                          : ((48ll << 20) + (o.serve ? (112ll << 20) : 0ll));
+                        if (use_df2 && native_head.loaded()) mtp_b += df2_head_bytes() + df2_extra_pre;   // DFlash2's own draft head and logits (serve: and the prompt staging)
 #endif
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
@@ -9364,8 +9371,15 @@ int main(int argc, char** argv) {
         if (stages.empty())
             for (const auto& d : slot_mtp)
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
+        static const bool tp2_vram_trim = [] {
+            const char* v = std::getenv("STRATA_TP2_VRAM_TRIM");
+            return !(v != nullptr && v[0] == '0');
+        }();
 #if defined(STRATA_HAVE_DFLASH2)
-        if (use_df2 && native_head.loaded()) mtp_bind += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
+        const int64_t df2_extra_b = (tp2_on && tp2_vram_trim && !df2_expect_share && df2_solo && pf_borrow)
+                                        ? (16ll << 20)
+                                        : ((48ll << 20) + (o.serve ? (112ll << 20) : 0ll));
+        if (use_df2 && native_head.loaded()) mtp_bind += df2_head_bytes() + df2_extra_b;   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
 #endif
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
@@ -9377,8 +9391,13 @@ int main(int argc, char** argv) {
         // verifier warm up, ~245 MiB on every card measured) came out of the reserve, so a card ended 240 MiB under the reserve it was asked to
         // keep (459 MiB free at --vram-reserve-mib 700: under the 512 MiB line the serve check warns about, #2065).  The cache now leaves it too.
         // Not on a card that could not keep min_slots after it, and not under STRATA_DEFAULTS=026 (the v0.2.6 sizing).
+        const int64_t late_mib_0 = strata::qwen_defaults_026()
+                                       ? 0
+                                       : ((tp2_on && tp2_vram_trim && !o.pcie_frac_auto && o.pcie_frac == 0.0)
+                                              ? 96
+                                              : strata::core::kLateAllocMib);
         strata::core::AutoCacheSlots auto_slots = strata::core::auto_cache_slots(
-            (int64_t) free_b, reserve, blob, min_slots, strata::qwen_defaults_026() ? 0 : strata::core::kLateAllocMib);
+            (int64_t) free_b, reserve, blob, min_slots, late_mib_0);
         int64_t slots = auto_slots.slots;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         if (const char* ecap = std::getenv("STRATA_TP2_EXPERT_CAP"); ecap != nullptr && std::atoi(ecap) > 0)
@@ -9400,7 +9419,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head%s) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
-                     auto_slots.late_priced ? ", +256 MiB for what is allocated after the cache" : "", o.expert_cache);
+                     auto_slots.late_priced ? (", +" + std::to_string((long long) late_mib_0) + " MiB for what is allocated after the cache").c_str() : "",
+                     o.expert_cache);
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
         // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
@@ -10118,7 +10138,12 @@ int main(int argc, char** argv) {
         const bool mtp_q4_head = (o.mtp_q4 == "all" || o.mtp_q4 == "head");
         const int64_t mtp_peer1_b = (!o.mtp.empty() && mtp_q4_head && o.pipeline_windows <= 0 &&
                                      (tp2_h_env == nullptr || tp2_h_env[0] != '0')) ? (78LL << 20) : 0LL;
-        const int64_t reserve1 = (((int64_t) std::max<int64_t>(later_r1, 384) + 128) << 20) + mtp_peer1_b;
+        static const bool tp2_vram_trim1 = [] {
+            const char* v = std::getenv("STRATA_TP2_VRAM_TRIM");
+            return !(v != nullptr && v[0] == '0');
+        }();
+        const int64_t pad1_mib = (tp2_vram_trim1 && !o.pcie_frac_auto && o.pcie_frac == 0.0) ? 96 : 128;
+        const int64_t reserve1 = (((int64_t) std::max<int64_t>(later_r1, 384) + pad1_mib) << 20) + mtp_peer1_b;
         const int64_t room1 = (int64_t) fb1 > reserve1 ? (int64_t) fb1 - reserve1 : 0;
         if (!profile_all.empty()) {
             std::vector<uint8_t> on0((size_t) g.n_layers * (size_t) g.n_expert, 0);
@@ -13704,7 +13729,7 @@ int main(int argc, char** argv) {
         if (tp1) {
             tp1->ver.set_tp(&tp1->comm, 1, false, nullptr);
             ver.set_tp(&tp1->comm, 0, true, &tp1->ver);
-            if (use_mtp) mtp.set_head_peer(tp1->dev);
+            if (use_mtp) mtp.set_head_peer(tp1->dev, &tp1->comm);
         }
         const int tp2_miss_256 = (tp1 && tp1->d_res_peer != nullptr && tp1->d_host_blobs != nullptr &&
                                   tp1->host_blobs_mapped == g.n_layers * g.n_expert)
@@ -13749,6 +13774,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: TP2 CUDA%d CPU-miss peer mapping unavailable (falling back to GPU0 receive)\n", tp1->dev);
                 }
                 (void) tp1->ver.set_tp_shared_ple(ver.h_ple(), ver.h_igs());
+                (void) tp1->ver.set_tp_shared_inputs(ver.h_tok(), ver.h_step(), ver.h_step_tree(),
+                                                     ver.h_pos(), ver.h_commit(), ver.h_emb_raw());
             }
             drive.d.tp_plan1 = tp1->ver.plan_sink();
             drive.d.tp_res1 = tp1->host_res.data();
@@ -22426,8 +22453,12 @@ int main(int argc, char** argv) {
                 }
                 TreeRoundPick tpick;
                 const int room_serve = (int) std::min<int64_t>({S_mtp, S, o.max_context - p});
+                static const bool tree_pen_on = [] {
+                    const char* v = std::getenv("STRATA_DF2_TREE_PEN");
+                    return v != nullptr && v[0] != '\0' && v[0] != '0';
+                }();
                 const bool tree_elig = use_mtp && draft_on && mtp_have_drafts && !req_df2 && !mtp.prob() &&
-                                       req_sp.greedy && hist_n == 0 && req_bias.empty() && !from_sfx && !first_window &&
+                                       req_sp.greedy && (hist_n == 0 || tree_pen_on) && req_bias.empty() && !from_sfx && !first_window &&
                                        !merged && !gated_proposal && chain_n == 0 && !win_forced && fol == nullptr &&
                                        !hold_on && mtp_last_n >= 1 && room_serve >= 3 &&
                                        ver.tree_kv_supported(ss, g);
@@ -22477,7 +22508,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 // Gate Frontier-Fork Tree to Greedy decode ONLY (temp>0 stochastic misses scatter beyond top-2)
-                if (tpick.fork == 0 && use_df2 && req_df2 && draft_on && req_sp.greedy && hist_n == 0 && req_bias.empty() && !from_sfx && !first_window &&
+                if (tpick.fork == 0 && use_df2 && req_df2 && draft_on && req_sp.greedy && (hist_n == 0 || tree_pen_on) && req_bias.empty() && !from_sfx && !first_window &&
                     !merged && !gated_proposal && chain_n == 0 && !win_forced && fol == nullptr && !hold_on &&
                     n_stages == 1 && T >= 1 && room_serve >= 3 && ver.tree_kv_supported(ss, g)) {
                     const int df2_cap = std::min<int>({(int) std::min<int64_t>(S, o.max_context - p),
@@ -22664,16 +22695,21 @@ int main(int argc, char** argv) {
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
                     // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
                     // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), window.data(), T,
-                                                  hist_n, hist_stage.data());
+                    if (tpick.fork > 0) {
+                        strata::kernels::penalty_rows_tree(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0),
+                                                           window.data(), T, tpick.fork, tpick.parent, hist_n, hist_stage.data());
+                    } else {
+                        strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), window.data(), T,
+                                                      hist_n, hist_stage.data());
+                    }
                     static const bool tp_head_fast_env = [] {
                         const char* v = std::getenv("STRATA_TP_HEAD_FAST");
                         return !(v != nullptr && v[0] == '0');
                     }();
                     if (!(tp1 != nullptr && tp_head_fast_env && ver.can_in_graph_hist(hist_n))) {
                         const strata::core::OnDevice on_h(hist_dev);
-                        cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
-                                   cudaMemcpyHostToDevice);
+                        cudaMemcpyAsync(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
+                                        cudaMemcpyHostToDevice, ver.stream());
                     }
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them

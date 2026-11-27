@@ -13,6 +13,9 @@ public:
     static constexpr int64_t kP2pPipeElems = 20LL << 20;
     static constexpr int kP2pPipeSlots = 8;
     static constexpr size_t kP2pHeadArgBytes = 16384;
+    static constexpr size_t kP2pMtpXqBytes = 4096;
+    static constexpr size_t kP2pHistBytes = 40960;
+    static constexpr size_t kP2pMtpLogitsBytes = 458752;
     static constexpr size_t kP2pQsaSlots = 8;
     static constexpr size_t kP2pQsaSelInts = 32768;
 
@@ -46,8 +49,15 @@ public:
     uint32_t* host_main_flag_dev(int rank) const { return (rank >= 0 && rank < 2) ? m_flag_[rank][rank] : nullptr; }
     void* p2p_head_arg(int dst_rank) const { return (p2p_dec_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_head_arg_[dst_rank] : nullptr; }
     uint32_t* p2p_head_flag(int dst_rank) const { return (p2p_dec_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_head_flag_[dst_rank] : nullptr; }
-    void* p2p_df2_buf(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_tx_[dst_rank][0] : nullptr; }
+    void* p2p_df2_buf(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_df2_buf_[dst_rank] : nullptr; }
     uint32_t* p2p_df2_flag(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_df2_flag_[dst_rank] : nullptr; }
+    uint8_t* p2p_mtp_xq(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_mtp_xq_[dst_rank] : nullptr; }
+    uint64_t* p2p_mtp_go(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_mtp_go_[dst_rank] : nullptr; }
+    uint64_t* p2p_mtp_done(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_mtp_done_[dst_rank] : nullptr; }
+    void* p2p_mtp_hp(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_mtp_hp_[dst_rank] : nullptr; }
+    float* p2p_mtp_logits(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_mtp_logits_[dst_rank] : nullptr; }
+    int32_t* p2p_hist_buf(int dst_rank) const { return (p2p_ && p2p_vmm_ && dst_rank >= 0 && dst_rank < 2) ? d_p2p_hist_[dst_rank] : nullptr; }
+    bool p2p_push_bytes_async(const void* src_dev, void* dst_peer_vmm, size_t bytes, int src_rank, void* stream);
     bool p2p_qsa_ready() const { return p2p_ && p2p_vmm_ && d_p2p_qsa_sel_[0] != nullptr && d_p2p_qsa_flag_[0] != nullptr; }
     void p2p_push_qsa_sel_dec(const int32_t* src, int slot, int dst_off_ints, int n_ints, uint32_t sig_val, int rank, void* stream);
     void p2p_recv_qsa_sel_dec(int32_t* dst, int slot, int src_off_ints, int n_ints, uint32_t wait_val, bool reset_after, int rank, void* stream);
@@ -87,12 +97,19 @@ private:
     uint32_t* d_p2p_head_flag_[2] = {nullptr, nullptr};
     uint32_t* d_p2p_logits_flag_[2] = {nullptr, nullptr};
     uint32_t* d_p2p_swap_flag_[2] = {nullptr, nullptr};
+    void* d_p2p_df2_buf_[2] = {nullptr, nullptr};
     uint32_t* d_p2p_df2_flag_[2] = {nullptr, nullptr};
     uint32_t* d_p2p_qsa_flag_[2] = {nullptr, nullptr};
     int32_t* d_p2p_qsa_sel_[2] = {nullptr, nullptr};
     int32_t* d_p2p_qsa_pf_sel_[2] = {nullptr, nullptr};
     uint32_t* d_p2p_qsa_pf_rdy_[2] = {nullptr, nullptr};
     uint32_t* d_p2p_qsa_pf_ack_[2] = {nullptr, nullptr};
+    uint8_t* d_p2p_mtp_xq_[2] = {nullptr, nullptr};
+    uint64_t* d_p2p_mtp_go_[2] = {nullptr, nullptr};
+    uint64_t* d_p2p_mtp_done_[2] = {nullptr, nullptr};
+    void* d_p2p_mtp_hp_[2] = {nullptr, nullptr};
+    float* d_p2p_mtp_logits_[2] = {nullptr, nullptr};
+    int32_t* d_p2p_hist_[2] = {nullptr, nullptr};
     uint32_t qsa_pf_step_[2][2] = {{0, 0}, {0, 0}};
     uint32_t logits_step_ = 0;
     uint32_t swap_step_ = 0;

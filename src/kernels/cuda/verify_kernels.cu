@@ -2616,19 +2616,37 @@ __global__ void mtp_tp2_publish_x_kernel(const uint8_t* __restrict__ xq_src, uin
         const uint4* __restrict__ s4 = reinterpret_cast<const uint4*>(xq_src);
         uint4* __restrict__ d4 = reinterpret_cast<uint4*>(mapped_xq);
         const int n4 = n_bytes >> 4;
-        for (int i = threadIdx.x; i < n4; i += blockDim.x) d4[i] = s4[i];
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            const uint4 v = s4[i];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("st.global.wt.v4.u32 [%0], {%1, %2, %3, %4};"
+                         :: "l"(d4 + i), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+#else
+            d4[i] = v;
+#endif
+        }
     } else {
         const uint32_t* __restrict__ s1 = reinterpret_cast<const uint32_t*>(xq_src);
         uint32_t* __restrict__ d1 = reinterpret_cast<uint32_t*>(mapped_xq);
         const int n1 = n_bytes >> 2;
-        for (int i = threadIdx.x; i < n1; i += blockDim.x) d1[i] = s1[i];
+        for (int i = threadIdx.x; i < n1; i += blockDim.x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("st.global.wt.u32 [%0], %1;" :: "l"(d1 + i), "r"(s1[i]) : "memory");
+#else
+            d1[i] = s1[i];
+#endif
+        }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        __threadfence_system();
         const uint64_t r = d_round ? (bump_round ? (*d_round = *d_round + 1ull) : *d_round) : 0ull;
         const uint64_t tag = (r << 5) | ((uint64_t) step_j << 1) | 1ull;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(mapped_go), "l"(tag) : "memory");
+#else
+        __threadfence_system();
         asm volatile("st.relaxed.sys.global.u64 [%0], %1;" :: "l"(mapped_go), "l"(tag) : "memory");
+#endif
     }
 }
 
@@ -2636,8 +2654,12 @@ __global__ void mtp_tp2_abort_peer_kernel(const uint64_t* __restrict__ d_round, 
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         const uint64_t r = d_round ? *d_round : 0ull;
         const uint64_t tag = (r << 5) | 30ull;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(mapped_go), "l"(tag) : "memory");
+#else
         __threadfence_system();
         asm volatile("st.relaxed.sys.global.u64 [%0], %1;" :: "l"(mapped_go), "l"(tag) : "memory");
+#endif
     }
 }
 
@@ -2651,9 +2673,13 @@ __global__ void mtp_tp2_peer_wait_kernel(const uint64_t* __restrict__ mapped_go,
         const uint64_t r = d_round ? (step_j == 0 ? (*d_round = *d_round + 1ull) : *d_round) : 0ull;
         const uint64_t want = (r << 5) | ((uint64_t) step_j << 1);
         uint64_t v = 0;
-        do {
+        for (;;) {
             asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(mapped_go) : "memory");
-        } while (v < want);
+            if (v >= want) break;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(32);
+#endif
+        }
         s_run = (int) (v & 1ull);
         if (use_cond) cudaGraphSetConditional(cond_handle, s_run ? 1u : 0u);
     }
@@ -2663,12 +2689,29 @@ __global__ void mtp_tp2_peer_wait_kernel(const uint64_t* __restrict__ mapped_go,
             const uint4* __restrict__ s4 = reinterpret_cast<const uint4*>(mapped_xq);
             uint4* __restrict__ d4 = reinterpret_cast<uint4*>(xq_dst);
             const int n4 = n_bytes >> 4;
-            for (int i = threadIdx.x; i < n4; i += blockDim.x) d4[i] = s4[i];
+            for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                uint4 v;
+                asm volatile("ld.global.cv.v4.u32 {%0, %1, %2, %3}, [%4];"
+                             : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(s4 + i) : "memory");
+                d4[i] = v;
+#else
+                d4[i] = s4[i];
+#endif
+            }
         } else {
             const uint32_t* __restrict__ s1 = reinterpret_cast<const uint32_t*>(mapped_xq);
             uint32_t* __restrict__ d1 = reinterpret_cast<uint32_t*>(xq_dst);
             const int n1 = n_bytes >> 2;
-            for (int i = threadIdx.x; i < n1; i += blockDim.x) d1[i] = s1[i];
+            for (int i = threadIdx.x; i < n1; i += blockDim.x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                uint32_t v;
+                asm volatile("ld.global.cv.u32 %0, [%1];" : "=r"(v) : "l"(s1 + i) : "memory");
+                d1[i] = v;
+#else
+                d1[i] = s1[i];
+#endif
+            }
         }
     }
 }
@@ -2852,6 +2895,16 @@ __global__ void mtp_tp2_argmax_p2_sumexp_kernel(const float* __restrict__ logits
                     ? ((gid2 >= 0 && isfinite(gmax2) && isfinite(gmax) && sum > 0.0) ? (float) ((double) expf(gmax2 - gmax) / sum) : 0.0f)
                     : gmax2;
                 if (mapped_hp && mapped_done) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+                    asm volatile("st.global.wt.s32 [%0], %1;" :: "l"(&mapped_hp->id), "r"(gid) : "memory");
+                    asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(&mapped_hp->maxv), "f"(gmax) : "memory");
+                    asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(&mapped_hp->sumexp), "f"(fsum) : "memory");
+                    asm volatile("st.global.wt.s32 [%0], %1;" :: "l"(&mapped_hp->id2), "r"(gid2) : "memory");
+                    asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(&mapped_hp->maxv2), "f"(gmax2) : "memory");
+                    const uint64_t r = d_round ? *d_round : 0ull;
+                    const uint64_t tag = (r << 5) | (uint64_t) step_j;
+                    asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(mapped_done), "l"(tag) : "memory");
+#else
                     mapped_hp->id = gid;
                     mapped_hp->maxv = gmax;
                     mapped_hp->sumexp = fsum;
@@ -2861,6 +2914,7 @@ __global__ void mtp_tp2_argmax_p2_sumexp_kernel(const float* __restrict__ logits
                     const uint64_t r = d_round ? *d_round : 0ull;
                     const uint64_t tag = (r << 5) | (uint64_t) step_j;
                     asm volatile("st.relaxed.sys.global.u64 [%0], %1;" :: "l"(mapped_done), "l"(tag) : "memory");
+#endif
                 }
             }
         }
@@ -2877,19 +2931,34 @@ __global__ void mtp_tp2_merge_head_kernel(const int32_t* __restrict__ id0, const
         const uint64_t r = d_round ? *d_round : 0ull;
         const uint64_t want = (r << 5) | (uint64_t) step_j;
         uint64_t df = 0;
-        do {
+        for (;;) {
             asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(df) : "l"(mapped_done) : "memory");
-        } while (df < want);
+            if (df >= want) break;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(32);
+#endif
+        }
         float gm = __int_as_float(0xff800000), gm2 = gm;
         int32_t gi = 0x7fffffff, gi2 = 0x7fffffff;
-        const int32_t i0 = *id0, i1 = hp1->id;
-        const float m0 = *max0, m1 = hp1->maxv;
-        const float s0 = *sum0, s1 = hp1->sumexp;
+        int32_t i1, hp_id2;
+        float m1, s1, hp_maxv2;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("ld.global.cv.s32 %0, [%1];" : "=r"(i1) : "l"(&hp1->id) : "memory");
+        asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(m1) : "l"(&hp1->maxv) : "memory");
+        asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(s1) : "l"(&hp1->sumexp) : "memory");
+        asm volatile("ld.global.cv.s32 %0, [%1];" : "=r"(hp_id2) : "l"(&hp1->id2) : "memory");
+        asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(hp_maxv2) : "l"(&hp1->maxv2) : "memory");
+#else
+        i1 = hp1->id; m1 = hp1->maxv; s1 = hp1->sumexp; hp_id2 = hp1->id2; hp_maxv2 = hp1->maxv2;
+#endif
+        const int32_t i0 = *id0;
+        const float m0 = *max0;
+        const float s0 = *sum0;
         tp2_top2_push(gm, gi, gm2, gi2, m0, i0);
         tp2_top2_push(gm, gi, gm2, gi2, m1, i1);
         if (out2_id != nullptr) {
             tp2_top2_push(gm, gi, gm2, gi2, max0[1], id0[1]);
-            tp2_top2_push(gm, gi, gm2, gi2, hp1->maxv2, hp1->id2);
+            tp2_top2_push(gm, gi, gm2, gi2, hp_maxv2, hp_id2);
         }
         if (gi == 0x7fffffff || (!isfinite(gm) && gm < 0.0f)) { gi = 0; gi2 = -1; }
         if (gi2 == 0x7fffffff) gi2 = -1;
@@ -2912,17 +2981,26 @@ __global__ void mtp_tp2_merge_head_kernel(const int32_t* __restrict__ id0, const
 __global__ void mtp_tp2_peer_copy_logits_kernel(const float* __restrict__ src, float* __restrict__ mapped_dst,
                                                 uint64_t* __restrict__ mapped_done, const uint64_t* __restrict__ d_round,
                                                 uint32_t step_j, int n, unsigned int* __restrict__ ctr) {
-    for (int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x; i < n; i += (int) gridDim.x * (int) blockDim.x)
+    for (int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x; i < n; i += (int) gridDim.x * (int) blockDim.x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        asm volatile("st.global.wt.f32 [%0], %1;" :: "l"(mapped_dst + i), "f"(src[i]) : "memory");
+#else
         mapped_dst[i] = src[i];
+#endif
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence();
         if (atomicAdd(ctr, 1u) == (unsigned int) (gridDim.x - 1)) {
             *ctr = 0u;
-            __threadfence_system();
             const uint64_t r = d_round ? *d_round : 0ull;
             const uint64_t tag = (r << 5) | (uint64_t) step_j;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(mapped_done), "l"(tag) : "memory");
+#else
+            __threadfence_system();
             asm volatile("st.relaxed.sys.global.u64 [%0], %1;" :: "l"(mapped_done), "l"(tag) : "memory");
+#endif
         }
     }
 }
@@ -2934,12 +3012,24 @@ __global__ void mtp_tp2_merge_logits_kernel(const float* __restrict__ mapped_src
         const uint64_t r = d_round ? *d_round : 0ull;
         const uint64_t want = (r << 5) | (uint64_t) step_j;
         uint64_t df = 0;
-        do {
+        for (;;) {
             asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(df) : "l"(mapped_done) : "memory");
-        } while (df < want);
+            if (df >= want) break;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(32);
+#endif
+        }
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = mapped_src[i];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        float v;
+        asm volatile("ld.global.cv.f32 %0, [%1];" : "=f"(v) : "l"(mapped_src + i) : "memory");
+        dst[i] = v;
+#else
+        dst[i] = mapped_src[i];
+#endif
+    }
 }
 
 }  // namespace

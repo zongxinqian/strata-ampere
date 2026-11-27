@@ -1591,8 +1591,18 @@ tp2_head_part_kernel(const float* __restrict__ logits, int local_n, int row_offs
         hlen = p.penalty_last_n < eff_hlen ? p.penalty_last_n : eff_hlen;
         if (hlen < 0) hlen = 0;
     }
-    __shared__ unsigned int bits[kSplitBlockSpan / 32];
-    __shared__ int sh_hrow[kTpHeadMaxHistLen];
+    struct Phase1Smem {
+        unsigned int bits[kSplitBlockSpan / 32];
+        int sh_hrow[kTpHeadMaxHistLen];
+        int2 wl[kSplitWarps][kSelMax];
+    };
+    union SharedBody {
+        Phase1Smem p1;
+        int2 sh_lists[32 * kSelMax];
+    };
+    __shared__ SharedBody smem;
+    unsigned int* const bits = smem.p1.bits;
+    int* const sh_hrow = smem.p1.sh_hrow;
     const int* hrow = nullptr;
     if (hlen > 0) {
         if (mapped_hist) {
@@ -1624,7 +1634,6 @@ tp2_head_part_kernel(const float* __restrict__ logits, int local_n, int row_offs
         }
     }
 
-    __shared__ int2 wl[kSplitWarps][kSelMax];
     float prev_v = __int_as_float(0x7f800000);
     int prev_i = -1;
     int round_i = 0;
@@ -1641,15 +1650,15 @@ tp2_head_part_kernel(const float* __restrict__ logits, int local_n, int row_offs
         take_first(b0, i0, b1, i1);
         warp_first(b0, i0);
         if (i0 >= full_vocab) break;
-        if (lane == 0) wl[warp][round_i] = make_int2(i0, __float_as_int(b0));
+        if (lane == 0) smem.p1.wl[warp][round_i] = make_int2(i0, __float_as_int(b0));
         prev_v = b0;
         prev_i = i0;
     }
-    for (int r = round_i + lane; r < k; r += 32) wl[warp][r] = make_int2(full_vocab, (int) 0xff800000u);
+    for (int r = round_i + lane; r < k; r += 32) smem.p1.wl[warp][r] = make_int2(full_vocab, (int) 0xff800000u);
     __syncthreads();
     if (warp == 0) {
         int2* dst = row_st->block_lists + (size_t) b * (size_t) k;
-        warp_merge_lists(&wl[0][0], kSplitWarps, kSelMax, k, full_vocab, [&](int r, float v, int id) {
+        warp_merge_lists(&smem.p1.wl[0][0], kSplitWarps, kSelMax, k, full_vocab, [&](int r, float v, int id) {
             if (lane == 0) dst[r] = make_int2(id, __float_as_int(v));
         });
     }
@@ -1664,7 +1673,7 @@ tp2_head_part_kernel(const float* __restrict__ logits, int local_n, int row_offs
     __threadfence();
 
     // Last block of row t merges all n_blocks (<= 31) block lists into local_out[t * k .. +k]
-    __shared__ int2 sh_lists[32 * kSelMax];
+    int2* const sh_lists = smem.sh_lists;
     const int total_e = n_blocks * k;
     for (int e = (int) threadIdx.x; e < total_e; e += (int) blockDim.x) {
         const volatile int2* vp = row_st->block_lists + e;

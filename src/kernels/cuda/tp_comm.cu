@@ -1323,12 +1323,19 @@ void TpComm::release_pipe() {
             d_p2p_head_flag_[r] = nullptr;
             d_p2p_logits_flag_[r] = nullptr;
             d_p2p_swap_flag_[r] = nullptr;
+            d_p2p_df2_buf_[r] = nullptr;
             d_p2p_df2_flag_[r] = nullptr;
             d_p2p_qsa_flag_[r] = nullptr;
             d_p2p_qsa_sel_[r] = nullptr;
             d_p2p_qsa_pf_sel_[r] = nullptr;
             d_p2p_qsa_pf_rdy_[r] = nullptr;
             d_p2p_qsa_pf_ack_[r] = nullptr;
+            d_p2p_mtp_xq_[r] = nullptr;
+            d_p2p_mtp_go_[r] = nullptr;
+            d_p2p_mtp_done_[r] = nullptr;
+            d_p2p_mtp_hp_[r] = nullptr;
+            d_p2p_mtp_logits_[r] = nullptr;
+            d_p2p_hist_[r] = nullptr;
             d_p2p_tx_[r][0] = nullptr;
             d_p2p_tx_[r][1] = nullptr;
             if (d_done_ctr_[r]) { cudaFree(d_done_ctr_[r]); d_done_ctr_[r] = nullptr; }
@@ -1520,9 +1527,16 @@ bool TpComm::init(int dev0, int dev1, size_t max_floats, std::string& err) {
                         d_p2p_qsa_flag_[r] = reinterpret_cast<uint32_t*>(tail + 1024u);       // 8 x 64B cachelines (512 B)
                         d_p2p_qsa_pf_rdy_[r] = reinterpret_cast<uint32_t*>(tail + 1536u);     // 64B cacheline
                         d_p2p_qsa_pf_ack_[r] = reinterpret_cast<uint32_t*>(tail + 1600u);     // 64B cacheline
+                        d_p2p_mtp_go_[r] = reinterpret_cast<uint64_t*>(tail + 1664u);         // 64B cacheline (MTP TP2 go)
+                        d_p2p_mtp_done_[r] = reinterpret_cast<uint64_t*>(tail + 1728u);       // 64B cacheline (MTP TP2 done)
+                        d_p2p_mtp_hp_[r] = reinterpret_cast<void*>(tail + 1792u);             // 64B cacheline (MtpHeadPartial)
                         d_p2p_head_arg_[r] = reinterpret_cast<void*>(tail + 4096u);           // 16 KiB room for Top-64 shortlist P2P
+                        d_p2p_mtp_xq_[r] = reinterpret_cast<uint8_t*>(tail + 20480u);         // 4 KiB room for MTP q8_1 row P2P
+                        d_p2p_hist_[r] = reinterpret_cast<int32_t*>(tail + 24576u);           // 40 KiB room for fallback hist P2P
                         d_p2p_qsa_sel_[r] = reinterpret_cast<int32_t*>(tail + 65536u);        // 8 x 128 KiB = 1 MiB inside 2 MiB VMM tail
                         d_p2p_qsa_pf_sel_[r] = reinterpret_cast<int32_t*>(tail + 1114112u);   // 8 x 64 KiB = 512 KiB disjoint prefill ring
+                        d_p2p_mtp_logits_[r] = reinterpret_cast<float*>(tail + 1638400u);     // 416 KiB room for MTP coupled logits P2P
+                        d_p2p_df2_buf_[r] = reinterpret_cast<void*>(tail + 2064384u);         // Dedicated 32 KiB room for DFlash2 TP2 P2P (isolated from prefill d_p2p_tx_)
                     }
                     p2p_vmm_ = true;
                     alloc_ok = true;
@@ -1996,6 +2010,24 @@ bool TpComm::p2p_swap_expert_blobs(void* slot0_dev, void* slot1_dev, size_t byte
     }
     cudaSetDevice(prev_dev);
     return true;
+}
+
+bool TpComm::p2p_push_bytes_async(const void* src_dev, void* dst_peer_vmm, size_t bytes, int src_rank, void* stream) {
+    if (!p2p_ || !p2p_vmm_ || src_dev == nullptr || dst_peer_vmm == nullptr || bytes == 0 ||
+        src_rank < 0 || src_rank > 1)
+        return false;
+    if ((((uintptr_t) src_dev | (uintptr_t) dst_peer_vmm | bytes) & 15u) != 0)
+        return false;
+    int prev_dev = 0;
+    cudaGetDevice(&prev_dev);
+    cudaSetDevice(dev_[src_rank]);
+    const size_t n16 = bytes >> 4;
+    const int blocks = (int) ((n16 + 255u) / 256u < 256u ? (n16 + 255u) / 256u : 256u);
+    tp_push_bytes_kernel<<<blocks > 0 ? blocks : 1, 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const uint8_t*>(src_dev), reinterpret_cast<uint8_t*>(dst_peer_vmm), bytes);
+    const cudaError_t ce = cudaGetLastError();
+    cudaSetDevice(prev_dev);
+    return ce == cudaSuccess;
 }
 
 const uint16_t* TpComm::p2p_push_bf16_oneshot(const float* local_buf, int64_t n_elems, uint32_t& step, int rank, void* stream) {

@@ -1700,6 +1700,7 @@ struct Prefill::Impl {
     uint32_t tp_step_cur = 0;
     const int32_t* tp_peer_res = nullptr;
     Prefill* tp_peer = nullptr;
+    std::unique_ptr<HandWorker> tp_worker;
     uint8_t* tp_own_dev = nullptr;
     std::vector<uint8_t> tp_own_host;
     PinnedUpload tp_own_up;
@@ -9276,10 +9277,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         for (int64_t off = 0; off < n; off += step_C) {
             if (should_stop && should_stop()) { err = "cancelled"; body_ok = false; break; }
             const int64_t sub_n = std::min(step_C, n - off);
+            static const bool use_tp_worker = [] {
+                const char* v = std::getenv("STRATA_PF_TP_WORKER");
+                return !(v != nullptr && v[0] == '0');
+            }();
             std::string peer_err;
-            std::future<bool> peer_fut = std::async(std::launch::async, [&, off, sub_n] {
-                return impl_->tp_peer->run_impl(tokens + off, sub_n, pos0 + off, peer_err);
-            });
+            std::future<bool> peer_fut;
+            if (use_tp_worker) {
+                if (!impl_->tp_worker) impl_->tp_worker = std::make_unique<HandWorker>();
+                peer_fut = impl_->tp_worker->submit(std::packaged_task<bool()>([&, off, sub_n] {
+                    const bool r = impl_->tp_peer->run_impl(tokens + off, sub_n, pos0 + off, peer_err);
+                    (void) cudaGetLastError();
+                    return r;
+                }));
+            } else {
+                peer_fut = std::async(std::launch::async, [&, off, sub_n] {
+                    return impl_->tp_peer->run_impl(tokens + off, sub_n, pos0 + off, peer_err);
+                });
+            }
             const bool r0_ok = run_impl(tokens + off, sub_n, pos0 + off, err);
             const bool r1_ok = peer_fut.get();
             if (!r0_ok || !r1_ok) {

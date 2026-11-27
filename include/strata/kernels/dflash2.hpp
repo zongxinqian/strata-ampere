@@ -118,7 +118,7 @@ void df2_tap_rows(const float* R, float* out, int64_t out_stride, int64_t n_embd
 
 /// Wave 2B: P2P TP=2 Draft Head helpers (Zero-Host-Sync BAR1 push + 1-warp bitonic exact top-16 merge).
 void df2_p2p_push_bytes_signal(const void* src, void* peer_dst, size_t bytes, uint32_t* peer_flag, void* stream);
-void df2_p2p_wait_reset(uint32_t* local_flag, void* stream);
+void df2_p2p_wait_reset(uint32_t* local_flag, void* stream, const void* vmm_src = nullptr, void* local_dst = nullptr, size_t bytes = 0);
 void df2_p2p_push_top16_signal(const float* val, const int32_t* tok, int rows, void* peer_dst, uint32_t* peer_flag, void* stream);
 void df2_p2p_wait_merge_top16(uint32_t* local_flag, const void* local_peer_buf, float* val0, int32_t* tok0, int rows, void* stream);
 /// Phase 3A: Layer-45 monotonic counter signal & wait for deterministic async DFlash2 context overlap.

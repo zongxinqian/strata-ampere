@@ -6,6 +6,7 @@
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/tp_comm.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -1079,21 +1080,44 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                     cudaMemset(tp2_d0_round_, 0, 8) != cudaSuccess) {
                     err = "mtp: TP2 head GPU0 scratch alloc failed"; return false;
                 }
-                if (cudaHostAlloc((void**) &tp2_xq_h_, xq_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostAlloc((void**) &tp2_hp_h_, sizeof(strata::kernels::MtpHeadPartial), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostAlloc((void**) &tp2_go_h_, 8, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostAlloc((void**) &tp2_done_h_, 8, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostAlloc((void**) &tp2_logits_h_, (size_t) n_dhead1_ * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-                    err = "mtp: TP2 head mapped host alloc failed"; return false;
-                }
-                *tp2_go_h_ = 0ull;
-                *tp2_done_h_ = 0ull;
-                if (cudaHostGetDevicePointer((void**) &tp2_xq_m0_, tp2_xq_h_, 0) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &tp2_hp_m0_, tp2_hp_h_, 0) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &tp2_go_m0_, tp2_go_h_, 0) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &tp2_done_m0_, tp2_done_h_, 0) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &tp2_logits_m0_, tp2_logits_h_, 0) != cudaSuccess) {
-                    err = "mtp: TP2 head GPU0 host pointer map failed"; return false;
+                static const bool want_vmm_p2p = [] {
+                    const char* v = std::getenv("STRATA_MTP_TP2_P2P");
+                    return !(v != nullptr && v[0] == '0');
+                }();
+                const bool use_vmm_p2p = want_vmm_p2p && tp_comm_ != nullptr && tp_comm_->p2p_vmm() &&
+                                         xq_bytes <= TpComm::kP2pMtpXqBytes &&
+                                         (size_t) n_dhead1_ * sizeof(float) <= TpComm::kP2pMtpLogitsBytes &&
+                                         tp_comm_->p2p_mtp_xq(1) != nullptr && tp_comm_->p2p_mtp_go(1) != nullptr &&
+                                         tp_comm_->p2p_mtp_done(0) != nullptr && tp_comm_->p2p_mtp_hp(0) != nullptr &&
+                                         tp_comm_->p2p_mtp_logits(0) != nullptr;
+                if (use_vmm_p2p) {
+                    tp2_xq_m0_ = tp_comm_->p2p_mtp_xq(1);
+                    tp2_go_m0_ = tp_comm_->p2p_mtp_go(1);
+                    tp2_hp_m0_ = reinterpret_cast<strata::kernels::MtpHeadPartial*>(tp_comm_->p2p_mtp_hp(0));
+                    tp2_done_m0_ = tp_comm_->p2p_mtp_done(0);
+                    tp2_logits_m0_ = tp_comm_->p2p_mtp_logits(0);
+                    if (cudaMemset(tp2_hp_m0_, 0, 64) != cudaSuccess ||
+                        cudaMemset(tp2_done_m0_, 0, sizeof(uint64_t)) != cudaSuccess) {
+                        err = "mtp: TP2 VMM P2P GPU0 init failed"; return false;
+                    }
+                    tp2_vmm_p2p_ = true;
+                } else {
+                    if (cudaHostAlloc((void**) &tp2_xq_h_, xq_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostAlloc((void**) &tp2_hp_h_, sizeof(strata::kernels::MtpHeadPartial), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostAlloc((void**) &tp2_go_h_, 8, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostAlloc((void**) &tp2_done_h_, 8, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostAlloc((void**) &tp2_logits_h_, (size_t) n_dhead1_ * 4, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                        err = "mtp: TP2 head mapped host alloc failed"; return false;
+                    }
+                    *tp2_go_h_ = 0ull;
+                    *tp2_done_h_ = 0ull;
+                    if (cudaHostGetDevicePointer((void**) &tp2_xq_m0_, tp2_xq_h_, 0) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &tp2_hp_m0_, tp2_hp_h_, 0) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &tp2_go_m0_, tp2_go_h_, 0) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &tp2_done_m0_, tp2_done_h_, 0) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &tp2_logits_m0_, tp2_logits_h_, 0) != cudaSuccess) {
+                        err = "mtp: TP2 head GPU0 host pointer map failed"; return false;
+                    }
                 }
                 {
                     const OnDevice on1(head_peer_dev_);
@@ -1108,22 +1132,35 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                         cudaMalloc((void**) &tp2_ctr1_, 4) != cudaSuccess ||
                         cudaMalloc((void**) &tp2_d1_round_, 8) != cudaSuccess ||
                         cudaMemset(tp2_ctr1_, 0, 4) != cudaSuccess ||
-                        cudaMemset(tp2_d1_round_, 0, 8) != cudaSuccess ||
-                        cudaHostGetDevicePointer((void**) &tp2_xq_m1_, tp2_xq_h_, 0) != cudaSuccess ||
-                        cudaHostGetDevicePointer((void**) &tp2_hp_m1_, tp2_hp_h_, 0) != cudaSuccess ||
-                        cudaHostGetDevicePointer((void**) &tp2_go_m1_, tp2_go_h_, 0) != cudaSuccess ||
-                        cudaHostGetDevicePointer((void**) &tp2_done_m1_, tp2_done_h_, 0) != cudaSuccess ||
-                        cudaHostGetDevicePointer((void**) &tp2_logits_m1_, tp2_logits_h_, 0) != cudaSuccess) {
+                        cudaMemset(tp2_d1_round_, 0, 8) != cudaSuccess) {
                         err = "mtp: TP2 head GPU1 alloc failed"; return false;
+                    }
+                    if (tp2_vmm_p2p_) {
+                        tp2_xq_m1_ = tp_comm_->p2p_mtp_xq(1);
+                        tp2_go_m1_ = tp_comm_->p2p_mtp_go(1);
+                        tp2_hp_m1_ = reinterpret_cast<strata::kernels::MtpHeadPartial*>(tp_comm_->p2p_mtp_hp(0));
+                        tp2_done_m1_ = tp_comm_->p2p_mtp_done(0);
+                        tp2_logits_m1_ = tp_comm_->p2p_mtp_logits(0);
+                        if (cudaMemset(tp2_xq_m1_, 0, xq_bytes) != cudaSuccess ||
+                            cudaMemset(tp2_go_m1_, 0, sizeof(uint64_t)) != cudaSuccess) {
+                            err = "mtp: TP2 VMM P2P GPU1 init failed"; return false;
+                        }
+                    } else if (cudaHostGetDevicePointer((void**) &tp2_xq_m1_, tp2_xq_h_, 0) != cudaSuccess ||
+                               cudaHostGetDevicePointer((void**) &tp2_hp_m1_, tp2_hp_h_, 0) != cudaSuccess ||
+                               cudaHostGetDevicePointer((void**) &tp2_go_m1_, tp2_go_h_, 0) != cudaSuccess ||
+                               cudaHostGetDevicePointer((void**) &tp2_done_m1_, tp2_done_h_, 0) != cudaSuccess ||
+                               cudaHostGetDevicePointer((void**) &tp2_logits_m1_, tp2_logits_h_, 0) != cudaSuccess) {
+                        err = "mtp: TP2 head GPU1 host pointer map failed"; return false;
                     }
                 }
                 tp2_head_ = true;
                 dhead_type_ = GGML_Q4_0;
                 dhead_plain_ = false;
                 vram_ += (uint64_t) (n_dhead0_ * out_row) + raw.size();
-                std::fprintf(stderr, "strata mtp: --mtp-q4: TP2 draft head split CUDA%d %lld rows (%.1f MiB) + CUDA%d %lld rows (%.1f MiB), packed sm_86\n",
+                std::fprintf(stderr, "strata mtp: --mtp-q4: TP2 draft head split CUDA%d %lld rows (%.1f MiB) + CUDA%d %lld rows (%.1f MiB), packed sm_86%s\n",
                              device_, (long long) n_dhead0_, (double) (n_dhead0_ * out_row) / 1048576.0,
-                             head_peer_dev_, (long long) n_dhead1_, (double) (n_dhead1_pad_ * out_row) / 1048576.0);
+                             head_peer_dev_, (long long) n_dhead1_, (double) (n_dhead1_pad_ * out_row) / 1048576.0,
+                             tp2_vmm_p2p_ ? " [VMM BAR1 P2P]" : "");
 #endif
             } else {
             if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||

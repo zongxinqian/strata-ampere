@@ -253,12 +253,20 @@ public:
     bool set_tp_head_peer(strata::kernels::ArgHalf* h_arg, uint32_t* h_flag);
     bool set_tp_miss_peer(uint32_t* h_flag, float* h_ymiss);
     bool set_tp_shared_ple(float* h_ple, strata::kernels::TpHeadSampleCfg* h_igs);
+    bool set_tp_shared_inputs(int32_t* h_tok, int32_t* h_step, int32_t* h_step_tree,
+                              int32_t* h_pos, int32_t* h_commit, uint8_t* h_emb_raw);
     strata::kernels::ArgHalf* h_head_arg() const { return h_head_arg_; }
     uint32_t* h_head_flag() const { return h_head_flag_; }
     uint32_t* h_flag() const { return h_flag_; }
     float* h_ymiss() const { return h_ymiss_; }
     float* h_ple() const { return h_ple_; }
     strata::kernels::TpHeadSampleCfg* h_igs() const { return h_igs_; }
+    int32_t* h_tok() const { return h_tok_; }
+    int32_t* h_step() const { return h_step_; }
+    int32_t* h_step_tree() const { return h_step_tree_; }
+    int32_t* h_pos() const { return h_pos_; }
+    int32_t* h_commit() const { return h_commit_; }
+    uint8_t* h_emb_raw() const { return h_emb_raw_; }
     /// #2-B: optional abortable L->L+1 CPU L3 cache pre-warming hook called right after `*flag = want`
     /// while GPUs run layer L combine/allreduce and layer L+1 attention/GDN/router.
     using IdlePrewarmFn = void (*)(void* user, const float* x_f, const int32_t* ids, int n_tok, int k,
@@ -900,6 +908,7 @@ private:
     int32_t* tp2_peer_hist_d_ = nullptr;
     size_t tp2_peer_hist_cap_ = 0;
     bool shared_ple_ = false;
+    bool shared_inputs_ = false;
     float* full_logits_dev_ = nullptr;
     mutable std::vector<float> full_logits_host_;
     bool copy_full_logits_host(int T, float* dst_host) const;
