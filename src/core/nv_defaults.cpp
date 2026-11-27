@@ -44,6 +44,14 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_QSA_ROWS", "1"},            // -0.5, -1.2
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
             {"STRATA_SMALL_UNR", "3"},           // bitwise BF16 router + GDN a/b constant-trip unroll
+            // v1.5.0: upstream 0.2.19/0.2.20 sm_86 bit-exact pipeline/PLE/K-quant defaults
+            {"STRATA_DEQUANT_SIDE", "1"},
+            {"STRATA_LFUSE", "1"},
+            {"STRATA_PLE_COMPACT", "1"},
+            {"STRATA_PLE_COPY_STREAM", "1"},
+            {"STRATA_PF_FUSED_KQ", "1"},
+            {"STRATA_HC_UPMIX", "1"},
+            {"STRATA_PREFILL_CPU_SHARE_NT", "32"},
         };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;

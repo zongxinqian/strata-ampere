@@ -458,6 +458,15 @@ private:
     void drain_prewarm_l3(int tid, int nt_total, uint32_t epoch, bool is_host);
     void drain_prewarm_blobs(int tid, int nt_total, bool is_host);
     std::vector<SplitBufMulti> split_multi_;
+    // v1.5.0: upstream STRATA_POOL_DEP (mode_ == 11): per-expert Gate/Up -> quant -> Down dependency batch (no inter-phase barrier)
+    struct DepExpert {
+        alignas(64) std::atomic<int> gu_left{0};
+        std::atomic<int> quant{0};
+    };
+    std::unique_ptr<DepExpert[]> dep_;
+    bool dep_on_ = true;
+    int dep_nb_ = 0, dep_k_gu_ = 1, dep_k_dn_ = 1;
+    void dep_task(int i);
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own

@@ -6351,15 +6351,33 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                                                               const block_q8_1* __restrict__ hq, NativeExpertLayout L,
                                                               float* __restrict__ out) {
     using F = Fmt<TD>;
+    constexpr bool kStageSplit = (TD == 18 || TD == 21);
+    constexpr int kGridN = (TD == 21) ? 1024 : (TD == 18) ? 512 : 1;
+    __shared__ uint32_t sgrid[kGridN];
     extern __shared__ int sh_raw[];   // LDS_NT entries x hb blocks of q8_1
     const int g = blockIdx.y;
     if (g >= *n_groups) return;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    if (e0 >= e1) return;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    if constexpr (TD == 18) {
+        sgrid[tid] = iq3xxs_grid[tid];
+        stage_iq3xxs_masks(sgrid, tid, 256);
+    } else if constexpr (TD == 21) {
+        for (int i = tid; i < 512; i += 256) sgrid[i] = iq3s_grid[i];
+        sgrid[512 + tid] = (uint32_t) nib_mask((uint32_t) tid);
+        sgrid[768 + tid] = (uint32_t) nib_mask((uint32_t) tid >> 4);
+    }
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
     const int nb = (int) (L.n_ff / F::qk), hb = (int) (L.n_ff / 32);
-    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    const int n_items = nb * F::ipb;
     const int nrow = (int) L.n_embd;
     const block_q8_1* sh = (const block_q8_1*) sh_raw;
+    constexpr bool kDownSplit = kSplit<TD> || (TD == 7);
+    constexpr bool kCanSub8 = kDownSplit && (TD != 8);
+    constexpr bool kCanSub16 = kSplit<TD> && (TD != 40 && TD != 42 && TD != 20);
+    const bool use_sub8 = kCanSub8 && (n_items == 40 || n_items == 20 || n_items == 24);
+    const bool use_sub16 = kCanSub16 && !use_sub8 && (n_items == 80 || n_items == 16 || n_items == 48);
     for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
         const int cn = min(LDS_NT, e1 - c0);
         __syncthreads();
@@ -6368,6 +6386,135 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
             for (int i = tid; i < cn * hb * 9; i += 256) sh_raw[i] = src[i];
         }
         __syncthreads();
+        if constexpr (kCanSub8) if (use_sub8) {
+            const int sub_row = (tid >> 3);
+            const int slane = tid & 7;
+            for (int p = 0; p < 2; ++p) {
+                const int r = blockIdx.x * LDS_RB + p * 32 + sub_row;
+                if (r >= nrow) break;
+                const uint8_t* w = blob + L.down_off + (size_t) r * L.d_row;
+                auto pass8 = [&](auto ntc) {
+                    constexpr int NTC = decltype(ntc)::value;
+                    float s[NTC];
+                    if constexpr (kSplit<TD> && (TD == 20)) {
+                        if (n_items == 40) {
+                            int off[NTC];
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) off[j] = j * hb;
+                            row_dot_40_sub8<TD, NTC, true, kStageSplit>(w, sh, off, NTC, slane, s, sgrid);
+                            if (slane == 0) {
+#pragma unroll
+                                for (int j = 0; j < NTC; ++j)
+                                    out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
+                            }
+                            return;
+                        }
+                    }
+                    if constexpr (kSplit<TD> && (TD == 42)) {
+                        if (n_items == 20) {
+                            int off[NTC];
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) off[j] = j * hb;
+                            row_dot_20_sub8<TD, NTC, true>(w, sh, off, NTC, slane, s);
+                            if (slane == 0) {
+#pragma unroll
+                                for (int j = 0; j < NTC; ++j)
+                                    out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
+                            }
+                            return;
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) s[j] = 0.0f;
+                    for (int k = slane; k < n_items; k += 8) {
+                        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                        if constexpr (kSplit<TD>) {
+                            const auto rw = Split<TD>::template load<kStageSplit>(w, kbx, iqs, sgrid);
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                                s[j] += Split<TD>::apply(rw, xk, iqs);
+                            }
+                        } else if constexpr (TD == 7) {
+                            const auto rw = S27<7>::load(w, kbx, iqs);
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                                s[j] += S27<7>::apply(rw, xk, iqs);
+                            }
+                        }
+                    }
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) {
+                        float v = s[j];
+#pragma unroll
+                        for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                        if (slane == 0) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = v;
+                    }
+                };
+                switch (cn) {
+                    case 1: pass8(std::integral_constant<int, 1>{}); break;
+                    case 2: pass8(std::integral_constant<int, 2>{}); break;
+                    case 3: pass8(std::integral_constant<int, 3>{}); break;
+                    default: pass8(std::integral_constant<int, 4>{}); break;
+                }
+            }
+            continue;
+        }
+        if constexpr (kCanSub16) if (use_sub16) {
+            const int sub_row = (tid >> 4);
+            const int t16 = tid & 15;
+            for (int p = 0; p < 4; ++p) {
+                const int r = blockIdx.x * LDS_RB + p * 16 + sub_row;
+                if (r >= nrow) break;
+                const uint8_t* w = blob + L.down_off + (size_t) r * L.d_row;
+                auto pass16 = [&](auto ntc) {
+                    constexpr int NTC = decltype(ntc)::value;
+                    if constexpr (kSplit<TD>) {
+                        float s[NTC];
+                        if constexpr (TD == 8) {
+                            if (n_items == 80) {
+                                int off[NTC];
+#pragma unroll
+                                for (int j = 0; j < NTC; ++j) off[j] = j * hb;
+                                row_dot_80_sub16<TD, NTC, true, kStageSplit>(w, sh, off, NTC, t16, s, sgrid);
+                                if (t16 == 0) {
+#pragma unroll
+                                    for (int j = 0; j < NTC; ++j)
+                                        out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
+                                }
+                                return;
+                            }
+                        }
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) s[j] = 0.0f;
+                        for (int k = t16; k < n_items; k += 16) {
+                            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                            const auto rw = Split<TD>::template load<kStageSplit>(w, kbx, iqs, sgrid);
+#pragma unroll
+                            for (int j = 0; j < NTC; ++j) {
+                                const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                                s[j] += Split<TD>::apply(rw, xk, iqs);
+                            }
+                        }
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) {
+                            float v = s[j];
+#pragma unroll
+                            for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+                            if (t16 == 0) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = v;
+                        }
+                    }
+                };
+                switch (cn) {
+                    case 1: pass16(std::integral_constant<int, 1>{}); break;
+                    case 2: pass16(std::integral_constant<int, 2>{}); break;
+                    case 3: pass16(std::integral_constant<int, 3>{}); break;
+                    default: pass16(std::integral_constant<int, 4>{}); break;
+                }
+            }
+            continue;
+        }
         for (int p = 0; p < LDS_RB / 16; ++p) {
             const int r0 = blockIdx.x * LDS_RB + p * 16 + warp, r1 = r0 + 8;
             if (r0 >= nrow) break;
@@ -6379,15 +6526,26 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
                 float s0[NTC], s1[NTC];
 #pragma unroll
                 for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
-                for (int k = lane; k < nb * F::ipb; k += 32) {
+                for (int k = lane; k < n_items; k += 32) {
                     const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    if constexpr (kSplit<TD>) {
+                        const auto rw0 = Split<TD>::template load<kStageSplit>(w0, kbx, iqs, sgrid);
+                        const auto rw1 = Split<TD>::template load<kStageSplit>(w1, kbx, iqs, sgrid);
 #pragma unroll
-                    for (int j = 0; j < NTC; ++j) {
-                        const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
-                        const float a = F::dot(w0, xk, kbx, iqs);
-                        const float b = F::dot(w1, xk, kbx, iqs);
-                        s0[j] += a;
-                        s1[j] += b;
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                            s0[j] += Split<TD>::apply(rw0, xk, iqs);
+                            s1[j] += Split<TD>::apply(rw1, xk, iqs);
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < NTC; ++j) {
+                            const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+                            const float a = F::dot(w0, xk, kbx, iqs);
+                            const float b = F::dot(w1, xk, kbx, iqs);
+                            s0[j] += a;
+                            s1[j] += b;
+                        }
                     }
                 }
 #pragma unroll
@@ -7015,12 +7173,29 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     int dev_d = 0;
     cudaGetDevice(&dev_d);
     // gfx1151: the LDS down kernel is slower than the CUDA layout for IQ4_NL (86 vs 63 us, 24 groups) and faster for Q2_0 (-18%)
-    const bool lds_down_ok = L.d_type == 42 || (L.d_type == 20 && !gfx1151_exp8(dev_d));
+    const bool lds_down_ok = L.n_ff <= 4096 &&
+                             (L.d_type == 8 || L.d_type == 12 || L.d_type == 13 ||
+#ifdef STRATA_Q6K_EXPERTS
+                              L.d_type == 14 ||
+#endif
+                              L.d_type == 18 || L.d_type == 21 || L.d_type == 23 ||
+                              L.d_type == 42 || (L.d_type == 20 && !gfx1151_exp8(dev_d)));
     if ((em0d == 7 || em0d == 8) && lds_down_ok) {
         const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
-        if (L.d_type == 20) native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
-        else native_down_lds_kernel<42><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        switch (L.d_type) {
+            case 8:  native_down_lds_kernel<8><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            case 12: native_down_lds_kernel<12><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            case 13: native_down_lds_kernel<13><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+#ifdef STRATA_Q6K_EXPERTS
+            case 14: native_down_lds_kernel<14><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+#endif
+            case 18: native_down_lds_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            case 20: native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            case 21: native_down_lds_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            case 23: native_down_lds_kernel<23><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            default: native_down_lds_kernel<42><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        }
         check("native_expert_grouped/down");
         return;
     }

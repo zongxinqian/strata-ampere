@@ -844,6 +844,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
+    dep_.reset(new DepExpert[(size_t) kMaxSplitMulti]);
+    dep_on_ = [] { const char* v = std::getenv("STRATA_POOL_DEP"); return v == nullptr || v[0] != '0'; }();
     // STRATA_NUMA_SPLIT: decided here, before any worker starts (a worker counts into its slice's `parked` from its
     // first instruction), and never revised.  Unset: the plan stays empty and nothing below runs.
     NumaSplitPlan plan;
@@ -1214,6 +1216,8 @@ bool ExpertPool::drain_one(int id, ExpertScratch& scratch, uint32_t epoch) {
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
         } else if (mode_ == 8) {
             range_fn_(range_ctx_, (int) i);
+        } else if (mode_ == 11) {
+            dep_task((int) i);
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
             // FF / H, or another family's smaller expert)
@@ -1467,6 +1471,47 @@ bool ExpertPool::async_poll() {
 
 void ExpertPool::async_wait() {
     while (!async_poll()) strata_cpu_pause();
+}
+
+void ExpertPool::dep_task(int i) {
+    const NativeFmt& f = *nfmt_;
+    const int ngu = dep_nb_ * dep_k_gu_;
+    if (i < ngu) {
+        const int e = i / dep_k_gu_, p = i % dep_k_gu_;
+        const int h = (int) f.n_ff;
+        const int r0 = (int) ((int64_t) h * p / dep_k_gu_), r1 = (int) ((int64_t) h * (p + 1) / dep_k_gu_);
+        SplitBufMulti& sb = split_multi_[(size_t) e];
+        const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;
+        float* ff[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+        if (narithmetic_ == NativeArithmetic::WindowInvariant)
+            native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+        else
+            native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+        dep_[(size_t) e].gu_left.fetch_sub(1, std::memory_order_release);
+        return;
+    }
+    const int j = i - ngu;
+    const int e = j / dep_k_dn_, p = j % dep_k_dn_;
+    DepExpert& d = dep_[(size_t) e];
+    while (d.gu_left.load(std::memory_order_acquire) > 0) strata_cpu_pause();
+    int expect = 0;
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;
+    if (d.quant.compare_exchange_strong(expect, 1, std::memory_order_acquire)) {
+        for (int t = 0; t < mjobs_[e].nt; ++t) native_quant_h(*nfmt, sb.ff[t], sb.hq[t]);
+        d.quant.store(2, std::memory_order_release);
+    } else {
+        while (d.quant.load(std::memory_order_acquire) != 2) strata_cpu_pause();
+    }
+    const int h = (int) f.n_embd;
+    const int r0 = (int) ((int64_t) h * p / dep_k_dn_), r1 = (int) ((int64_t) h * (p + 1) / dep_k_dn_);
+    const void* hq[MAXT];
+    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+    if (narithmetic_ == NativeArithmetic::WindowInvariant)
+        native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    else
+        native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
 }
 
 void ExpertPool::run_range(int n_tasks, void (*fn)(void*, int), void* ctx) {
@@ -1917,7 +1962,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     if (n <= 0) return;
     static const bool fused_env = [] {
         const char* v = std::getenv("STRATA_POOL_FUSED");
-        return v == nullptr || v[0] != '0';
+        return v != nullptr && v[0] == '1';
     }();
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
@@ -1955,6 +2000,23 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
             }
             const auto d = std::chrono::steady_clock::now();
             ms_multi_gu += std::chrono::duration<double, std::milli>(d - a).count();
+        } else if (dep_on_ && numa_n_ == 0 && n_ > 1 && !q2_native_kernels(f.gu_type) && !q2_native_kernels(f.d_type)) {
+            if (batch_pre != nullptr) {
+                for (int t = 0; t < batch_pre->n_toks; ++t)
+                    native_quant_act(f, batch_pre->x[t], batch_pre->dst[t]);
+            }
+            const int per_phase = phase_tasks((int64_t) nb * f.n_ff);
+            dep_nb_ = nb;
+            dep_k_gu_ = (std::max)(1, (std::min)((int) f.n_ff, (per_phase + nb - 1) / nb));
+            dep_k_dn_ = (std::max)(1, (std::min)((int) f.n_embd, (phase_tasks((int64_t) nb * f.n_embd) + nb - 1) / nb));
+            for (int e = 0; e < nb; ++e) {
+                dep_[(size_t) e].gu_left.store(dep_k_gu_, std::memory_order_relaxed);
+                dep_[(size_t) e].quant.store(0, std::memory_order_relaxed);
+            }
+            const auto a = std::chrono::steady_clock::now();
+            run_phase(11, nb * (dep_k_gu_ + dep_k_dn_));
+            const auto b = std::chrono::steady_clock::now();
+            ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
         } else {
             if (batch_pre != nullptr) {
                 for (int t = 0; t < batch_pre->n_toks; ++t)
