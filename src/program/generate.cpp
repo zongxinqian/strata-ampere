@@ -10039,6 +10039,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> host_res;
         int32_t* d_res = nullptr;
         int32_t* d_res_peer = nullptr;
+        int32_t* mrope = nullptr;   // TP2 vision fix: CUDA1's own image-position table
         uint64_t* d_host_blobs = nullptr;
         int64_t host_blobs_mapped = 0;
         strata::core::Verifier ver;
@@ -10060,6 +10061,18 @@ int main(int argc, char** argv) {
     if (tp2_on) {
         tp1 = std::make_unique<TpPeerStage>();
         const strata::core::OnDevice on1(tp1->dev);
+        // TP2 vision fix: this device needs its own image-position table, set before any
+        // rope kernel it captures goes into a CUDA graph (same rule as the layer-split path).
+        if (o.vision) {
+            if (mrope_host.empty() ||
+                cudaMalloc((void**) &tp1->mrope, mrope_host.size() * sizeof(int32_t)) != cudaSuccess ||
+                cudaMemcpy(tp1->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: TP2 CUDA1: the image position table failed\n");
+                return 1;
+            }
+            strata::kernels::mrope_table_set(tp1->mrope);
+        }
         strata::core::WeightTable::set_tp_shard(1, 2);
         strata::core::NativeDense::set_tp_shard(1, 2);
         tp1->arena_bytes = pool_bytes;
@@ -19026,6 +19039,13 @@ int main(int argc, char** argv) {
                         ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                               cudaMemcpyHostToDevice) == cudaSuccess;
                     }
+                    // TP2 vision fix: the peer stage reads its own table too
+                    if (tp1 && tp1->mrope != nullptr) {
+                        const strata::core::OnDevice onp(tp1->dev);
+                        cudaDeviceSynchronize();
+                        ok = ok && cudaMemcpy(tp1->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                              cudaMemcpyHostToDevice) == cudaSuccess;
+                    }
                     return ok;
                 };
                 if (ve.empty() && !upload_mrope()) ve = "the image position upload failed";
@@ -19041,6 +19061,7 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
+            if (tp1) tp1->sp.embd_rows = geni ? row_ptr.data() : nullptr;   // TP2 vision fix (peer prefill)
             if (n + max_new + 8 > o.max_context) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
