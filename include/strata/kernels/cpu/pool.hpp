@@ -465,6 +465,7 @@ private:
     };
     std::unique_ptr<DepExpert[]> dep_;
     bool dep_on_ = true;
+    bool dep_fuse_hq_ = false;
     int dep_nb_ = 0, dep_k_gu_ = 1, dep_k_dn_ = 1;
     void dep_task(int i);
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows

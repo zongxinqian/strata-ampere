@@ -2665,7 +2665,7 @@ bool topk_split_device() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = (env == 1 || strata::sm75_default(major, minor)) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
+        ok[dev] = (env == 1 || strata::sm75_default(major, minor) || (major == 8 && minor == 6)) ? 1 : 2;   // Turing + Ampere sm_86 multi-CTA 256K top-k
     }
     return ok[dev] == 1;
 }
